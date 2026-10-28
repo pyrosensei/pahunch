@@ -1,0 +1,35 @@
+[project]
+name = "pahunch-backend"
+version = "0.1.0"
+description = "Policy-bound delivery coordination backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.5",
+    "sqlmodel>=0.0.22",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
