@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pahunch — Realtime Voice Demo</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --dim: #8b949e; --accent: #2f81f7; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex;
+    align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; }
+  #state-chip { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--dim); font-size: 12px; }
+  #state-chip.active { color: var(--ok); border-color: var(--ok); }
+  main { display: grid; grid-template-columns: 260px 1fr 320px; gap: 16px; padding: 16px 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 10px; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .order { border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+    margin-bottom: 8px; cursor: pointer; }
+  .order:hover { border-color: var(--accent); }
+  .order .id { font-weight: bold; }
+  .order .meta { color: var(--dim); font-size: 12px; }
+  #log { height: 320px; overflow-y: auto; font-size: 13px; }
+  .entry { margin-bottom: 8px; }
+  .entry .who { color: var(--dim); }
+  .entry.customer .who { color: var(--ok); }
+  .entry.agent .who { color: var(--accent); }
+  .entry.system { color: var(--dim); font-size: 12px; }
+  .entry.error { color: var(--bad); }
+  #meter-wrap { height: 14px; background: #21262d; border-radius: 7px; overflow: hidden;
+    margin: 8px 0; }
+  #meter { height: 100%; width: 0%; background: var(--ok); transition: width 60ms linear; }
+  #ptt { padding: 14px 0; width: 100%; user-select: none; }
+  #ptt.held { background: var(--ok); border-color: var(--ok); color: #0d1117; }
+  pre { background: #0d1117; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px; overflow-x: auto; font-size: 12px; margin: 0; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .row button { flex: 1; }
+  label { color: var(--dim); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  .kv { color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+  .kv b { color: var(--text); font-weight: normal; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pahunch — realtime voice demo</h1>
+  <span id="state-chip">IDLE</span>
+  <span id="latency" class="kv"></span>
+</header>
+<main>
+  <section class="panel">
+    <h2>Orders</h2>
+    <div id="orders">Loading…</div>
+  </section>
+
+  <section class="panel">
+    <h2>Conversation</h2>
+    <div id="log"></div>
+    <div id="meter-wrap"><div id="meter"></div></div>
+    <div class="row">
+      <button id="mic-btn" class="primary">Start mic</button>
+      <button id="ptt">Hold to talk</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="auto-listen" checked /> auto-listen after agent speech</label>
+    </div>
+    <div class="row">
+      <button id="commit-btn" disabled>Commit plan</button>
+      <button id="end-btn" disabled>End call</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Execution</h2>
+    <div id="verdict" class="kv">No plan yet.</div>
+    <div id="courier" class="kv">No commit yet.</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log"), meterEl = $("meter"), chipEl = $("state-chip"), latencyEl = $("latency");
+const verdictEl = $("verdict"), courierEl = $("courier");
+const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
+
+const state = {
+  sessionId: null, ws: null, streaming: false, auto: true,
+  audioCtx: null, node: null, playing: null, speaking: false,
+};
+
+function log(who, text) {
+  const div = document.createElement("div");
+  div.className = `entry ${who}`;
+  div.innerHTML = `<span class="who">${who === "customer" ? "customer" : who === "agent" ? "agent" : "system"}</span> ${text}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setState(name) {
+  chipEl.textContent = name;
+  chipEl.className = name === "IDLE" ? "" : "active";
+}
+function fmtMs(ms) { return ms == null ? "" : `${ms} ms`; }
+
+async function loadOrders() {
+  const orders = await (await fetch("/api/orders")).json();
+  $("orders").innerHTML = "";
+  for (const order of orders) {
+    const div = document.createElement("div");
+    div.className = "order";
+    div.innerHTML = `<span class="id">#${order.id}</span> ${order.merchant_name}<br/>
+      <span class="meta">${order.delivery_address_summary}<br/>
+      window ${order.window_start?.slice(11, 16) ?? "?"}–${order.window_end?.slice(11, 16) ?? "?"} ·
+      ${order.payment_mode} · OTP: ${order.requires_otp ? "yes" : "no"} · value ₹${order.declared_value}</span>`;
+    div.onclick = () => startCall(order.id);
+    $("orders").appendChild(div);
+  }
+}
+
+async function startCall(orderId) {
+  log("system", `starting call for order ${orderId}…`);
+  const created = await (await fetch(`/api/orders/${orderId}/call`, { method: "POST" })).json();
+  const sessionId = created.id;
+  await fetch(`/api/sessions/${sessionId}/connect`, { method: "POST" });
+  await fetch(`/api/sessions/${sessionId}/context-confirmation`, { method: "POST" });
+  log("system", `session ${sessionId} ready`);
+  connectSocket(sessionId);
+}
+
+function connectSocket(sessionId) {
+  state.sessionId = sessionId;
+  const ws = new WebSocket(`${wsUrl}/ws/sessions/${sessionId}/voice`);
+  state.ws = ws;
+  ws.binaryType = "arraybuffer";
+  $("commit-btn").disabled = false;
+  $("end-btn").disabled = false;
+
+  ws.onopen = () => log("system", "socket open, waiting for ready…");
+  ws.onclose = () => { log("system", "socket closed"); setState("IDLE"); };
+
+  const handleEvent = async (event) => {
+    switch (event.type) {
+      case "ready":
+        setState(event.state);
+        log("system", `ready — call state ${event.state}`);
+        if (state.auto) sendStart();
+        break;
+      case "listening":
+        state.streaming = true;
+        log("system", "listening…");
+        break;
+      case "speech_start":
+        log("system", "speech detected");
+        break;
+      case "speech_end":
+        log("system", `utterance end (${event.duration_ms} ms)`);
+        break;
+      case "stop_speaking":
+        state.speaking = false;
+        stopPlayback();
+        log("system", "barge-in: agent stopped speaking");
+        break;
+      case "turn":
+        setState(event.state);
+        log("customer", `“${event.transcript}” (${event.detected_language ?? "?"}, conf ${event.transcript_confidence})`);
+        log("agent", `“${event.agent_message}”${event.audio_error ? ` [TTS ${event.audio_error}]` : ""}`);
+        log("system", `turn ${event.turn.turn_count} · ${event.planner.model} · ${event.planner.action} · ` +
+          `stt ${fmtMs(event.timings.stt_ms)} · planner ${fmtMs(event.timings.planner_ms)} · tts ${fmtMs(event.timings.tts_ms)} · total ${fmtMs(event.timings.total_ms)}`);
+        if (event.turn.verdict) {
+          verdictEl.innerHTML = `<b>Plan verdict:</b> ${event.turn.verdict.valid ? "valid" : "INVALID"}` +
+            (event.turn.verdict.violations?.length
+              ? `<br/>violations: ${event.turn.verdict.violations.map((v) => v.code).join(", ")}` : "");
+        }
+        if (event.turn.customer_confirmed) {
+          log("system", "customer confirmed — committing plan");
+          await commitPlan();
+        } else if (event.audio_error && state.auto) {
+          setTimeout(sendStart, 600);
+        }
+        break;
+      case "agent_audio":
+        if (event.audio_base64) {
+          state.speaking = true;
+          playAudio(event.audio_base64, event.content_type);
+        }
+        break;
+      case "error":
+        log("error", event.detail);
+        break;
+    }
+  };
+  ws.onmessage = (event) => {
+    if (typeof event.data === "string") handleEvent(JSON.parse(event.data));
+  };
+}
+
+function sendStart() {
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "start" }));
+}
+function sendStop() {
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "stop" }));
+}
+
+function stopPlayback() {
+  if (state.playing) { try { state.playing.stop(); } catch {} state.playing = null; }
+}
+
+async function playAudio(base64, contentType) {
+  if (!state.audioCtx) return;
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  const buffer = await state.audioCtx.decodeAudioData(bytes.buffer);
+  const source = state.audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(state.audioCtx.destination);
+  state.playing = source;
+  source.onended = () => {
+    if (state.playing === source) state.playing = null;
+    state.speaking = false;
+    if (state.auto) sendStart();
+  };
+  source.start();
+}
+
+async function ensureMic() {
+  if (state.audioCtx) return;
+  state.audioCtx = new AudioContext();
+  await state.audioCtx.audioWorklet.addModule("/worklet.js");
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+  });
+  const source = state.audioCtx.createMediaStreamSource(stream);
+  state.node = new AudioWorkletNode(state.audioCtx, "mic-resampler");
+  state.node.port.onmessage = (event) => {
+    if (event.data.type === "audio") {
+      if (state.streaming && state.ws && state.ws.readyState === 1) {
+        state.ws.send(event.data.buffer);
+      }
+    } else if (event.data.type === "level") {
+      meterEl.style.width = `${Math.min(100, event.data.rms * 400)}%`;
+    }
+  };
+  source.connect(state.node);
+  await state.audioCtx.resume();
+  log("system", "microphone on — audio is streamed only while listening");
+}
+
+async function commitPlan() {
+  const sessionId = state.sessionId;
+  const result = await fetch(`/api/sessions/${sessionId}/commit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ idempotency_key: `demo-${sessionId}` }),
+  });
+  if (!result.ok) {
+    log("error", `commit failed: ${(await result.json()).detail}`);
+    return;
+  }
+  const body = await result.json();
+  setState(body.state);
+  log("system", `plan committed (${body.reused ? "reused" : "new"} commit ${body.commit_id})`);
+  courierEl.innerHTML = "<b>Courier card</b>";
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(body.courier_card, null, 2);
+  courierEl.appendChild(pre);
+}
+
+$("mic-btn").onclick = async () => {
+  await ensureMic();
+  $("mic-btn").disabled = true;
+};
+$("ptt").addEventListener("pointerdown", () => {
+  if (!state.ws) return;
+  state.auto = false;
+  $("auto-listen").checked = false;
+  sendStart();
+  state.streaming = true;
+  $("ptt").classList.add("held");
+});
+$("ptt").addEventListener("pointerup", () => {
+  sendStop();
+  state.streaming = false;
+  $("ptt").classList.remove("held");
+});
+$("auto-listen").onchange = (event) => { state.auto = event.target.checked; };
+$("commit-btn").onclick = commitPlan;
+$("end-btn").onclick = () => { if (state.ws) state.ws.close(); setState("IDLE"); };
+
+loadOrders();
+</script>
+</body>
+</html>
