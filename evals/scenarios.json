@@ -1,0 +1,162 @@
+[
+  {
+    "id": "T01",
+    "order_id": 1045,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "HAND_TO_CUSTOMER",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T02",
+    "order_id": 1043,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "RESCHEDULE",
+        "window_start": "2026-11-06T12:00:00+05:30",
+        "window_end": "2026-11-06T15:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T03",
+    "order_id": 1045,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "HAND_TO_CUSTOMER",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      },
+      "fallback": {
+        "action": "LEAVE_WITH_SECURITY",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T04",
+    "order_id": 1042,
+    "expected_valid": false,
+    "proposal": {
+      "primary": {
+        "action": "HAND_TO_CUSTOMER",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      },
+      "fallback": {
+        "action": "LEAVE_WITH_SECURITY",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T05",
+    "order_id": 1043,
+    "expected_valid": false,
+    "proposal": {
+      "primary": {
+        "action": "LEAVE_WITH_SECURITY",
+        "window_start": "2026-11-06T12:00:00+05:30",
+        "window_end": "2026-11-06T15:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T06",
+    "order_id": 1044,
+    "expected_valid": false,
+    "proposal": {
+      "primary": {
+        "action": "LEAVE_WITH_SECURITY",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T07",
+    "order_id": 1042,
+    "expected_valid": false,
+    "proposal": {
+      "primary": {
+        "action": "RESCHEDULE",
+        "window_start": "2026-11-07T10:00:00+05:30",
+        "window_end": "2026-11-07T12:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T08",
+    "order_id": 1046,
+    "expected_valid": false,
+    "proposal": {
+      "primary": {
+        "action": "LEAVE_WITH_NEIGHBOR",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      }
+    }
+  },
+  {
+    "id": "T09",
+    "order_id": 1048,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "RETRY_AFTER_DELAY",
+        "delay_minutes": 20,
+        "max_retries": 1
+      }
+    }
+  },
+  {
+    "id": "T10",
+    "order_id": 1042,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "HAND_TO_CUSTOMER",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30"
+      },
+      "fallback": {
+        "action": "RETRY_AFTER_DELAY",
+        "delay_minutes": 15,
+        "max_retries": 1
+      }
+    }
+  },
+  {
+    "id": "T11",
+    "order_id": 1046,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "LEAVE_WITH_NEIGHBOR",
+        "window_start": "2026-11-05T18:00:00+05:30",
+        "window_end": "2026-11-05T20:00:00+05:30",
+        "named_recipient": "Sharma"
+      }
+    }
+  },
+  {
+    "id": "T12",
+    "order_id": 1042,
+    "expected_valid": true,
+    "proposal": {
+      "primary": {
+        "action": "RESCHEDULE",
+        "window_start": "2026-11-06T10:00:00+05:30",
+        "window_end": "2026-11-06T12:00:00+05:30"
+      }
+    }
+  }
+]
