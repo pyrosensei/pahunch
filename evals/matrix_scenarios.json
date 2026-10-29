@@ -392,7 +392,7 @@
         "expect_action": "PROPOSE_PLAN",
         "expect_valid_if_present": true,
         "expect_message_contains": [
-          "Sharma ji"
+          "शर्मा जी"
         ]
       },
       {
@@ -401,6 +401,7 @@
         "expect_confirmed": true
       }
     ],
+    "notes": "The customer speaks Devanagari, so the recipient is stored and shown as शर्मा जी rather than transliterated.",
     "expect": {
       "final_state": "COMMITTED",
       "commits": 1,
@@ -408,7 +409,7 @@
       "primary_action": "LEAVE_WITH_NEIGHBOR",
       "courier_action": "LEAVE_WITH_NEIGHBOR",
       "courier_instructions_contain": [
-        "Leave with neighbour: Sharma ji"
+        "Leave with neighbour: शर्मा जी"
       ],
       "courier_window_start": "2026-11-05T18:00:00+05:30"
     }
