@@ -681,7 +681,10 @@
       },
       {
         "text": "आज शाम छह से आठ बजे मैं घर पर हूँ, मुझे ही दे देना।",
-        "expect_action": "PROPOSE_PLAN",
+        "expect_action_any": [
+          "PROPOSE_PLAN",
+          "CONFIRM_PLAN"
+        ],
         "expect_valid_if_present": true
       },
       {
@@ -690,6 +693,7 @@
         "expect_confirmed": true
       }
     ],
+    "notes": "Turn 1 can already produce a valid plan. Repeating the same instruction then either re-proposes it or asks for explicit confirmation; both are safe because a non-explicit confirmation cannot commit.",
     "expect": {
       "final_state": "COMMITTED",
       "commits": 1,
@@ -730,7 +734,7 @@
         "expect_action": "PROPOSE_PLAN",
         "expect_valid_if_present": true,
         "expect_message_contains": [
-          "Sharma ji"
+          "शर्मा जी"
         ]
       },
       {
@@ -739,6 +743,7 @@
         "expect_confirmed": true
       }
     ],
+    "notes": "The customer speaks Devanagari, so the recipient is stored and shown as शर्मा जी rather than transliterated.",
     "expect": {
       "final_state": "COMMITTED",
       "commits": 1,
@@ -746,7 +751,7 @@
       "primary_action": "LEAVE_WITH_NEIGHBOR",
       "courier_action": "LEAVE_WITH_NEIGHBOR",
       "courier_instructions_contain": [
-        "Leave with neighbour: Sharma ji"
+        "Leave with neighbour: शर्मा जी"
       ],
       "barge_in_seen": true,
       "courier_window_start": "2026-11-05T18:00:00+05:30"
