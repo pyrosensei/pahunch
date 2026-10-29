@@ -52,11 +52,12 @@ def create_app(
         if speech_client is _SPEECH_UNSET
         else cast(SpeechClient | None, speech_client)
     )
-    streaming_stt = (
-        build_streaming_stt_client(settings)
-        if streaming_stt_client is _SPEECH_UNSET
-        else cast(StreamingSTTClient | None, streaming_stt_client)
-    )
+    def new_streaming_stt() -> StreamingSTTClient | None:
+        # One Prisma stream per voice connection: client state (_queue,
+        # _partial, _last_error) belongs to a single live session.
+        if streaming_stt_client is _SPEECH_UNSET:
+            return build_streaming_stt_client(settings)
+        return cast(StreamingSTTClient | None, streaming_stt_client)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -217,7 +218,7 @@ def create_app(
             planner_llm,
             speech,
             rt_config,
-            streaming=streaming_stt,
+            streaming=new_streaming_stt(),
             max_audio_bytes=max_audio_bytes,
             min_confidence=settings.planner_min_confidence,
             min_transcript_confidence=settings.planner_min_transcript_confidence,

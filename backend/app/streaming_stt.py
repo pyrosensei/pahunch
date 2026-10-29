@@ -81,6 +81,11 @@ class GnaniStreamingSTTClient:
         self._last_error: str | None = None
 
     async def connect(self) -> None:
+        await self.close()
+        self._partial.clear()
+        self._dirty = False
+        self._last_error = None
+        self._queue = asyncio.Queue()
         headers = {
             "x-api-key-id": self._api_key,
             "lang_code": self._language,
@@ -210,6 +215,9 @@ class GnaniStreamingSTTClient:
         task, self._reader_task = self._reader_task, None
         if task is not None:
             task.cancel()
+            # Let the reader unwind so its final sentinel lands in the old
+            # queue, not the one the next connect() installs.
+            await asyncio.gather(task, return_exceptions=True)
         if ws is not None:
             try:
                 await ws.close()
@@ -222,13 +230,14 @@ class GnaniStreamingSTTClient:
         return self._ws
 
     async def _reader(self) -> None:
+        queue = self._queue
         try:
             async for raw in self._ws:
                 event = json.loads(raw)
                 if event.get("type") == "transcript":
                     text = event.get("text")
                     if isinstance(text, str) and text.strip():
-                        await self._queue.put(
+                        await queue.put(
                             (text.strip(), event.get("detected_language_code"), perf_counter())
                         )
                 elif event.get("type") == "error":
@@ -237,7 +246,7 @@ class GnaniStreamingSTTClient:
         except (ConnectionClosed, ValueError) as error:
             self._last_error = self._last_error or str(error)
         finally:
-            await self._queue.put(None)
+            await queue.put(None)
 
 
 def build_streaming_stt_client(settings: Settings) -> GnaniStreamingSTTClient | None:

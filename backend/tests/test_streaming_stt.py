@@ -229,3 +229,31 @@ def test_begin_utterance_discards_stale_segments():
 
     transcript = run_scenario(handler, scenario)
     assert transcript.text == "fresh"
+
+
+def test_reconnect_starts_with_clean_state():
+    connections = {"count": 0}
+
+    async def handler(ws):
+        connections["count"] += 1
+        await ws.send(connected_event())
+        if connections["count"] == 1:
+            await ws.close()
+            return
+        async for message in ws:
+            if isinstance(message, str) and json.loads(message).get("type") == "commit":
+                await ws.send(json.dumps({"type": "transcript", "text": "dobara"}))
+                break
+        await ws.wait_closed()
+
+    async def scenario(client):
+        await client.connect()
+        with pytest.raises(StreamingSTTError):
+            await client.finish_utterance()
+        await client.connect()
+        await client.send_audio(b"\x00" * 1024)
+        return await client.finish_utterance()
+
+    transcript = run_scenario(handler, scenario)
+    assert transcript.text == "dobara"
+    assert connections["count"] == 2
