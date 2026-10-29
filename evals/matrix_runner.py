@@ -806,6 +806,12 @@ def summarize(results: list[dict], usage: dict) -> dict:
         for item in non_adv_live
         if item["passed"] and len(item.get("commits", [])) == 1
     ]
+    planner_errors: dict[str, int] = {}
+    for turn in turns:
+        planner = turn.get("planner") or {}
+        code = planner.get("error_code")
+        if planner.get("degraded") and code:
+            planner_errors[code] = planner_errors.get(code, 0) + 1
     return {
         "live_scenarios": len(live),
         "deterministic_scenarios": len(results) - len(live),
@@ -832,6 +838,7 @@ def summarize(results: list[dict], usage: dict) -> dict:
             "client_p50": percentile(client_ms, 0.5),
             "client_p95": percentile(client_ms, 0.95),
         },
+        "planner_errors": planner_errors,
         "usage": usage,
         "failed_scenarios": [item["id"] for item in live if not item["passed"]],
     }
@@ -840,6 +847,16 @@ def summarize(results: list[dict], usage: dict) -> dict:
 def markdown(report: dict) -> str:
     summary = report["summary"]
     latency = summary["latency_ms"]
+    planner_errors = summary.get("planner_errors") or {}
+    if planner_errors:
+        breakdown = ", ".join(
+            f"{code}: {count}" for code, count in sorted(planner_errors.items())
+        )
+        degraded = (
+            f"- Degraded planner turns: {sum(planner_errors.values())} ({breakdown})"
+        )
+    else:
+        degraded = "- Degraded planner turns: 0"
     lines = [
         f"# Pahunch live evaluation matrix — {report['generated_at']}",
         "",
@@ -867,6 +884,7 @@ def markdown(report: dict) -> str:
         (f"- Stage P50/P95: STT {latency['stt_p50']}/{latency['stt_p95']} ms, "
         f"planner {latency['planner_p50']}/{latency['planner_p95']} ms, "
         f"TTS {latency['tts_p50']}/{latency['tts_p95']} ms"),
+        degraded,
         "",
         "## Scenarios",
         "",
@@ -912,6 +930,10 @@ def markdown(report: dict) -> str:
         ("- T19 is deterministic-only: this architecture commits through a local "
         "policy revalidation and SQLite write, not a remote tool. Failure paths "
         "(commit before confirmation, invalid revalidation) are covered by tests."),
+        ("- Planner calls are bounded at 12 s. Provider stalls surface as "
+        "`LLM_TIMEOUT` degraded turns, counted above; the turn falls back to a "
+        "safe reply and the scenario fails its task check rather than hiding "
+        "the stall."),
         "- Noise is white Gaussian noise mixed at 8 dB SNR, not recorded street audio.",
         ("- Each scenario uses a synthetic fixture order in a disposable database; "
         "the production cooldown and order lifecycle are exercised by unit tests."),
