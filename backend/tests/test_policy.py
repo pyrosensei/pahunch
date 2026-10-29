@@ -63,8 +63,26 @@ def test_unavailable_slot_is_rejected():
         datetime.fromisoformat("2026-11-06T10:00:00+05:30"),
         datetime.fromisoformat("2026-11-06T12:00:00+05:30"),
     )
-    verdict = validate_plan(proposal(step(PlanAction.HAND_TO_CUSTOMER)), make_order(), [other_slot])
+    requested = step(
+        PlanAction.RESCHEDULE,
+        window_start=datetime.fromisoformat("2026-11-07T10:00:00+05:30"),
+        window_end=datetime.fromisoformat("2026-11-07T13:00:00+05:30"),
+    )
+    verdict = validate_plan(proposal(requested), make_order(), [other_slot])
     assert codes(verdict) == {ViolationCode.SLOT_NOT_AVAILABLE}
+
+
+def test_order_window_is_deliverable_without_a_slot_row():
+    other_slot = make_slot(
+        datetime.fromisoformat("2026-11-06T10:00:00+05:30"),
+        datetime.fromisoformat("2026-11-06T12:00:00+05:30"),
+    )
+    verdict = validate_plan(
+        proposal(step(PlanAction.HAND_TO_CUSTOMER)),
+        make_order(),
+        [other_slot],
+    )
+    assert verdict.valid
 
 
 def test_equivalent_utc_window_matches_ist_slot():

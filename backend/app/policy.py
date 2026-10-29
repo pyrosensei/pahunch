@@ -32,6 +32,22 @@ def _slot_matches(step: PlanStep, slots: list[DeliverySlot]) -> bool:
     )
 
 
+def _window_is_deliverable(
+    step: PlanStep,
+    order: Order,
+    slots: list[DeliverySlot],
+) -> bool:
+    if step.window_start is None or step.window_end is None:
+        return False
+    # The order's current window is already scheduled even when only
+    # reschedule options appear in available_slots.
+    if _utc(step.window_start) == _utc(order.window_start) and _utc(
+        step.window_end
+    ) == _utc(order.window_end):
+        return True
+    return _slot_matches(step, slots)
+
+
 def _allowed_alternatives(order: Order) -> list[PlanAction]:
     if not order.delivery_address_summary.strip():
         return [PlanAction.ESCALATE_TO_HUMAN]
@@ -85,7 +101,9 @@ def validate_plan(
         )
 
     for path, step in steps:
-        if step.action in SLOT_ACTIONS and not _slot_matches(step, slots):
+        if step.action in SLOT_ACTIONS and not _window_is_deliverable(
+            step, order, slots
+        ):
             violations.append(
                 PolicyViolation(
                     code=ViolationCode.SLOT_NOT_AVAILABLE,
