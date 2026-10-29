@@ -315,6 +315,52 @@ def test_barge_in_stops_agent_audio_and_accepts_confirmation(
         assert "CONFIRMATION_RULE" in types
 
 
+def test_push_to_talk_after_agent_audio_is_not_a_barge_in(
+    scripted_llm, scripted_speech
+):
+    speech = scripted_speech(
+        [
+            Transcript(text="6 se 8 aa jaana", confidence=0.9, latency_ms=90),
+            Transcript(
+                text="हाँ, ठीक है।",
+                language="hi-IN",
+                confidence=0.93,
+                latency_ms=90,
+            ),
+        ],
+        [
+            SpeechAudio(data=b"AUDIO1", content_type="audio/wav", latency_ms=40),
+            SpeechAudio(data=b"AUDIO2", content_type="audio/wav", latency_ms=40),
+        ],
+    )
+
+    with realtime_client(
+        scripted_llm,
+        llm_outcomes=[proposal_decision()],
+        speech=speech,
+    ) as client:
+        session_id = start_session(client)
+        with client.websocket_connect(f"/ws/sessions/{session_id}/voice") as ws:
+            ws.receive_json()  # ready
+            ws.send_json({"type": "start"})
+            ws.receive_json()  # listening
+            send_utterance(ws)
+            ws.receive_json()  # speech_start
+            ws.receive_json()  # speech_end
+            assert ws.receive_json()["state"] == "PENDING_CONFIRMATION"
+            assert ws.receive_json()["type"] == "agent_audio"
+
+            # The customer waits for the reply, presses start, then speaks.
+            ws.send_json({"type": "start"})
+            assert ws.receive_json() == {"type": "listening"}
+            ws.send_bytes(loud())
+            assert ws.receive_json() == {"type": "speech_start"}
+
+        events = client.get(f"/api/sessions/{session_id}/events").json()
+        types = [event["event_type"] for event in events]
+        assert "BARGE_IN" not in types
+
+
 def test_turn_in_wrong_call_state_sends_error_event(scripted_llm, scripted_speech):
     speech = scripted_speech([], [])
 

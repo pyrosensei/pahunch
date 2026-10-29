@@ -51,18 +51,22 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
-def frame_is_speech(frame: bytes, threshold: int) -> bool:
+def frame_rms(frame: bytes) -> float:
     usable = len(frame) - (len(frame) % 2)
     if usable < 2:
-        return False
+        return 0.0
     samples = array("h")
     samples.frombytes(frame[:usable])
     if sys.byteorder != "little":
         samples.byteswap()
     if not samples:
-        return False
+        return 0.0
     energy = sum(value * value for value in samples) / len(samples)
-    return math.sqrt(energy) >= threshold
+    return math.sqrt(energy)
+
+
+def frame_is_speech(frame: bytes, threshold: int) -> bool:
+    return frame_rms(frame) >= threshold
 
 
 class UtteranceBuffer:
@@ -277,7 +281,7 @@ async def handle_voice_socket(
                         speaking = False
                         listening = True
                         buffer.reset()
-                        audit("BARGE_IN")
+                        audit("BARGE_IN", {"rms": round(frame_rms(frame))})
                         await websocket.send_json({"type": "stop_speaking"})
                         await websocket.send_json({"type": "listening"})
                         await new_utterance()
@@ -308,6 +312,9 @@ async def handle_voice_socket(
             if kind == "start":
                 if stream is not None and not stream_ok:
                     await connect_stream()
+                # A new turn starts after the previous reply finished playing;
+                # only raw frames arriving mid-playback are a barge-in.
+                speaking = False
                 listening = True
                 buffer.reset()
                 await new_utterance()
@@ -321,6 +328,7 @@ async def handle_voice_socket(
                     buffer.reset()
                     await cancel_utterance()
             elif kind == "reset":
+                speaking = False
                 listening = False
                 buffer.reset()
                 await cancel_utterance()
