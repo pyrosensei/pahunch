@@ -124,6 +124,14 @@ def test_no_answer_is_terminal(db):
         service.connect(call.id)
 
 
+def test_no_answer_after_connect_is_allowed(db):
+    service = CallService(db)
+    call = start_call(service)
+    result = service.mark_no_answer(call.id)
+    assert result.state == CallState.NO_ANSWER
+    assert result.outcome.value == "NO_ANSWER"
+
+
 def test_address_change_escalates_without_modifying_address(db):
     service = CallService(db)
     call = start_call(service)

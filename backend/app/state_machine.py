@@ -20,12 +20,14 @@ ALLOWED_TRANSITIONS = {
     },
     CallState.CONTEXT_CONFIRMATION: {
         CallState.DISCOVERY,
+        CallState.NO_ANSWER,
         CallState.UNREACHABLE,
         CallState.ESCALATED,
     },
     CallState.DISCOVERY: {
         CallState.NEGOTIATION,
         CallState.PENDING_CONFIRMATION,
+        CallState.NO_ANSWER,
         CallState.UNREACHABLE,
         CallState.ESCALATED,
         CallState.TURN_BUDGET_EXHAUSTED,
