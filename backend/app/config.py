@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = ""
-    llm_timeout_seconds: float = 20.0
+    llm_timeout_seconds: float = 12.0
     llm_max_tokens: int = 600
     llm_temperature: float = 0.1
     llm_structured_mode: Literal["json_schema", "json_object"] = "json_schema"
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     planner_min_transcript_confidence: float = 0.55
     realtime_sample_rate: int = 16_000
     realtime_vad_threshold: int = 500
-    realtime_silence_ms: int = 700
+    realtime_silence_ms: int = 1000
     realtime_max_utterance_ms: int = 15_000
     realtime_min_speech_ms: int = 300
     streaming_stt_enabled: bool = True
