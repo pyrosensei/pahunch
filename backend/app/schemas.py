@@ -164,6 +164,7 @@ class VoiceTimings(BaseModel):
     planner_ms: int = 0
     tts_ms: int = 0
     total_ms: int = 0
+    first_audio_ms: int = 0
 
 
 class VoiceTurnResponse(BaseModel):
@@ -178,6 +179,8 @@ class VoiceTurnResponse(BaseModel):
     audio_base64: str | None = None
     audio_content_type: str | None = None
     audio_error: str | None = None
+    audio_streamed: bool = False
+    ack_played: bool = False
     timings: VoiceTimings
 
 
