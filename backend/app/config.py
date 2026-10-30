@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     app_name: str = "Pahunch API"
     database_url: str = "sqlite:///./pahunch.db"
     gnani_api_key: str = ""
+    # Extra Gnani keys, comma separated. The provider allows one active
+    # request per key, so each extra key adds one concurrent slot.
+    gnani_api_keys: str = ""
     gnani_base_url: str = "https://api.vachana.ai"
     gnani_stt_model: str = "prisma-v3.0"
     gnani_stt_language: str = "indic-auto"
@@ -18,7 +21,7 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_model: str = ""
     llm_timeout_seconds: float = 12.0
-    llm_max_tokens: int = 600
+    llm_max_tokens: int = 320
     llm_temperature: float = 0.1
     llm_structured_mode: Literal["json_schema", "json_object"] = "json_schema"
     llm_enable_thinking: bool = False
@@ -26,12 +29,23 @@ class Settings(BaseSettings):
     planner_min_transcript_confidence: float = 0.55
     realtime_sample_rate: int = 16_000
     realtime_vad_threshold: int = 500
-    realtime_silence_ms: int = 1000
+    realtime_silence_ms: int = 600
+    realtime_quiet_ms: int = 600
     realtime_max_utterance_ms: int = 15_000
     realtime_min_speech_ms: int = 300
     streaming_stt_enabled: bool = True
     streaming_stt_candidates: str = "hi-IN,en-IN"
     streaming_stt_transcript_timeout_seconds: float = 3.0
+    # Real phone calls. "none" keeps the browser as the phone. Credentials belong
+    # in backend/.env only; none of these has a usable default.
+    telephony_provider: Literal["none", "twilio"] = "none"
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+    # https address Twilio can reach (a tunnel to this server), no trailing slash.
+    public_base_url: str = ""
+    # The owner's own handset in E.164 form. The dialer may only call this number.
+    demo_handset_number: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

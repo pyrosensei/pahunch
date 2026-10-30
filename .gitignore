@@ -7,6 +7,7 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 *.db
+*.db.bak-*
 .coverage
 htmlcov/
 live_*.wav
