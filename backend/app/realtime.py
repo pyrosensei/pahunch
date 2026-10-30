@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
 import json
 import math
@@ -7,6 +9,7 @@ import sys
 import wave
 from array import array
 from dataclasses import dataclass
+from time import perf_counter
 
 from fastapi import WebSocket
 from sqlmodel import Session
@@ -14,19 +17,30 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.calls import utc_now
 from app.errors import DomainError
-from app.gnani import SpeechClient
+from app.gnani import GnaniError, SpeechClient
 from app.llm import StructuredLLM
 from app.models import AuditEvent
 from app.planner import MIN_CONFIDENCE, MIN_TRANSCRIPT_CONFIDENCE
 from app.streaming_stt import StreamingSTTClient, StreamingSTTError
-from app.voice import MAX_AUDIO_BYTES, VoiceTurnService
+from app.voice import ACK_PHRASE, MAX_AUDIO_BYTES, VoiceTurnService
+
+MIN_TTS_SAMPLE_RATE = 8_000
+MAX_TTS_SAMPLE_RATE = 48_000
+
+# An outbound call opens with the agent identifying itself; the customer should
+# never have to speak into a silent line to find out who called.
+OPENING_LINE = (
+    "Namaste, main SwiftCart ki delivery team se baat kar rahi hoon. "
+    "Aapke parcel ke baare mein ek minute baat karni hai — boliye?"
+)
 
 
 @dataclass(frozen=True)
 class RealtimeConfig:
     sample_rate: int = 16_000
     vad_threshold: int = 500
-    silence_ms: int = 700
+    silence_ms: int = 600
+    quiet_ms: int = 600
     max_utterance_ms: int = 15_000
     min_speech_ms: int = 300
 
@@ -36,6 +50,7 @@ def build_realtime_config(settings) -> RealtimeConfig:
         sample_rate=settings.realtime_sample_rate,
         vad_threshold=settings.realtime_vad_threshold,
         silence_ms=settings.realtime_silence_ms,
+        quiet_ms=settings.realtime_quiet_ms,
         max_utterance_ms=settings.realtime_max_utterance_ms,
         min_speech_ms=settings.realtime_min_speech_ms,
     )
@@ -70,19 +85,29 @@ def frame_is_speech(frame: bytes, threshold: int) -> bool:
 
 
 class UtteranceBuffer:
-    """Accumulates PCM16 frames and applies simple energy endpointing."""
+    """Accumulates PCM16 frames and applies energy endpointing.
+
+    Two thresholds end an utterance: a hard silence window for frames that
+    have fallen to the noise floor, and a shorter quiet window for frames
+    that are merely much quieter than speech. The quiet window is what keeps
+    a natural pause from adding a full second of dead air to every turn.
+    """
+
+    QUIET_FLOOR_RATIO = 0.35
 
     def __init__(self, config: RealtimeConfig):
         self._config = config
         self.pcm = bytearray()
         self.speech_ms = 0
         self.silence_ms = 0
+        self.quiet_ms = 0
         self._saw_speech = False
 
     def add(self, frame: bytes) -> bool:
         """Returns True when this frame is the first speech frame."""
         frame_ms = round(len(frame) / 2 / self._config.sample_rate * 1000)
-        is_speech = frame_is_speech(frame, self._config.vad_threshold)
+        rms = frame_rms(frame)
+        is_speech = rms >= self._config.vad_threshold
         started = False
         if is_speech:
             if not self._saw_speech:
@@ -90,8 +115,13 @@ class UtteranceBuffer:
                 started = True
             self.speech_ms += frame_ms
             self.silence_ms = 0
+            self.quiet_ms = 0
         elif self._saw_speech:
             self.silence_ms += frame_ms
+            if rms >= self._config.vad_threshold * self.QUIET_FLOOR_RATIO:
+                self.quiet_ms += frame_ms
+            else:
+                self.quiet_ms = 0
         if self._saw_speech:
             self.pcm.extend(frame)
         return started
@@ -102,15 +132,19 @@ class UtteranceBuffer:
 
     @property
     def complete(self) -> bool:
-        return self._saw_speech and (
-            self.silence_ms >= self._config.silence_ms
-            or self.speech_ms + self.silence_ms >= self._config.max_utterance_ms
+        if not self._saw_speech:
+            return False
+        if self.quiet_ms >= self._config.quiet_ms:
+            return True
+        return self.silence_ms >= self._config.silence_ms or (
+            self.speech_ms + self.silence_ms >= self._config.max_utterance_ms
         )
 
     def reset(self) -> None:
         self.pcm.clear()
         self.speech_ms = 0
         self.silence_ms = 0
+        self.quiet_ms = 0
         self._saw_speech = False
 
 
@@ -164,6 +198,31 @@ async def handle_voice_socket(
     speaking = False
     stream = streaming
     stream_ok = False
+    # The browser plays the agent at its own native AudioContext rate, so the
+    # server asks Timbre for exactly that rate and ships raw PCM16.
+    tts_sample_rate = config.sample_rate
+    ack_tasks: dict[int, asyncio.Task] = {}
+    greeting_task: asyncio.Task | None = None
+    pending_listening = False
+
+    async def prepare_ack() -> None:
+        """Synthesise the acknowledgement up front so it can be played instantly."""
+        rate = tts_sample_rate
+        if rate in ack_tasks:
+            return
+        synthesize_pcm = getattr(speech, "synthesize_pcm", None)
+        if synthesize_pcm is None:
+            return
+
+        async def run() -> None:
+            try:
+                pcm = await synthesize_pcm(ACK_PHRASE, sample_rate=rate)
+            except GnaniError as error:
+                audit("ACK_UNAVAILABLE", {"detail": str(error)})
+                return
+            service.set_ack(pcm, rate)
+
+        ack_tasks[rate] = asyncio.create_task(run())
 
     async def connect_stream() -> bool:
         nonlocal stream_ok
@@ -202,7 +261,7 @@ async def handle_voice_socket(
             audit("STREAMING_STT_FAILED", {"detail": str(error)})
 
     async def send_turn(response) -> None:
-        nonlocal speaking
+        """Announce the agent's reply before any audio exists."""
         await websocket.send_json(
             {
                 "type": "turn",
@@ -215,8 +274,109 @@ async def handle_voice_socket(
                 "planner": response.planner.model_dump(mode="json"),
                 "timings": response.timings.model_dump(mode="json"),
                 "audio_error": response.audio_error,
+                "audio_streamed": response.audio_streamed,
             }
         )
+
+    async def send_chunk(chunk: bytes) -> None:
+        nonlocal speaking
+        speaking = True
+        await websocket.send_json(
+            {
+                "type": "agent_audio_chunk",
+                "chunk_base64": base64.b64encode(chunk).decode("ascii"),
+                "sample_rate": tts_sample_rate,
+            }
+        )
+
+    async def send_audio_end(response) -> None:
+        await websocket.send_json(
+            {
+                "type": "agent_audio_end",
+                "audio_streamed": response.audio_streamed,
+                "audio_error": response.audio_error,
+                "ack_played": response.ack_played,
+                "timings": response.timings.model_dump(mode="json"),
+            }
+        )
+
+    async def greet() -> None:
+        """Speak the opening line, then hand the line to the customer."""
+        nonlocal speaking, listening, pending_listening
+        started = perf_counter()
+        first_audio_ms = 0
+        byte_count = 0
+        error: str | None = None
+        stream_pcm = getattr(speech, "stream_pcm", None)
+        try:
+            if stream_pcm is None:
+                error = "TTS_UNAVAILABLE"
+            else:
+                async for chunk in stream_pcm(OPENING_LINE, sample_rate=tts_sample_rate):
+                    if not chunk:
+                        continue
+                    if not first_audio_ms:
+                        first_audio_ms = round((perf_counter() - started) * 1000)
+                    byte_count += len(chunk)
+                    await send_chunk(chunk)
+        except GnaniError:
+            error = "TTS_UNAVAILABLE" if not byte_count else "TTS_INTERRUPTED"
+        except RuntimeError:
+            return  # socket closed mid-greeting
+        speaking = False
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_audio_end",
+                    "audio_streamed": first_audio_ms > 0,
+                    "audio_error": error,
+                    "ack_played": False,
+                    "timings": {
+                        "first_audio_ms": first_audio_ms,
+                        "tts_ms": round((perf_counter() - started) * 1000),
+                        "total_ms": round((perf_counter() - started) * 1000),
+                    },
+                }
+            )
+        except RuntimeError:
+            return
+        audit(
+            "OPENING_LINE_SPOKEN",
+            {"bytes": byte_count, "first_audio_ms": first_audio_ms, "error": error},
+        )
+        if pending_listening:
+            pending_listening = False
+            listening = True
+            buffer.reset()
+            await new_utterance()
+            await websocket.send_json({"type": "listening"})
+
+    async def deliver_turn(
+        text: str,
+        *,
+        detected_language: str | None,
+        transcript_confidence: float | None,
+        stt_ms: int,
+        stt_mode: str,
+        turn_started: float,
+    ) -> None:
+        nonlocal speaking
+        try:
+            response = await service.handle_transcript(
+                session_id,
+                text,
+                detected_language=detected_language,
+                transcript_confidence=transcript_confidence,
+                stt_ms=stt_ms,
+                stt_mode=stt_mode,
+                turn_started=turn_started,
+                turn_sink=send_turn,
+                audio_sink=send_chunk,
+                sample_rate=tts_sample_rate,
+            )
+        except DomainError as error:
+            await websocket.send_json({"type": "error", "detail": error.detail})
+            return
         if response.audio_base64:
             speaking = True
             await websocket.send_json(
@@ -226,12 +386,14 @@ async def handle_voice_socket(
                     "content_type": response.audio_content_type,
                 }
             )
+        await send_audio_end(response)
 
     async def process_utterance() -> None:
-        nonlocal stream_ok
+        nonlocal stream_ok, speaking
         await websocket.send_json(
             {"type": "speech_end", "duration_ms": buffer.speech_ms}
         )
+        utterance_ended_at = perf_counter()
         pcm = bytes(buffer.pcm)
         buffer.reset()
         if stream_ok:
@@ -242,29 +404,39 @@ async def handle_voice_socket(
                 audit("STREAMING_STT_FAILED", {"detail": str(error)})
                 transcript = None
             if transcript is not None:
-                try:
-                    response = await service.handle_transcript(
-                        session_id,
-                        transcript.text,
-                        detected_language=transcript.language,
-                        transcript_confidence=None,
-                        stt_ms=transcript.latency_ms,
-                        stt_mode="streaming",
-                    )
-                except DomainError as error:
-                    await websocket.send_json({"type": "error", "detail": error.detail})
-                    return
-                await send_turn(response)
+                await deliver_turn(
+                    transcript.text,
+                    detected_language=transcript.language,
+                    transcript_confidence=None,
+                    stt_ms=transcript.latency_ms,
+                    stt_mode="streaming",
+                    turn_started=utterance_ended_at,
+                )
                 return
         try:
             wav = pcm16_to_wav(pcm, config.sample_rate)
             response = await service.handle_audio(
-                session_id, wav, "utterance.wav", "audio/wav"
+                session_id,
+                wav,
+                "utterance.wav",
+                "audio/wav",
+                turn_sink=send_turn,
+                audio_sink=send_chunk,
+                sample_rate=tts_sample_rate,
             )
         except DomainError as error:
             await websocket.send_json({"type": "error", "detail": error.detail})
             return
-        await send_turn(response)
+        if response.audio_base64:
+            speaking = True
+            await websocket.send_json(
+                {
+                    "type": "agent_audio",
+                    "audio_base64": response.audio_base64,
+                    "content_type": response.audio_content_type,
+                }
+            )
+        await send_audio_end(response)
 
     await connect_stream()
 
@@ -281,6 +453,8 @@ async def handle_voice_socket(
                         speaking = False
                         listening = True
                         buffer.reset()
+                        if greeting_task is not None and not greeting_task.done():
+                            greeting_task.cancel()
                         audit("BARGE_IN", {"rms": round(frame_rms(frame))})
                         await websocket.send_json({"type": "stop_speaking"})
                         await websocket.send_json({"type": "listening"})
@@ -309,16 +483,34 @@ async def handle_voice_socket(
                 )
                 continue
             kind = control.get("type")
-            if kind == "start":
+            if kind == "config":
+                requested = control.get("tts_sample_rate")
+                if (
+                    isinstance(requested, int)
+                    and MIN_TTS_SAMPLE_RATE <= requested <= MAX_TTS_SAMPLE_RATE
+                ):
+                    tts_sample_rate = requested
+                await websocket.send_json(
+                    {"type": "config_ack", "tts_sample_rate": tts_sample_rate}
+                )
+                if greeting_task is None:
+                    greeting_task = asyncio.create_task(greet())
+                await prepare_ack()
+            elif kind == "start":
                 if stream is not None and not stream_ok:
                     await connect_stream()
                 # A new turn starts after the previous reply finished playing;
                 # only raw frames arriving mid-playback are a barge-in.
                 speaking = False
-                listening = True
                 buffer.reset()
                 await new_utterance()
-                await websocket.send_json({"type": "listening"})
+                if greeting_task is not None and not greeting_task.done():
+                    # Hold the microphone until the opening line has played, so
+                    # the agent never hears itself through the speakers.
+                    pending_listening = True
+                else:
+                    listening = True
+                    await websocket.send_json({"type": "listening"})
             elif kind == "stop":
                 if listening and buffer.has_utterance:
                     listening = False
@@ -332,6 +524,28 @@ async def handle_voice_socket(
                 listening = False
                 buffer.reset()
                 await cancel_utterance()
+            elif kind == "scripted_turn":
+                # A scripted turn bypasses speech recognition so the demo can
+                # be replayed without a microphone. Everything downstream
+                # (planner, policy, commit) is the live path.
+                listening = False
+                text = control.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    await websocket.send_json(
+                        {"type": "error", "detail": "scripted_turn needs a text field"}
+                    )
+                    continue
+                await websocket.send_json(
+                    {"type": "speech_end", "duration_ms": 0, "scripted": True}
+                )
+                await deliver_turn(
+                    text.strip(),
+                    detected_language=control.get("detected_language"),
+                    transcript_confidence=None,
+                    stt_ms=0,
+                    stt_mode="scripted",
+                    turn_started=perf_counter(),
+                )
             else:
                 await websocket.send_json(
                     {"type": "error", "detail": "Unknown control message"}
@@ -339,6 +553,10 @@ async def handle_voice_socket(
     except WebSocketDisconnect:
         audit("REALTIME_DISCONNECTED", {"code": "client"})
     finally:
+        for task in ack_tasks.values():
+            task.cancel()
+        if greeting_task is not None:
+            greeting_task.cancel()
         if stream is not None:
             try:
                 await stream.close()
