@@ -102,6 +102,17 @@ class CallService:
             return "HIGH_VALUE_DELIVERY"
         return "DELIVERY_CONFIRMATION"
 
+    def active_call(self, order_id: int) -> CallSession | None:
+        """The call still in progress for an order, if any."""
+        calls = self.db.exec(
+            select(CallSession)
+            .where(CallSession.order_id == order_id)
+            .order_by(CallSession.started_at.desc())
+        ).all()
+        return next(
+            (call for call in calls if call.state not in TERMINAL_STATES), None
+        )
+
     def create_call(self, order_id: int) -> CallSession:
         order = self._order(order_id)
         self._check_eligibility(order)

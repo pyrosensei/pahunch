@@ -12,7 +12,7 @@ from app.calls import CallService
 from app.config import settings
 from app.db import get_session, init_db
 from app.errors import DomainError
-from app.gnani import SpeechClient, build_gnani_speech_client
+from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
 from app.llm import StructuredLLM, build_llm_client
 from app.models import AuditEvent, CallSession, DeliverySlot, Order
 from app.planner import PlannerService
@@ -63,7 +63,16 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if init_database:
             init_db()
-        yield
+        key_slots = len(split_api_keys(settings.gnani_api_key, settings.gnani_api_keys))
+        # Logged so a restart shows whether the extra keys were picked up.
+        print(f"pahunch: {key_slots} Gnani key slot(s) available")
+        try:
+            yield
+        finally:
+            for client in (planner_llm, speech):
+                closer = getattr(client, "aclose", None)
+                if closer is not None:
+                    await closer()
 
     app = FastAPI(title="Pahunch API", version="0.1.0", lifespan=lifespan)
 
@@ -110,6 +119,13 @@ def create_app(
     @app.post("/api/orders/{order_id}/call", response_model=CallSession, status_code=201)
     def create_call(order_id: int, session: SessionDep) -> CallSession:
         return CallService(session).create_call(order_id)
+
+    @app.get("/api/orders/{order_id}/active-call", response_model=CallSession)
+    def active_call(order_id: int, session: SessionDep) -> CallSession:
+        call = CallService(session).active_call(order_id)
+        if call is None:
+            raise HTTPException(status_code=404, detail="No active call for this order")
+        return call
 
     @app.get("/api/sessions/{session_id}", response_model=CallSession)
     def get_call_session(session_id: str, session: SessionDep) -> CallSession:
