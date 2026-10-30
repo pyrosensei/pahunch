@@ -316,7 +316,7 @@ async def collect_turn(ws, timeout: float = 120) -> tuple[dict | None, list[dict
         now = time.perf_counter()
         budget = timeout - (now - started)
         if turn_seen_at is not None:
-            budget = min(budget, 12 - (now - turn_seen_at))
+            budget = min(budget, 30 - (now - turn_seen_at))
         if budget <= 0:
             if turn is not None:
                 return turn, events, False
@@ -335,7 +335,7 @@ async def collect_turn(ws, timeout: float = 120) -> tuple[dict | None, list[dict
             turn_seen_at = time.perf_counter()
             if event.get("audio_error"):
                 return turn, events, True
-        elif event["type"] == "agent_audio":
+        elif event["type"] in ("agent_audio", "agent_audio_end"):
             return turn, events, True
 
 
@@ -583,6 +583,14 @@ async def run_scenario(http, speech: SpeechCache, scenario: dict) -> dict:
                 len(base64.b64decode(event["audio_base64"]))
                 for event in events
                 if event["type"] == "agent_audio"
+            ) + sum(
+                len(base64.b64decode(event["chunk_base64"]))
+                for event in events
+                if event["type"] == "agent_audio_chunk"
+            )
+            ack_played = any(
+                event["type"] == "agent_audio_end" and event.get("ack_played")
+                for event in events
             )
             planner = turn_event["planner"]
             turn_data = turn_event["turn"]
@@ -609,6 +617,8 @@ async def run_scenario(http, speech: SpeechCache, scenario: dict) -> dict:
                 "confirmed": turn_data.get("customer_confirmed"),
                 "message": turn_event["agent_message"],
                 "timings": turn_event["timings"],
+                "first_audio_ms": turn_event["timings"].get("first_audio_ms", 0),
+                "ack_played": ack_played,
                 "client_ms": client_ms,
                 "agent_audio_bytes": agent_audio_bytes,
                 "event_types": [event["type"] for event in events],
@@ -787,6 +797,9 @@ def summarize(results: list[dict], usage: dict) -> dict:
     planner_ms = [turn["timings"]["planner_ms"] for turn in turns]
     tts_ms = [turn["timings"]["tts_ms"] for turn in turns]
     client_ms = [turn["client_ms"] for turn in turns]
+    first_audio_ms = [turn.get("first_audio_ms") or 0 for turn in turns]
+    first_audio_ms = [value for value in first_audio_ms if value > 0]
+    ack_turns = sum(1 for turn in turns if turn.get("ack_played"))
     commits = [commit for item in live for commit in item.get("commits", [])]
     violations_committed = sum(
         1
@@ -829,6 +842,11 @@ def summarize(results: list[dict], usage: dict) -> dict:
             "total_p50": percentile(total_ms, 0.5),
             "total_p95": percentile(total_ms, 0.95),
             "total_max": round(max(total_ms), 1) if total_ms else 0,
+            "first_audio_p50": percentile(first_audio_ms, 0.5),
+            "first_audio_p95": percentile(first_audio_ms, 0.95),
+            "first_audio_max": round(max(first_audio_ms), 1) if first_audio_ms else 0,
+            "first_audio_turns": len(first_audio_ms),
+            "ack_turns": ack_turns,
             "stt_p50": percentile(stt_ms, 0.5),
             "stt_p95": percentile(stt_ms, 0.95),
             "planner_p50": percentile(planner_ms, 0.5),
@@ -879,6 +897,10 @@ def markdown(report: dict) -> str:
         (f"- Turn latency (server voice path): P50 {latency['total_p50']} ms, "
         f"P95 {latency['total_p95']} ms, max {latency['total_max']} ms "
         f"over {latency['turns']} turns; target was P95 < 2500 ms"),
+        (f"- First audible agent response: P50 {latency['first_audio_p50']} ms, "
+        f"P95 {latency['first_audio_p95']} ms, max {latency['first_audio_max']} ms "
+        f"over {latency['first_audio_turns']} turns "
+        f"(acknowledgement played on {latency['ack_turns']} turns)"),
         (f"- Client-observed stop-to-turn latency: P50 {latency['client_p50']} ms, "
         f"P95 {latency['client_p95']} ms"),
         (f"- Stage P50/P95: STT {latency['stt_p50']}/{latency['stt_p95']} ms, "
@@ -935,6 +957,10 @@ def markdown(report: dict) -> str:
         "safe reply and the scenario fails its task check rather than hiding "
         "the stall."),
         "- Noise is white Gaussian noise mixed at 8 dB SNR, not recorded street audio.",
+        ("- The planner is a remote LLM call whose latency is provider-bound; a "
+        "pre-synthesised acknowledgement voice covers it so the caller's first "
+        "audible response stays near one second. The acknowledgement says only "
+        "that the agent is checking and promises nothing."),
         ("- Each scenario uses a synthetic fixture order in a disposable database; "
         "the production cooldown and order lifecycle are exercised by unit tests."),
         "- Full audit trails are stored per scenario in the JSON report.",
@@ -969,7 +995,9 @@ async def run(args) -> int:
             raise SystemExit(f"No scenarios matched {args.only}")
     live = [item for item in scenarios if item.get("mode") == "live"]
 
-    speech_client = build_gnani_speech_client(settings)
+    # The harness keeps to the primary key so the server under test keeps
+    # every extra slot for itself.
+    speech_client = build_gnani_speech_client(settings, extra_api_keys="")
     if speech_client is None:
         raise SystemExit("Gnani speech is not configured; set GNANI_API_KEY in backend/.env.")
     if not settings.llm_model:
