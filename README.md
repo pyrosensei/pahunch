@@ -10,7 +10,7 @@ Prisma v3.0 streaming STT · Timbre v3.0 TTS · NVIDIA NIM planner · FastAPI ·
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
 [![NVIDIA NIM](https://img.shields.io/badge/planner-NVIDIA%20NIM-76B900.svg)](https://build.nvidia.com)
-[![Tests](https://img.shields.io/badge/tests-360%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Tests](https://img.shields.io/badge/tests-369%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -270,6 +270,16 @@ ambiguous mixed-language turns can be misclassified. Streaming STT requests
 English and Hindi confirmations as Devanagari. Human speech and voice quality
 remain unverified. See [synthetic test review](SYNTHETIC_TEST_REVIEW.md).
 
+After synthesizing the opening, the socket prepares acknowledgements in all
+three supported languages at the selected output rate. Completed audio is used
+only for its matching language. A customer turn cancels unfinished preparation
+before planning or reply synthesis, so optional cache work cannot hold the shared
+speech slot ahead of the response. Cancelled preparation can resume after the
+reply, and disconnect awaits its cleanup. `VOICE_TURN` audits record
+`first_response_audio_ms` separately from `first_audio_ms`: a cached
+acknowledgement can precede the substantive reply. Measurements and limits are
+in [the first-turn audio review](FIRST_TURN_AUDIO_REVIEW.md).
+
 Any non-confirmation customer turn clears previous confirmation. An intervening
 question or degraded reply requires a fresh plan offer before a later yes can
 confirm it. The explicit-confirmation vocabulary and policy-at-commit checks are
@@ -447,7 +457,7 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **360 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **369 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | NVIDIA NIM | The model returns schema-valid decisions for fixed Hinglish turns |
@@ -563,7 +573,7 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 360 tests, no external network required
+uv run pytest              # 369 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
 ```
 
