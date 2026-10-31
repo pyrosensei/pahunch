@@ -16,7 +16,8 @@ from app.dialer import Dialer
 from app.errors import DomainError
 from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
 from app.llm import StructuredLLM, build_llm_client
-from app.models import AuditEvent, CallSession, DeliverySlot, DialerOrderState, Order
+from app.models import AuditEvent, CallRuntime, CallSession, DeliverySlot, DialerOrderState, Order
+from app.phone_media import router as phone_media_router
 from app.planner import PlannerService
 from app.policy import validate_plan
 from app.realtime import RealtimeConfig, build_realtime_config, handle_voice_socket
@@ -33,6 +34,8 @@ from app.schemas import (
     VoiceTurnResponse,
 )
 from app.streaming_stt import StreamingSTTClient, build_streaming_stt_client
+from app.telephony import TwilioTransport
+from app.telephony import router as telephony_router
 from app.voice import MAX_AUDIO_BYTES, VoiceTurnService
 
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -48,9 +51,13 @@ def create_app(
     max_audio_bytes: int = MAX_AUDIO_BYTES,
     realtime_config: RealtimeConfig | None = None,
     dialer: Dialer | None = None,
+    telephony: TwilioTransport | None = None,
 ) -> FastAPI:
     voice_owners: set[str] = set()
     automatic_dialer = dialer
+    phone_transport = telephony
+    if phone_transport is None and init_database and settings.telephony_provider == "twilio":
+        phone_transport = TwilioTransport(engine, settings)
     if automatic_dialer is None and init_database and settings.dialer_enabled:
         automatic_dialer = Dialer(
             engine,
@@ -61,6 +68,7 @@ def create_app(
         )
     if automatic_dialer is not None:
         automatic_dialer.live_sessions = voice_owners
+        automatic_dialer.telephony = phone_transport
     planner_llm = llm_client if llm_client is not None else build_llm_client(settings)
     speech = (
         build_gnani_speech_client(settings)
@@ -96,10 +104,22 @@ def create_app(
                 closer = getattr(client, "aclose", None)
                 if closer is not None:
                     await closer()
+            if phone_transport is not None:
+                phone_transport.close()
 
     app = FastAPI(title="Pahunch API", version="0.1.0", lifespan=lifespan)
     app.state.dialer = automatic_dialer
+    app.state.telephony = phone_transport
     app.state.voice_owners = voice_owners
+    app.state.phone_speech = speech
+    app.state.phone_llm = planner_llm
+    app.state.phone_config = realtime_config if realtime_config is not None else build_realtime_config(settings)
+    app.state.phone_streaming_factory = (
+        (lambda: build_streaming_stt_client(settings.model_copy(update={"realtime_sample_rate": 8000})))
+        if streaming_stt_client is _SPEECH_UNSET else new_streaming_stt
+    )
+    app.include_router(telephony_router)
+    app.include_router(phone_media_router)
 
     @app.exception_handler(DomainError)
     def domain_error_handler(_, error: DomainError) -> JSONResponse:
@@ -115,7 +135,7 @@ def create_app(
             return automatic_dialer.status()
         return {
             "running": False, "transport": "browser", "last_sweep_at": None, "last_error": None,
-            "phone": None,
+            "phone": phone_transport.readiness() if phone_transport is not None else None,
             "orders": [s.model_dump(mode="json") for s in session.exec(
                 select(DialerOrderState).order_by(DialerOrderState.order_id)
             ).all()],
@@ -269,6 +289,11 @@ def create_app(
             await websocket.send_json(
                 {"type": "error", "detail": "An active voice socket already owns this session"}
             )
+            await websocket.close(code=4409)
+            return
+        runtime = session.get(CallRuntime, session_id)
+        if runtime is not None and runtime.transport == "twilio":
+            await websocket.send_json({"type": "error", "detail": "This session uses the phone transport"})
             await websocket.close(code=4409)
             return
         voice_owners.add(session_id)

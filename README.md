@@ -402,3 +402,4 @@ MIT — see [LICENSE](LICENSE).
 - `feat/call-scheduling`: see the focused commits on this stacked branch.
 - `fix/voice-session-runtime`: see the focused commits on this stacked branch.
 - `fix/voice-session-runtime`: see the focused commits on this stacked branch.
+- `feat/guarded-phone-adapter`: see the focused commits on this stacked branch.
