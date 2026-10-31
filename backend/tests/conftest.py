@@ -80,7 +80,7 @@ class ScriptedSpeech:
         assert isinstance(outcome, Transcript)
         return outcome
 
-    async def synthesize(self, text: str) -> SpeechAudio:
+    async def synthesize(self, text: str, *, language: str | None = None) -> SpeechAudio:
         self.synthesize_calls.append(text)
         if not self._audios:
             raise AssertionError("ScriptedSpeech has no remaining audio")

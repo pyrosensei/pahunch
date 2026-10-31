@@ -1,28 +1,45 @@
-/**
- * Streams raw PCM16 from the agent into the speakers.
- *
- * The server sends the agent's voice as raw PCM16 chunks so playback starts
- * ~400 ms after the request instead of waiting for the whole sentence. The
- * worklet keeps a small queue of Float32 chunks and emits silence when it
- * runs dry, which keeps the audio clock running without gaps.
- */
+// Queue underruns are pauses in synthesis, not completion of agent playback.
 class PcmPlayer extends AudioWorkletProcessor {
   constructor() {
     super();
     this._chunks = [];
     this._offset = 0;
-    this._hasData = false;
+    this._generation = null;
+    this._retired = 0;
+    this._ended = false;
+    this._connection = 0;
     this.port.onmessage = (event) => {
       const message = event.data || {};
-      if (message.type === "flush") {
+      if (message.type === "connection" && message.connection_id > this._connection) {
+        this._connection = message.connection_id;
         this._chunks = [];
         this._offset = 0;
-        this._hasData = false;
+        this._generation = null;
+        this._retired = 0;
+        this._ended = false;
         return;
       }
-      if (message.type === "pcm" && message.samples) {
+      if ((message.connection_id || 0) !== this._connection) return;
+      if (message.type === "flush") {
+        this._retired = Math.max(this._retired, message.generation_id || this._generation || 0);
+        this._chunks = [];
+        this._offset = 0;
+        this._generation = null;
+        this._ended = false;
+        return;
+      }
+      if (message.type === "begin" && message.generation_id > this._retired &&
+          (this._generation === null || message.generation_id > this._generation)) {
+        this._chunks = [];
+        this._offset = 0;
+        this._generation = message.generation_id;
+        this._ended = false;
+      }
+      if (message.generation_id !== this._generation) return;
+      if (message.type === "pcm" && message.samples && !this._ended) {
         this._chunks.push(message.samples);
       }
+      if (message.type === "end") this._ended = true;
     };
   }
 
@@ -47,11 +64,12 @@ class PcmPlayer extends AudioWorkletProcessor {
     if (written < output.length) {
       output.fill(0, written);
     }
-    if (written > 0) {
-      this._hasData = true;
-    } else if (this._hasData) {
-      this._hasData = false;
-      this.port.postMessage({ type: "drained" });
+    if (this._ended && this._chunks.length === 0 && this._generation !== null) {
+      this.port.postMessage({ type: "drained", generation_id: this._generation,
+        connection_id: this._connection });
+      this._retired = this._generation;
+      this._generation = null;
+      this._ended = false;
     }
     return true;
   }

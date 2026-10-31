@@ -60,7 +60,9 @@ class SpeechClient(Protocol):
         content_type: str,
     ) -> Transcript: ...
 
-    async def synthesize(self, text: str, *, container: str = "mp3") -> SpeechAudio: ...
+    async def synthesize(
+        self, text: str, *, container: str = "mp3", language: str | None = None
+    ) -> SpeechAudio: ...
 
 
 def _optional_confidence(value: object) -> float | None:
@@ -112,8 +114,8 @@ class GnaniSpeechClient:
         self._timeout_seconds = timeout_seconds
         self._transport = transport
         self._pool = HttpClientPool(timeout=timeout_seconds, transport=transport)
-        self._tts_cache: dict[tuple[str, str], SpeechAudio] = {}
-        self._pcm_cache: dict[tuple[str, int], bytes] = {}
+        self._tts_cache: dict[tuple[str, str, str], SpeechAudio] = {}
+        self._pcm_cache: dict[tuple[str, int, str], bytes] = {}
 
     def _next_key(self) -> str:
         key = self._api_keys[self._key_index % len(self._api_keys)]
@@ -191,9 +193,10 @@ class GnaniSpeechClient:
             latency_ms=round((perf_counter() - started) * 1_000),
         )
 
-    async def synthesize(self, text: str, *, container: str = "mp3") -> SpeechAudio:
+    async def synthesize(self, text: str, *, container: str = "mp3", language: str | None = None) -> SpeechAudio:
         started = perf_counter()
-        key = (text, container)
+        language = language or self._tts_language
+        key = (text, container, language)
         cached = self._tts_cache.get(key)
         if cached is not None:
             return SpeechAudio(
@@ -205,7 +208,7 @@ class GnaniSpeechClient:
             "text": text,
             "voice": self._tts_voice,
             "model": self._tts_model,
-            "language": self._tts_language,
+            "language": language,
             # MP3 keeps the WebSocket agent_audio frames an order of magnitude
             # smaller than WAV and decodes fine in browsers.
             "audio_config": {"container": container},
@@ -248,6 +251,8 @@ class GnaniSpeechClient:
         text: str,
         *,
         sample_rate: int = 16_000,
+        language: str | None = None,
+        container: str = "raw",
     ) -> AsyncIterator[bytes]:
         """Yield raw PCM16 chunks as Timbre synthesises them.
 
@@ -259,8 +264,8 @@ class GnaniSpeechClient:
             "text": text,
             "voice": self._tts_voice,
             "model": self._tts_model,
-            "language": self._tts_language,
-            "audio_config": {"container": "raw", "sample_rate": sample_rate},
+            "language": language or self._tts_language,
+            "audio_config": {"container": container, "sample_rate": sample_rate},
         }
         for attempt in range(len(GNANI_RETRY_DELAYS) + 1):
             rate_limited = False
@@ -304,7 +309,7 @@ class GnaniSpeechClient:
                 await asyncio.sleep(delay + random.uniform(0, delay * 0.3))
         raise GnaniResponseError("Gnani TTS stream returned HTTP 429 when rate limited")
 
-    async def synthesize_pcm_blocking(self, text: str, *, sample_rate: int = 16_000) -> bytes:
+    async def synthesize_pcm_blocking(self, text: str, *, sample_rate: int = 16_000, language: str | None = None, container: str = "raw") -> bytes:
         """Whole-utterance PCM16 from the non-streaming endpoint.
 
         This is the fallback for the SSE stream: it returns the complete
@@ -315,8 +320,8 @@ class GnaniSpeechClient:
             "text": text,
             "voice": self._tts_voice,
             "model": self._tts_model,
-            "language": self._tts_language,
-            "audio_config": {"container": "raw", "sample_rate": sample_rate},
+            "language": language or self._tts_language,
+            "audio_config": {"container": container, "sample_rate": sample_rate},
         }
         try:
             response = await self._request(
@@ -341,13 +346,14 @@ class GnaniSpeechClient:
     async def aclose(self) -> None:
         await self._pool.aclose()
 
-    async def synthesize_pcm(self, text: str, *, sample_rate: int = 16_000) -> bytes:
+    async def synthesize_pcm(self, text: str, *, sample_rate: int = 16_000, language: str | None = None) -> bytes:
         """Whole-utterance PCM16, cached so it can be replayed for free."""
-        key = (text, sample_rate)
+        language = language or self._tts_language
+        key = (text, sample_rate, language)
         cached = self._pcm_cache.get(key)
         if cached is not None:
             return cached
-        chunks = [chunk async for chunk in self.stream_pcm(text, sample_rate=sample_rate)]
+        chunks = [chunk async for chunk in self.stream_pcm(text, sample_rate=sample_rate, language=language)]
         data = b"".join(chunks)
         if not data:
             raise GnaniResponseError("Gnani TTS returned no audio")

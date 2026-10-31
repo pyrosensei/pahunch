@@ -295,14 +295,17 @@ def test_barge_in_stops_agent_audio_and_accepts_confirmation(
             ws.receive_json()  # speech_start
             ws.receive_json()  # speech_end
             assert ws.receive_json()["state"] == "PENDING_CONFIRMATION"
-            assert ws.receive_json()["type"] == "agent_audio"
+            first_audio = ws.receive_json()
+            assert first_audio["type"] == "agent_audio"
             ws.receive_json()  # agent_audio_end
 
             ws.send_bytes(loud())
-            assert ws.receive_json() == {"type": "stop_speaking"}
+            ws.send_bytes(loud())
+            assert ws.receive_json() == {
+                "type": "stop_speaking", "generation_id": first_audio["generation_id"],
+            }
             assert ws.receive_json() == {"type": "listening"}
             assert ws.receive_json() == {"type": "speech_start"}
-            ws.send_bytes(loud())
             ws.send_bytes(loud())
             ws.send_bytes(silence())
             ws.send_bytes(silence())
@@ -730,16 +733,16 @@ class StreamingSpeech:
     async def transcribe(self, audio, *, filename, content_type):
         return Transcript(text="6 se 8 aa jaana", confidence=0.9, latency_ms=50)
 
-    async def synthesize(self, text: str) -> SpeechAudio:
+    async def synthesize(self, text: str, *, language: str | None = None) -> SpeechAudio:
         self.synthesize_calls.append(text)
         return SpeechAudio(data=b"FALLBACK", content_type="audio/wav", latency_ms=1)
 
-    async def stream_pcm(self, text: str, *, sample_rate: int = 16_000):
+    async def stream_pcm(self, text: str, *, sample_rate: int = 16_000, language: str | None = None):
         self.stream_calls.append({"text": text, "sample_rate": sample_rate})
         for chunk in self._chunks:
             yield chunk
 
-    async def synthesize_pcm(self, text: str, *, sample_rate: int = 16_000) -> bytes:
+    async def synthesize_pcm(self, text: str, *, sample_rate: int = 16_000, language: str | None = None) -> bytes:
         self.ack = b"ACK" + str(sample_rate).encode()
         self.ack_ready = True
         return self.ack
@@ -870,13 +873,13 @@ class FailingStreamSpeech(StreamingSpeech):
         super().__init__([])
         self.blocking_calls: list[dict] = []
 
-    async def stream_pcm(self, text: str, *, sample_rate: int = 16_000):
+    async def stream_pcm(self, text: str, *, sample_rate: int = 16_000, language: str | None = None):
         self.stream_calls.append({"text": text, "sample_rate": sample_rate})
         raise GnaniResponseError("Gnani TTS returned HTTP 429")
         yield b""  # pragma: no cover - unreachable, keeps this an async generator
 
     async def synthesize_pcm_blocking(
-        self, text: str, *, sample_rate: int = 16_000
+        self, text: str, *, sample_rate: int = 16_000, language: str | None = None
     ) -> bytes:
         self.blocking_calls.append({"text": text, "sample_rate": sample_rate})
         return b"\x09\x0a\x0b\x0c"
@@ -913,7 +916,7 @@ class UnrecoverableStreamSpeech(FailingStreamSpeech):
     """A speech client with no way to produce audio."""
 
     async def synthesize_pcm_blocking(
-        self, text: str, *, sample_rate: int = 16_000
+        self, text: str, *, sample_rate: int = 16_000, language: str | None = None
     ) -> bytes:
         self.blocking_calls.append({"text": text, "sample_rate": sample_rate})
         raise GnaniGatewayError("Gnani TTS request failed")

@@ -18,6 +18,7 @@ from app.gnani import (
     GnaniTimeoutError,
     SpeechClient,
 )
+from app.language import redact_customer_text, response_language
 from app.llm import StructuredLLM
 from app.models import AuditEvent
 from app.planner import (
@@ -120,13 +121,13 @@ class VoiceTurnService:
             min_confidence=min_confidence,
             min_transcript_confidence=min_transcript_confidence,
         )
-        self._acks: dict[int, bytes] = {}
+        self._acks: dict[tuple[int, str], bytes] = {}
 
-    def set_ack(self, pcm: bytes, sample_rate: int) -> None:
-        self._acks[sample_rate] = pcm
+    def set_ack(self, pcm: bytes, sample_rate: int, language: str = "hi-en") -> None:
+        self._acks[(sample_rate, language)] = pcm
 
-    def _ack_for(self, sample_rate: int) -> bytes | None:
-        return self._acks.get(sample_rate)
+    def _ack_for(self, sample_rate: int, language: str) -> bytes | None:
+        return self._acks.get((sample_rate, language))
 
     async def _speak(
         self,
@@ -135,6 +136,7 @@ class VoiceTurnService:
         sample_rate: int,
         audio_sink: AudioSink,
         mark_first_audio: Callable[[], None],
+        language: str,
     ) -> SpokenAudio:
         """Speak the agent's reply, falling back to a blocking synthesis.
 
@@ -149,7 +151,7 @@ class VoiceTurnService:
             for _ in range(2):
                 size = 0
                 try:
-                    async for chunk in stream_pcm(text, sample_rate=sample_rate):
+                    async for chunk in stream_pcm(text, sample_rate=sample_rate, language=language):
                         if not chunk:
                             continue
                         size += len(chunk)
@@ -174,7 +176,7 @@ class VoiceTurnService:
         if blocking is None:
             return SpokenAudio(error="TTS_UNAVAILABLE", detail="no blocking synthesis")
         try:
-            data = await blocking(text, sample_rate=sample_rate)
+            data = await blocking(text, sample_rate=sample_rate, language=language)
         except GnaniTimeoutError as error:
             return SpokenAudio(error="TTS_TIMEOUT", detail=str(error))
         except GnaniResponseError as error:
@@ -195,8 +197,9 @@ class VoiceTurnService:
         turn_sink: TurnSink | None = None,
         audio_sink: AudioSink | None = None,
         sample_rate: int = 16_000,
+        turn_started: float | None = None,
     ) -> VoiceTurnResponse:
-        started = perf_counter()
+        started = perf_counter() if turn_started is None else turn_started
         call = self.calls.get_call(session_id)
         if call.state not in PLANNER_STATES:
             raise DomainError(
@@ -262,7 +265,7 @@ class VoiceTurnService:
                 f"Voice turns are not available in call state {call.state.value}",
             )
 
-        text = text.strip()
+        text = redact_customer_text(text.strip())
         if not text:
             raise DomainError(422, "No speech was detected in the audio.")
         if len(text) > 2_000:
@@ -280,16 +283,21 @@ class VoiceTurnService:
         )
         ack_played = False
         first_audio_at = None
-        ack = self._ack_for(sample_rate) if audio_sink is not None else None
-        if ack is not None:
-            # Play the acknowledgement only if the planner is slow enough that
-            # the caller would otherwise hear nothing at all.
-            done, _ = await asyncio.wait({planner_task}, timeout=ACK_DELAY_SECONDS)
-            if not done:
-                first_audio_at = perf_counter()
-                await audio_sink(ack)
-                ack_played = True
-        planner_response = await planner_task
+        language = response_language(text)
+        ack = self._ack_for(sample_rate, language) if audio_sink is not None else None
+        try:
+            if ack is not None:
+                # An acknowledgement does not transfer ownership of the planner task.
+                done, _ = await asyncio.wait({planner_task}, timeout=ACK_DELAY_SECONDS)
+                if not done:
+                    first_audio_at = perf_counter()
+                    await audio_sink(ack)
+                    ack_played = True
+            planner_response = await planner_task
+        finally:
+            if not planner_task.done():
+                planner_task.cancel()
+            await asyncio.gather(planner_task, return_exceptions=True)
         planner_ms = round((perf_counter() - planner_started) * 1_000)
 
         response = VoiceTurnResponse(
@@ -328,6 +336,7 @@ class VoiceTurnService:
                 sample_rate=sample_rate,
                 audio_sink=audio_sink,
                 mark_first_audio=mark_first_audio,
+                language=planner_response.planner.response_language,
             )
             audio_bytes = spoken.size
             audio_streamed = spoken.streamed
@@ -340,7 +349,8 @@ class VoiceTurnService:
             for _ in range(2):
                 try:
                     speech_audio = await self.speech.synthesize(
-                        planner_response.agent_message
+                        planner_response.agent_message,
+                        language=planner_response.planner.response_language,
                     )
                 except GnaniTimeoutError as error:
                     audio_error, audio_error_detail = "TTS_TIMEOUT", str(error)
@@ -387,6 +397,9 @@ class VoiceTurnService:
                         "audio_streamed": audio_streamed,
                         "ack_played": ack_played,
                         "detected_language": detected_language,
+                        "response_language": planner_response.planner.response_language,
+                        "wording_source": planner_response.planner.wording_source,
+                        "fallback_reason": planner_response.planner.fallback_reason,
                         "transcript_confidence": transcript_confidence,
                         "transcript_chars": len(text),
                         "audio_error": audio_error,
