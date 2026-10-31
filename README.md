@@ -10,7 +10,6 @@ Prisma v3.0 streaming STT · Timbre v3.0 TTS · NVIDIA NIM planner · FastAPI ·
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
 [![NVIDIA NIM](https://img.shields.io/badge/planner-NVIDIA%20NIM-76B900.svg)](https://build.nvidia.com)
-[![Tests](https://img.shields.io/badge/tests-142%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -395,3 +394,7 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), [SQLModel](https://sqlmodel
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Feature stack snapshot
+
+- `feat/runtime-contracts`: see the focused commits on this stacked branch.

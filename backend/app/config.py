@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,9 +34,23 @@ class Settings(BaseSettings):
     realtime_quiet_ms: int = 600
     realtime_max_utterance_ms: int = 15_000
     realtime_min_speech_ms: int = 300
+    realtime_adaptive_vad: bool = True
+    realtime_vad_floor: int = 120
+    realtime_vad_ceiling: int = 12_000
+    realtime_noise_ratio: float = 3.0
+    realtime_calibration_ms: int = 300
+    realtime_speech_start_ms: int = 100
+    realtime_barge_in_ms: int = 160
+    realtime_pre_roll_ms: int = 200
+    realtime_no_speech_ms: int = 5_000
     streaming_stt_enabled: bool = True
     streaming_stt_candidates: str = "hi-IN,en-IN"
     streaming_stt_transcript_timeout_seconds: float = 3.0
+    dialer_enabled: bool = True
+    dialer_interval_seconds: float = Field(default=5, ge=0.1)
+    dialer_waiting_timeout_seconds: float = Field(default=120, ge=1)
+    dialer_disconnect_grace_seconds: float = Field(default=30, ge=1)
+    dialer_idle_timeout_seconds: float = Field(default=300, ge=1)
     # Real phone calls. "none" keeps the browser as the phone. Credentials belong
     # in backend/.env only; none of these has a usable default.
     telephony_provider: Literal["none", "twilio"] = "none"
@@ -46,6 +61,11 @@ class Settings(BaseSettings):
     public_base_url: str = ""
     # The owner's own handset in E.164 form. The dialer may only call this number.
     demo_handset_number: str = ""
+    twilio_console_verified: bool = False
+    twilio_streaming_verified: bool = False
+    gnani_phone_demo_approved: bool = False
+    # One approval authorizes only this existing local session, never a future retry.
+    twilio_approved_session_id: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

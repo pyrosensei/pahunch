@@ -12,7 +12,7 @@ TERMINAL_STATES = {
 
 ALLOWED_TRANSITIONS = {
     CallState.CREATED: {CallState.CALLING},
-    CallState.CALLING: {CallState.CONNECTED, CallState.NO_ANSWER},
+    CallState.CALLING: {CallState.CONNECTED, CallState.NO_ANSWER, CallState.TOOL_FAILURE},
     CallState.CONNECTED: {
         CallState.CONTEXT_CONFIRMATION,
         CallState.UNREACHABLE,
