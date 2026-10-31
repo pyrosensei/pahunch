@@ -33,8 +33,7 @@ MAX_AUDIO_BYTES = 10_000_000
 
 # The planner is a remote LLM call that cannot be made faster than the
 # provider allows. A short, pre-synthesised acknowledgement is played while it
-# runs so the caller hears the agent within a second instead of dead air. It
-# makes no promise about timing, only that the agent is working.
+# runs. This is listening feedback, separate from the substantive reply.
 ACK_PHRASE = "Ji, main check kar rahi hoon."
 ACK_DELAY_SECONDS = 0.55
 
@@ -283,6 +282,7 @@ class VoiceTurnService:
         )
         ack_played = False
         first_audio_at = None
+        first_response_audio_at = None
         language = response_language(text)
         ack = self._ack_for(sample_rate, language) if audio_sink is not None else None
         try:
@@ -323,9 +323,11 @@ class VoiceTurnService:
         tts_started = perf_counter()
 
         def mark_first_audio() -> None:
-            nonlocal first_audio_at
+            nonlocal first_audio_at, first_response_audio_at
+            if first_response_audio_at is None:
+                first_response_audio_at = perf_counter()
             if first_audio_at is None:
-                first_audio_at = perf_counter()
+                first_audio_at = first_response_audio_at
 
         if audio_sink is not None and getattr(self.speech, "stream_pcm", None) is not None:
             # The planner may already have committed state; a TTS failure must
@@ -394,6 +396,11 @@ class VoiceTurnService:
                         "tts_ms": tts_ms,
                         "total_ms": total_ms,
                         "first_audio_ms": response.timings.first_audio_ms,
+                        "first_response_audio_ms": (
+                            round((first_response_audio_at - turn_reference) * 1_000)
+                            if first_response_audio_at is not None
+                            else None
+                        ),
                         "audio_streamed": audio_streamed,
                         "ack_played": ack_played,
                         "detected_language": detected_language,

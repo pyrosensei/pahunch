@@ -625,7 +625,11 @@ async def handle_voice_socket(
 
     def prepare_ack(rate, language="hi-en"):
         key = (rate, language)
-        if key in ack_tasks or getattr(speech, "synthesize_pcm", None) is None:
+        if (
+            key in ack_pcm
+            or (key in ack_tasks and not ack_tasks[key].cancelled())
+            or getattr(speech, "synthesize_pcm", None) is None
+        ):
             return
 
         async def run():
@@ -756,7 +760,8 @@ async def handle_voice_socket(
                 "error": error,
             },
         )
-        prepare_ack(rate)
+        for language in ("hi-en", "en-IN", "hi-IN"):
+            prepare_ack(rate, language)
 
     async def deliver(
         gen, rate, *, pcm=None, capture=None, text=None, language=None, ended_at=None
@@ -771,9 +776,6 @@ async def handle_voice_socket(
                 min_confidence=min_confidence,
                 min_transcript_confidence=min_transcript_confidence,
             )
-            for (ack_rate, ack_language), data in ack_pcm.items():
-                service.set_ack(data, ack_rate, ack_language)
-
             async def turn_sink(response):
                 if not await send(
                     {
@@ -802,6 +804,16 @@ async def handle_voice_socket(
             transcript = await stt.finish(capture) if pcm is not None else None
             if gen != generation or closed:
                 raise asyncio.CancelledError
+            # Optional warmup must never reserve a speech slot ahead of the reply.
+            warming = [task for task in ack_tasks.values() if not task.done()]
+            for task in warming:
+                if not task.cancelling():
+                    task.cancel()
+            if warming:
+                await asyncio.gather(*warming, return_exceptions=True)
+                audit("ACK_PREPARATION_CANCELLED", {"reason": "CUSTOMER_TURN", "tasks": len(warming)})
+            for (ack_rate, ack_language), data in ack_pcm.items():
+                service.set_ack(data, ack_rate, ack_language)
             if text is not None or transcript is not None:
                 response = await service.handle_transcript(
                     session_id,
@@ -848,7 +860,8 @@ async def handle_voice_socket(
                 },
                 gen,
             )
-            prepare_ack(rate, response.planner.response_language)
+            for ack_language in dict.fromkeys((response.planner.response_language, "hi-en", "en-IN", "hi-IN")):
+                prepare_ack(rate, ack_language)
 
     async def endpoint():
         nonlocal listening
