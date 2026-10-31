@@ -36,16 +36,19 @@ STATE_TOOL_PERMISSIONS = {
 
 PLANNER_ACTION_PERMISSIONS = {
     CallState.DISCOVERY: {
+        PlannerAction.RESPOND,
         PlannerAction.ASK_CLARIFICATION,
         PlannerAction.PROPOSE_PLAN,
         PlannerAction.ESCALATE_TO_HUMAN,
     },
     CallState.NEGOTIATION: {
+        PlannerAction.RESPOND,
         PlannerAction.ASK_CLARIFICATION,
         PlannerAction.PROPOSE_PLAN,
         PlannerAction.ESCALATE_TO_HUMAN,
     },
     CallState.PENDING_CONFIRMATION: {
+        PlannerAction.RESPOND,
         PlannerAction.ASK_CLARIFICATION,
         PlannerAction.PROPOSE_PLAN,
         PlannerAction.CONFIRM_PLAN,

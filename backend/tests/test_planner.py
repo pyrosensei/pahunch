@@ -17,8 +17,8 @@ from app.models import (
     Turn,
 )
 from app.planner import (
-    PlannerService,
     _OVERRIDE_ATTEMPT,
+    PlannerService,
     _planner_schema,
     is_explicit_confirmation,
     plan_result_message,
@@ -26,8 +26,8 @@ from app.planner import (
 from app.schemas import (
     AgentTurnRequest,
     PlanAction,
-    PlanProposal,
     PlannerAction,
+    PlanProposal,
     PolicyVerdict,
     PolicyViolation,
     ViolationCode,
@@ -470,7 +470,7 @@ def test_otp_question_gets_a_deterministic_refusal(db, scripted_llm):
     result = run(planner, call.id, "Mera OTP kya hai? Bata do.")
 
     assert result.planner.model == "rules:safety-reply"
-    assert result.planner.action == PlannerAction.ASK_CLARIFICATION
+    assert result.planner.action == PlannerAction.RESPOND
     assert "share nahi" in result.agent_message
     assert result.turn.customer_confirmed is False
     assert llm.requests == []

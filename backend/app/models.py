@@ -129,3 +129,40 @@ class AuditEvent(SQLModel, table=True):
     event_type: str
     payload_json: str = "{}"
     created_at: datetime
+
+
+class CallRuntime(SQLModel, table=True):
+    session_id: str = Field(primary_key=True, foreign_key="callsession.id")
+    transport: str = "browser"
+    last_seen_at: datetime
+    disconnected_at: datetime | None = None
+    observed_state: CallState
+    observed_outcome: CallOutcome | None = None
+    retryable_failure: bool = False
+
+
+class DialerOrderState(SQLModel, table=True):
+    order_id: int = Field(primary_key=True, foreign_key="order.id")
+    skip_reason: str
+    session_id: str | None = Field(default=None, foreign_key="callsession.id")
+    checked_at: datetime
+
+
+class DialerEvent(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    order_id: int = Field(foreign_key="order.id", index=True)
+    session_id: str | None = Field(default=None, foreign_key="callsession.id", index=True)
+    event_type: str
+    reason: str
+    payload_json: str = "{}"
+    created_at: datetime
+
+
+class TwilioBinding(SQLModel, table=True):
+    session_id: str = Field(primary_key=True, foreign_key="callsession.id")
+    call_sid: str | None = Field(default=None, unique=True, index=True)
+    stream_sid: str | None = None
+    dispatch_state: str = "REQUESTING"
+    provider_status: str = "queued"
+    last_callback_sequence: int = -1
+    consented: bool = False

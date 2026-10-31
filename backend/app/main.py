@@ -1,20 +1,24 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
-from app.calls import CallService
+from app.calls import ADMISSION_LOCK, CallService
 from app.config import settings
-from app.db import get_session, init_db
+from app.db import engine, get_session, init_db
+from app.demo import router as demo_router
+from app.dialer import Dialer
 from app.errors import DomainError
-from app.gnani import SpeechClient, build_gnani_speech_client
+from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
 from app.llm import StructuredLLM, build_llm_client
-from app.models import AuditEvent, CallSession, DeliverySlot, Order
+from app.models import AuditEvent, CallRuntime, CallSession, DeliverySlot, DialerOrderState, Order
+from app.phone_media import router as phone_media_router
 from app.planner import PlannerService
 from app.policy import validate_plan
 from app.realtime import RealtimeConfig, build_realtime_config, handle_voice_socket
@@ -31,6 +35,8 @@ from app.schemas import (
     VoiceTurnResponse,
 )
 from app.streaming_stt import StreamingSTTClient, build_streaming_stt_client
+from app.telephony import TwilioTransport
+from app.telephony import router as telephony_router
 from app.voice import MAX_AUDIO_BYTES, VoiceTurnService
 
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -45,7 +51,25 @@ def create_app(
     streaming_stt_client: StreamingSTTClient | None | object = _SPEECH_UNSET,
     max_audio_bytes: int = MAX_AUDIO_BYTES,
     realtime_config: RealtimeConfig | None = None,
+    dialer: Dialer | None = None,
+    telephony: TwilioTransport | None = None,
 ) -> FastAPI:
+    voice_owners: set[str] = set()
+    automatic_dialer = dialer
+    phone_transport = telephony
+    if phone_transport is None and init_database and settings.telephony_provider == "twilio":
+        phone_transport = TwilioTransport(engine, settings)
+    if automatic_dialer is None and init_database and settings.dialer_enabled:
+        automatic_dialer = Dialer(
+            engine,
+            interval_seconds=settings.dialer_interval_seconds,
+            waiting_timeout_seconds=settings.dialer_waiting_timeout_seconds,
+            disconnect_grace_seconds=settings.dialer_disconnect_grace_seconds,
+            idle_timeout_seconds=settings.dialer_idle_timeout_seconds,
+        )
+    if automatic_dialer is not None:
+        automatic_dialer.live_sessions = voice_owners
+        automatic_dialer.telephony = phone_transport
     planner_llm = llm_client if llm_client is not None else build_llm_client(settings)
     speech = (
         build_gnani_speech_client(settings)
@@ -63,9 +87,41 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if init_database:
             init_db()
-        yield
+        key_slots = len(split_api_keys(settings.gnani_api_key, settings.gnani_api_keys))
+        # Logged so a restart shows whether the extra keys were picked up.
+        print(f"pahunch: {key_slots} Gnani key slot(s) available")
+        stop = asyncio.Event()
+        dialer_task = None
+        try:
+            if automatic_dialer is not None:
+                await asyncio.to_thread(automatic_dialer.sweep)
+                dialer_task = asyncio.create_task(automatic_dialer.run(stop))
+            yield
+        finally:
+            stop.set()
+            if dialer_task is not None:
+                await dialer_task
+            for client in (planner_llm, speech):
+                closer = getattr(client, "aclose", None)
+                if closer is not None:
+                    await closer()
+            if phone_transport is not None:
+                phone_transport.close()
 
     app = FastAPI(title="Pahunch API", version="0.1.0", lifespan=lifespan)
+    app.state.dialer = automatic_dialer
+    app.state.telephony = phone_transport
+    app.state.voice_owners = voice_owners
+    app.state.phone_speech = speech
+    app.state.phone_llm = planner_llm
+    app.state.phone_config = realtime_config if realtime_config is not None else build_realtime_config(settings)
+    app.state.phone_streaming_factory = (
+        (lambda: build_streaming_stt_client(settings.model_copy(update={"realtime_sample_rate": 8000})))
+        if streaming_stt_client is _SPEECH_UNSET else new_streaming_stt
+    )
+    app.include_router(demo_router)
+    app.include_router(telephony_router)
+    app.include_router(phone_media_router)
 
     @app.exception_handler(DomainError)
     def domain_error_handler(_, error: DomainError) -> JSONResponse:
@@ -74,6 +130,18 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/dialer/status")
+    def dialer_status(session: SessionDep) -> dict:
+        if automatic_dialer is not None:
+            return automatic_dialer.status()
+        return {
+            "running": False, "transport": "browser", "last_sweep_at": None, "last_error": None,
+            "phone": phone_transport.readiness() if phone_transport is not None else None,
+            "orders": [s.model_dump(mode="json") for s in session.exec(
+                select(DialerOrderState).order_by(DialerOrderState.order_id)
+            ).all()],
+        }
 
     @app.get("/api/orders", response_model=list[Order])
     def list_orders(session: SessionDep) -> list[Order]:
@@ -110,6 +178,13 @@ def create_app(
     @app.post("/api/orders/{order_id}/call", response_model=CallSession, status_code=201)
     def create_call(order_id: int, session: SessionDep) -> CallSession:
         return CallService(session).create_call(order_id)
+
+    @app.get("/api/orders/{order_id}/active-call", response_model=CallSession)
+    def active_call(order_id: int, session: SessionDep) -> CallSession:
+        call = CallService(session).active_call(order_id)
+        if call is None:
+            raise HTTPException(status_code=404, detail="No active call for this order")
+        return call
 
     @app.get("/api/sessions/{session_id}", response_model=CallSession)
     def get_call_session(session_id: str, session: SessionDep) -> CallSession:
@@ -210,22 +285,54 @@ def create_app(
             )
             await websocket.close(code=1013)
             return
+        if session_id in voice_owners:
+            CallService(session)._audit(session_id, "REALTIME_DUPLICATE_REJECTED")
+            session.commit()
+            await websocket.send_json(
+                {"type": "error", "detail": "An active voice socket already owns this session"}
+            )
+            await websocket.close(code=4409)
+            return
+        runtime = session.get(CallRuntime, session_id)
+        if runtime is not None and runtime.transport == "twilio":
+            await websocket.send_json({"type": "error", "detail": "This session uses the phone transport"})
+            await websocket.close(code=4409)
+            return
+        voice_owners.add(session_id)
         rt_config = realtime_config if realtime_config is not None else build_realtime_config(settings)
-        await handle_voice_socket(
-            websocket,
-            session_id,
-            session,
-            planner_llm,
-            speech,
-            rt_config,
-            streaming=new_streaming_stt(),
-            max_audio_bytes=max_audio_bytes,
-            min_confidence=settings.planner_min_confidence,
-            min_transcript_confidence=settings.planner_min_transcript_confidence,
-        )
+        try:
+            with ADMISSION_LOCK, Session(session.get_bind()) as presence_db:
+                if presence_db.get(CallSession, session_id) is not None:
+                    CallService(presence_db).browser_presence(session_id, attached=True)
+            await handle_voice_socket(
+                websocket,
+                session_id,
+                session,
+                planner_llm,
+                speech,
+                rt_config,
+                streaming=new_streaming_stt(),
+                max_audio_bytes=max_audio_bytes,
+                min_confidence=settings.planner_min_confidence,
+                min_transcript_confidence=settings.planner_min_transcript_confidence,
+            )
+        finally:
+            with ADMISSION_LOCK, Session(session.get_bind()) as presence_db:
+                if presence_db.get(CallSession, session_id) is not None:
+                    CallService(presence_db).browser_presence(session_id, attached=False)
+                voice_owners.discard(session_id)
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
     if static_dir.is_dir():
+        @app.get("/", include_in_schema=False)
+        @app.get("/dashboard", include_in_schema=False)
+        def dashboard_page():
+            return FileResponse(static_dir / "dashboard.html")
+
+        @app.get("/shop", include_in_schema=False)
+        def shop_page():
+            return FileResponse(static_dir / "shop.html")
+
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
     return app

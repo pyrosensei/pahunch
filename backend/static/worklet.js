@@ -1,5 +1,5 @@
 const TARGET_RATE = 16000;
-const CHUNK_SAMPLES = TARGET_RATE / 10; // 100 ms per WS frame
+const CHUNK_SAMPLES = TARGET_RATE / 50; // 20 ms per WS frame
 
 class MicResampler extends AudioWorkletProcessor {
   constructor() {

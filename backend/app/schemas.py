@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -14,6 +15,7 @@ class PlanAction(str, Enum):
 
 
 class PlannerAction(str, Enum):
+    RESPOND = "RESPOND"
     ASK_CLARIFICATION = "ASK_CLARIFICATION"
     PROPOSE_PLAN = "PROPOSE_PLAN"
     CONFIRM_PLAN = "CONFIRM_PLAN"
@@ -70,7 +72,7 @@ class PlannerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PlannerAction
-    message: str = Field(min_length=1, max_length=500)
+    message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
     confidence: float = Field(ge=0, le=1)
@@ -149,6 +151,9 @@ class PlannerMeta(BaseModel):
     completion_tokens: int | None = None
     degraded: bool = False
     error_code: str | None = None
+    response_language: Literal["en-IN", "hi-IN", "hi-en"] = "hi-en"
+    wording_source: Literal["model", "template"] = "template"
+    fallback_reason: str | None = None
 
 
 class AgentTurnResponse(BaseModel):
@@ -164,6 +169,7 @@ class VoiceTimings(BaseModel):
     planner_ms: int = 0
     tts_ms: int = 0
     total_ms: int = 0
+    first_audio_ms: int = 0
 
 
 class VoiceTurnResponse(BaseModel):
@@ -178,6 +184,8 @@ class VoiceTurnResponse(BaseModel):
     audio_base64: str | None = None
     audio_content_type: str | None = None
     audio_error: str | None = None
+    audio_streamed: bool = False
+    ack_played: bool = False
     timings: VoiceTimings
 
 

@@ -1,18 +1,24 @@
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import wraps
+from threading import RLock
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.errors import DomainError
+from app.language import has_otp_disclosure, redact_payload
 from app.models import (
     AuditEvent,
     CallOutcome,
+    CallRuntime,
     CallSession,
     CallState,
     DeliveryCommit,
     DeliverySlot,
+    DialerEvent,
     Order,
     OrderStatus,
     PaymentMode,
@@ -21,7 +27,7 @@ from app.models import (
     Speaker,
     Turn,
 )
-from app.policy import HIGH_VALUE_THRESHOLD_INR, validate_plan
+from app.policy import HIGH_VALUE_THRESHOLD_INR, _utc, validate_plan
 from app.schemas import (
     CommitResult,
     CourierCard,
@@ -35,16 +41,30 @@ from app.tools import ToolName, require_tool
 
 MAX_TURNS = 8
 MAX_CLARIFICATIONS = 3
-CALL_COOLDOWN = timedelta(minutes=30)
+CALL_COOLDOWN = timedelta(hours=1)
+MAX_CALL_ATTEMPTS = 3
+ADMISSION_LOCK = RLock()
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _call_mutation(method):
+    @wraps(method)
+    def serialized(self, *args, **kwargs):
+        # Expiry must not overwrite an answer, customer turn or commit in flight.
+        with ADMISSION_LOCK:
+            self.db.expire_all()
+            return method(self, *args, **kwargs)
+
+    return serialized
+
+
 class CallService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, *, clock: Callable[[], datetime] = utc_now):
         self.db = db
+        self.clock = clock
 
     def _order(self, order_id: int) -> Order:
         order = self.db.get(Order, order_id)
@@ -64,7 +84,7 @@ class CallService:
                 session_id=session_id,
                 event_type=event_type,
                 payload_json=json.dumps(payload or {}, default=str),
-                created_at=utc_now(),
+                created_at=self.clock(),
             )
         )
 
@@ -73,23 +93,54 @@ class CallService:
         transition(call, target)
         self._audit(call.id, "STATE_CHANGED", {"from": previous, "to": target})
 
-    def _check_eligibility(self, order: Order) -> None:
+    def eligibility_reason(self, order: Order, *, automatic: bool = False) -> str | None:
+        now = self.clock()
         if order.status in {OrderStatus.DELIVERED, OrderStatus.CANCELLED}:
-            raise DomainError(409, "Delivered or cancelled orders are not callable")
+            return "ORDER_CLOSED"
         if order.call_opt_out:
-            raise DomainError(409, "Customer has opted out of automated calls")
+            return "OPTED_OUT"
         if not order.delivery_address_summary.strip():
-            raise DomainError(409, "Order metadata is incomplete; human review required")
-        if order.last_call_completed_at is not None:
-            completed = order.last_call_completed_at
-            if completed.tzinfo is None:
-                completed = completed.replace(tzinfo=UTC)
-            if utc_now() - completed < CALL_COOLDOWN:
-                raise DomainError(409, "Call cooldown is active")
-
+            return "MISSING_METADATA"
         existing = self.db.exec(select(CallSession).where(CallSession.order_id == order.id)).all()
         if any(call.state not in TERMINAL_STATES for call in existing):
-            raise DomainError(409, "An active call already exists for this order")
+            return "ACTIVE_CALL"
+        resolved = {CallState.COMMITTED, CallState.ESCALATED, CallState.TURN_BUDGET_EXHAUSTED}
+        if any(
+            call.state in resolved or call.outcome in {s.value for s in resolved}
+            for call in existing
+        ):
+            return "RESOLVED"
+        for call in existing:
+            if call.state == CallState.TOOL_FAILURE:
+                runtime = self.db.get(CallRuntime, call.id)
+                if runtime is None or not runtime.retryable_failure:
+                    return "NON_RETRYABLE_FAILURE"
+        if len(existing) >= MAX_CALL_ATTEMPTS:
+            return "ATTEMPT_LIMIT"
+        completed = [call.ended_at or call.started_at for call in existing]
+        if order.last_call_completed_at is not None:
+            completed.append(order.last_call_completed_at)
+        if (
+            completed
+            and now - max(t.replace(tzinfo=UTC) if t.tzinfo is None else t for t in completed)
+            < CALL_COOLDOWN
+        ):
+            return "COOLDOWN"
+        if automatic:
+            if order.status != OrderStatus.OUT_FOR_DELIVERY:
+                return "NOT_OUT_FOR_DELIVERY"
+            if self._trigger_reason(order) == "DELIVERY_CONFIRMATION":
+                return "NO_RISK_TRIGGER"
+            if _utc(order.window_end) <= _utc(order.window_start):
+                return "INVALID_WINDOW"
+            if now >= _utc(order.window_end):
+                return "WINDOW_EXPIRED"
+            if now < _utc(order.window_start) - timedelta(minutes=60):
+                return "WINDOW_NOT_DUE"
+        active = self.db.exec(
+            select(CallSession.id).where(CallSession.state.notin_(TERMINAL_STATES))
+        ).first()
+        return "CAPACITY" if active is not None else None
 
     def _trigger_reason(self, order: Order) -> str:
         if order.prior_attempts > 0:
@@ -102,52 +153,151 @@ class CallService:
             return "HIGH_VALUE_DELIVERY"
         return "DELIVERY_CONFIRMATION"
 
-    def create_call(self, order_id: int) -> CallSession:
-        order = self._order(order_id)
-        self._check_eligibility(order)
-        call = CallSession(
-            id=uuid4().hex,
-            order_id=order.id,
-            trigger_reason=self._trigger_reason(order),
-            state=CallState.CREATED,
-            started_at=utc_now(),
-        )
-        self.db.add(call)
-        self._audit(call.id, "CALL_CREATED", {"order_id": order.id})
-        self._transition(call, CallState.CALLING)
-        self.db.commit()
-        self.db.refresh(call)
-        return call
+    def active_call(self, order_id: int) -> CallSession | None:
+        """The call still in progress for an order, if any."""
+        calls = self.db.exec(
+            select(CallSession)
+            .where(CallSession.order_id == order_id)
+            .order_by(CallSession.started_at.desc())
+        ).all()
+        return next((call for call in calls if call.state not in TERMINAL_STATES), None)
 
+    def create_call(self, order_id: int, *, automatic: bool = False) -> CallSession:
+        with ADMISSION_LOCK:
+            self.db.expire_all()
+            order = self._order(order_id)
+            reason = self.eligibility_reason(order, automatic=automatic)
+            if reason:
+                detail = {
+                    "ORDER_CLOSED": "Delivered or cancelled orders are not callable",
+                    "OPTED_OUT": "Customer has opted out of automated calls",
+                    "MISSING_METADATA": "Order metadata is incomplete; human review required",
+                    "ACTIVE_CALL": "An active call already exists for this order",
+                    "RESOLVED": "Order call history is resolved; human review required",
+                    "NON_RETRYABLE_FAILURE": "Previous failure is not explicitly retryable",
+                    "ATTEMPT_LIMIT": "Call attempt limit reached",
+                    "COOLDOWN": "Call cooldown is active",
+                    "CAPACITY": "Demo call capacity is occupied",
+                }.get(reason, reason)
+                raise DomainError(409, detail)
+            now = self.clock()
+            call = CallSession(
+                id=uuid4().hex,
+                order_id=order.id,
+                trigger_reason=self._trigger_reason(order),
+                state=CallState.CREATED,
+                started_at=now,
+            )
+            self.db.add(call)
+            self._audit(call.id, "CALL_CREATED", {"order_id": order.id})
+            self._transition(call, CallState.CALLING)
+            self.db.add(
+                CallRuntime(session_id=call.id, last_seen_at=now, observed_state=call.state)
+            )
+            self.db.add(
+                DialerEvent(
+                    order_id=order.id,
+                    session_id=call.id,
+                    event_type="STARTED",
+                    reason=call.trigger_reason,
+                    created_at=now,
+                    payload_json=json.dumps(
+                        {"transport": "browser", "origin": "automatic" if automatic else "manual"}
+                    ),
+                )
+            )
+            self.db.commit()
+            self.db.refresh(call)
+            return call
+
+    @_call_mutation
+    def browser_presence(self, session_id: str, *, attached: bool) -> None:
+        call = self.get_call(session_id)
+        if call.state in TERMINAL_STATES:
+            return
+        now = self.clock()
+        runtime = self.db.get(CallRuntime, session_id)
+        if runtime is None:
+            runtime = CallRuntime(
+                session_id=session_id, last_seen_at=now, observed_state=call.state
+            )
+            self.db.add(runtime)
+        runtime.last_seen_at = now
+        runtime.disconnected_at = None if attached else now
+        self._audit(session_id, "BROWSER_ATTACHED" if attached else "BROWSER_DETACHED")
+        self.db.commit()
+
+    def finish_call(
+        self, session_id: str, state: CallState, *, reason: str, retryable: bool = False
+    ) -> CallSession:
+        with ADMISSION_LOCK:
+            self.db.expire_all()
+            call = self.get_call(session_id)
+            if call.state in TERMINAL_STATES:
+                return call
+            if state not in {CallState.NO_ANSWER, CallState.UNREACHABLE, CallState.TOOL_FAILURE}:
+                raise ValueError("Unsupported failure disposition")
+            self._transition(call, state)
+            call.customer_confirmed = False
+            call.outcome = CallOutcome(state.value)
+            call.ended_at = self.clock()
+            self._order(call.order_id).last_call_completed_at = call.ended_at
+            runtime = self.db.get(CallRuntime, call.id)
+            if runtime is None:
+                runtime = CallRuntime(
+                    session_id=call.id, last_seen_at=call.ended_at, observed_state=call.state
+                )
+                self.db.add(runtime)
+            runtime.retryable_failure = retryable and state == CallState.TOOL_FAILURE
+            self._audit(
+                call.id,
+                "CALL_DISPOSITION",
+                {"state": state, "reason": reason, "retryable_failure": runtime.retryable_failure},
+            )
+            self.db.commit()
+            self.db.refresh(call)
+            return call
+
+    @_call_mutation
     def connect(self, session_id: str) -> CallSession:
         call = self.get_call(session_id)
         self._transition(call, CallState.CONNECTED)
+        runtime = self.db.get(CallRuntime, call.id)
+        if runtime is not None:
+            runtime.last_seen_at = self.clock()
         self.db.commit()
         self.db.refresh(call)
         return call
 
+    @_call_mutation
     def confirm_context(self, session_id: str) -> CallSession:
         call = self.get_call(session_id)
         self._transition(call, CallState.CONTEXT_CONFIRMATION)
         self._transition(call, CallState.DISCOVERY)
+        runtime = self.db.get(CallRuntime, call.id)
+        if runtime is not None:
+            runtime.last_seen_at = self.clock()
         self.db.commit()
         self.db.refresh(call)
         return call
 
+    @_call_mutation
     def mark_no_answer(self, session_id: str) -> CallSession:
         call = self.get_call(session_id)
         self._transition(call, CallState.NO_ANSWER)
+        call.customer_confirmed = False
         call.outcome = CallOutcome.NO_ANSWER
-        call.ended_at = utc_now()
+        call.ended_at = self.clock()
         self._order(call.order_id).last_call_completed_at = call.ended_at
         self.db.commit()
         self.db.refresh(call)
         return call
 
     def _escalate(self, call: CallSession, reason: str) -> None:
+        call.customer_confirmed = False
         self._transition(call, CallState.ESCALATED)
         call.outcome = CallOutcome.ESCALATED
-        call.ended_at = utc_now()
+        call.ended_at = self.clock()
         self._order(call.order_id).last_call_completed_at = call.ended_at
         self._audit(call.id, "ESCALATED", {"reason": reason})
 
@@ -161,17 +311,29 @@ class CallService:
             raise DomainError(409, "Proposal has no policy decision")
         return decision
 
-    def submit_turn(self, session_id: str, request: CustomerTurnRequest) -> TurnResult:
+    @_call_mutation
+    def submit_turn(
+        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False
+    ) -> TurnResult:
         call = self.get_call(session_id)
         if call.state in TERMINAL_STATES:
             raise DomainError(409, "Call session is already terminal")
+        original = request.model_dump(mode="json")
+        cleaned = redact_payload(original)
+        if has_otp_disclosure(request.text):
+            cleaned.update(confirmation=False, proposal=None, escalation_reason=None)
+        if cleaned != original:
+            self._audit(call.id, "SENSITIVE_TEXT_REDACTED", {"reason": "OTP_DISCLOSURE"})
+        request = CustomerTurnRequest.model_validate(cleaned)
+        if not request.confirmation:
+            call.customer_confirmed = False
 
         turn = Turn(
             session_id=call.id,
             speaker=Speaker.CUSTOMER,
             text=request.text,
             structured_payload_json=request.model_dump_json(),
-            created_at=utc_now(),
+            created_at=self.clock(),
         )
         self.db.add(turn)
         self.db.flush()
@@ -179,14 +341,20 @@ class CallService:
         verdict = None
 
         if call.turn_count > MAX_TURNS:
+            call.customer_confirmed = False
             self._transition(call, CallState.TURN_BUDGET_EXHAUSTED)
             call.outcome = CallOutcome.TURN_BUDGET_EXHAUSTED
-            call.ended_at = utc_now()
+            call.ended_at = self.clock()
         elif request.address_change_requested:
             self._escalate(call, "ADDRESS_CHANGE_REQUESTED")
         elif request.escalation_reason:
             self._escalate(call, request.escalation_reason)
         else:
+            if clarification:
+                call.clarification_count += 1
+                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count})
+                if call.clarification_count > MAX_CLARIFICATIONS:
+                    self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
             if request.proposal is not None:
                 require_tool(call.state, ToolName.PROPOSE_PLAN)
                 order = self._order(call.order_id)
@@ -201,7 +369,7 @@ class CallService:
                     session_id=call.id,
                     proposal_json=request.proposal.model_dump_json(),
                     source_turn_ids_json=json.dumps([turn.id]),
-                    created_at=utc_now(),
+                    created_at=self.clock(),
                 )
                 self.db.add(proposal_record)
                 self.db.flush()
@@ -216,7 +384,7 @@ class CallService:
                         allowed_alternatives_json=json.dumps(
                             [item.value for item in verdict.allowed_alternatives]
                         ),
-                        created_at=utc_now(),
+                        created_at=self.clock(),
                     )
                 )
                 call.current_proposal_id = proposal_record.id
@@ -266,13 +434,17 @@ class CallService:
             reused=reused,
         )
 
+    @_call_mutation
     def commit_plan(self, session_id: str, idempotency_key: str) -> CommitResult:
         call = self.get_call(session_id)
         existing = self.db.exec(
             select(DeliveryCommit).where(DeliveryCommit.idempotency_key == idempotency_key)
         ).first()
         if existing is not None:
-            if existing.session_id != session_id or existing.proposal_id != call.current_proposal_id:
+            if (
+                existing.session_id != session_id
+                or existing.proposal_id != call.current_proposal_id
+            ):
                 raise DomainError(409, "Idempotency key belongs to a different commit")
             return self._result(existing, reused=True)
 
@@ -298,7 +470,7 @@ class CallService:
             self.db.commit()
             raise DomainError(409, "Plan no longer passes current delivery policy")
 
-        now = utc_now()
+        now = self.clock()
         card = self._courier_card(order, proposal, now)
         commit = DeliveryCommit(
             id=uuid4().hex,

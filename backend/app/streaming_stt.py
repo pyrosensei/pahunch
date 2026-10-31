@@ -12,6 +12,7 @@ from websockets.exceptions import ConnectionClosed
 from app.config import Settings
 
 FRAME_BYTES = 1024
+MAX_TRANSCRIPT_SEGMENTS = 16
 
 
 class StreamingSTTError(Exception):
@@ -77,7 +78,9 @@ class GnaniStreamingSTTClient:
         self._reader_task: asyncio.Task | None = None
         self._partial = bytearray()
         self._dirty = False
-        self._queue: asyncio.Queue[tuple[str, str | None, float] | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, str | None, float] | None] = asyncio.Queue(
+            maxsize=MAX_TRANSCRIPT_SEGMENTS
+        )
         self._last_error: str | None = None
 
     async def connect(self) -> None:
@@ -85,7 +88,7 @@ class GnaniStreamingSTTClient:
         self._partial.clear()
         self._dirty = False
         self._last_error = None
-        self._queue = asyncio.Queue()
+        self._queue = asyncio.Queue(maxsize=MAX_TRANSCRIPT_SEGMENTS)
         headers = {
             "x-api-key-id": self._api_key,
             "lang_code": self._language,
@@ -93,6 +96,8 @@ class GnaniStreamingSTTClient:
             "x-sample-rate": str(self._sample_rate),
             "x-model": self._model,
             "x-api-request-id": "pahunch",
+            # Verbatim can transliterate English confirmations into Devanagari.
+            "x-format": "codemix",
             # Local VAD endpoints at ~700ms of silence; keep the server from
             # closing segments mid-utterance so every transcript is a response
             # to our own commit.
@@ -104,6 +109,9 @@ class GnaniStreamingSTTClient:
             raise StreamingSTTError("Streaming STT connect failed") from error
         try:
             first = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        except asyncio.CancelledError:
+            await ws.close()
+            raise
         except Exception as error:
             await ws.close()
             raise StreamingSTTError("Streaming STT handshake failed") from error
@@ -163,6 +171,8 @@ class GnaniStreamingSTTClient:
 
     async def finish_utterance(self) -> StreamingTranscript | None:
         """Commit the open utterance and wait for the final transcript."""
+        if self._last_error is not None:
+            raise StreamingSTTError(self._last_error)
         ws = self._require_ws()
         self._dirty = False
         try:
@@ -221,8 +231,8 @@ class GnaniStreamingSTTClient:
         if ws is not None:
             try:
                 await ws.close()
-            except (ConnectionClosed, OSError):
-                pass
+            except (ConnectionClosed, OSError) as error:
+                raise StreamingSTTError("Streaming STT close failed") from error
 
     def _require_ws(self) -> websockets.ClientConnection:
         if self._ws is None:
@@ -237,7 +247,10 @@ class GnaniStreamingSTTClient:
                 if event.get("type") == "transcript":
                     text = event.get("text")
                     if isinstance(text, str) and text.strip():
-                        await queue.put(
+                        if queue.full():
+                            self._last_error = "Streaming STT transcript queue overflow"
+                            break
+                        queue.put_nowait(
                             (text.strip(), event.get("detected_language_code"), perf_counter())
                         )
                 elif event.get("type") == "error":
@@ -246,7 +259,11 @@ class GnaniStreamingSTTClient:
         except (ConnectionClosed, ValueError) as error:
             self._last_error = self._last_error or str(error)
         finally:
-            await queue.put(None)
+            # A full result queue must never prevent cancellation or close.
+            if queue.full():
+                while not queue.empty():
+                    queue.get_nowait()
+            queue.put_nowait(None)
 
 
 def build_streaming_stt_client(settings: Settings) -> GnaniStreamingSTTClient | None:

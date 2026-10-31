@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SwiftCart demo shop</title><link rel="stylesheet" href="/demo.css"><script defer src="/shop.js"></script></head>
+<body><header><h1>SwiftCart</h1><nav><a href="/">Operator dashboard</a><a href="/index.html">Browser voice</a></nav></header>
+<main class="shop"><p class="notice">Fictional shop. Synthetic orders only. No purchase or payment is processed.</p>
+<section class="panel"><h2>Create a demo delivery</h2><form id="checkout">
+<label for="parcel">Parcel</label><select id="parcel"><option value="standard">Everyday parcel · INR 1,800</option><option value="high_value">High-value parcel · INR 30,000</option></select>
+<label for="payment">Payment</label><select id="payment"><option value="COD">Cash on delivery</option><option value="PREPAID">Prepaid</option></select>
+<label><input type="checkbox" id="otp" checked> OTP verification required at delivery</label>
+<p class="dim">Delivery details are generated for SwiftCart Test Block. The window starts 15 minutes from checkout and lasts two hours.</p>
+<button id="place" class="primary" type="submit">Create synthetic order</button></form></section>
+<section class="panel"><h2>Order</h2><pre id="summary">No order created.</pre><div class="row"><button id="ready" disabled>Mark out for delivery</button><a id="dashboard" href="/">View dashboard</a></div>
+<p class="dim">Marking ready makes an eligible order available to the scheduler. The current browser transport requires a browser connection.</p></section>
+<p id="message" role="status" aria-live="polite"></p></main></body></html>

@@ -49,6 +49,7 @@ def test_connect_sends_handshake_headers():
     assert headers["x-sample-rate"] == "16000"
     assert headers["x-min-silence-ms"] == "5000"
     assert headers["x-api-request-id"] == "pahunch"
+    assert headers["x-format"] == "codemix"
 
 
 def test_connect_rejects_non_connected_first_event():
@@ -257,3 +258,50 @@ def test_reconnect_starts_with_clean_state():
     transcript = run_scenario(handler, scenario)
     assert transcript.text == "dobara"
     assert connections["count"] == 2
+
+
+def test_cancel_during_handshake_closes_unowned_provider_socket(monkeypatch):
+    async def scenario():
+        entered = asyncio.Event()
+
+        class Socket:
+            closed = False
+
+            async def recv(self):
+                entered.set()
+                await asyncio.Event().wait()
+
+            async def close(self):
+                self.closed = True
+
+        socket = Socket()
+
+        async def connect(*args, **kwargs):
+            return socket
+
+        monkeypatch.setattr(websockets, "connect", connect)
+        client = GnaniStreamingSTTClient(api_key="test-key")
+        task = asyncio.create_task(client.connect())
+        await entered.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert socket.closed
+
+    asyncio.run(scenario())
+
+
+def test_transcript_flood_is_bounded_and_fails_visibly():
+    async def handler(ws):
+        await ws.send(connected_event())
+        for index in range(100):
+            await ws.send(json.dumps({"type": "transcript", "text": f"fragment {index}"}))
+        await ws.wait_closed()
+
+    async def scenario(client):
+        await client.connect()
+        await asyncio.wait_for(client._reader_task, 1)
+        assert client._queue.qsize() <= 16
+        with pytest.raises(StreamingSTTError, match="queue overflow"):
+            await client.finish_utterance()
+
+    run_scenario(handler, scenario)

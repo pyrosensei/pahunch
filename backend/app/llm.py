@@ -8,6 +8,7 @@ import httpx
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.http_pool import HttpClientPool
 
 
 class LLMGatewayError(Exception):
@@ -103,6 +104,7 @@ class OpenAICompatibleClient:
         self._structured_mode = structured_mode
         self._enable_thinking = enable_thinking
         self._transport = transport
+        self._pool = HttpClientPool(timeout=timeout_seconds, transport=transport)
 
     @property
     def model_name(self) -> str:
@@ -149,18 +151,14 @@ class OpenAICompatibleClient:
             "chat_template_kwargs": {"enable_thinking": self._enable_thinking},
         }
         try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = await client.post(
-                    self.chat_completions_url,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+            response = await self._pool.get().post(
+                self.chat_completions_url,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
         except httpx.TimeoutException as error:
             raise LLMTimeoutError("LLM provider timed out") from error
         except httpx.HTTPError as error:
@@ -188,6 +186,9 @@ class OpenAICompatibleClient:
             prompt_tokens=_optional_int(usage.get("prompt_tokens")),
             completion_tokens=_optional_int(usage.get("completion_tokens")),
         )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
 
 
 def build_llm_client(settings: Settings) -> OpenAICompatibleClient | None:

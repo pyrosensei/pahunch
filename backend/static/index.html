@@ -49,6 +49,10 @@
     padding: 8px; overflow-x: auto; font-size: 12px; margin: 0; }
   .row { display: flex; gap: 8px; margin-bottom: 8px; }
   .row button { flex: 1; }
+  #text-input { flex: 3; background: #0d1117; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font: inherit; }
+  #text-input:focus { outline: none; border-color: var(--accent); }
+  #send-btn { flex: 1; }
   label { color: var(--dim); font-size: 13px; display: flex; gap: 6px; align-items: center; }
   .kv { color: var(--dim); font-size: 12px; margin-bottom: 4px; }
   .kv b { color: var(--text); font-weight: normal; }
@@ -57,6 +61,7 @@
 <body>
 <header>
   <h1>Pahunch — realtime voice demo</h1>
+  <a href="/">Dashboard</a><a href="/shop">SwiftCart shop</a>
   <span id="state-chip">IDLE</span>
   <span id="latency" class="kv"></span>
 </header>
@@ -70,9 +75,17 @@
     <h2>Conversation</h2>
     <div id="log"></div>
     <div id="meter-wrap"><div id="meter"></div></div>
+    <div id="mic-status" class="kv" role="status" aria-live="polite">Microphone off</div>
     <div class="row">
       <button id="mic-btn" class="primary">Start mic</button>
       <button id="ptt">Hold to talk</button>
+    </div>
+    <div class="row">
+      <button id="demo-btn">Run scripted demo</button>
+    </div>
+    <div class="row">
+      <input id="text-input" type="text" placeholder="No mic? type the customer's line here" />
+      <button id="send-btn">Send</button>
     </div>
     <div class="row">
       <label><input type="checkbox" id="auto-listen" checked /> auto-listen after agent speech</label>
@@ -96,15 +109,35 @@ const logEl = $("log"), meterEl = $("meter"), chipEl = $("state-chip"), latencyE
 const verdictEl = $("verdict"), courierEl = $("courier");
 const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
 
+// A scripted demo replays a fixed Hinglish conversation. The customer's turns
+// skip speech recognition; the planner, policy engine and commit are the live
+// path, so the demo shows real behaviour instead of a mock.
+const DEMO_TURNS = [
+  "Mujhe parcel abhi mat do, shaam ko chhah se aath ke beech le aana.",
+  "Haan theek hai, kar do.",
+];
+
 const state = {
   sessionId: null, ws: null, streaming: false, auto: true,
   audioCtx: null, node: null, playing: null, speaking: false,
+  player: null, demoQueue: [], demoRunning: false,
+  connecting: false, generationId: null, lastGenerationId: 0,
+  generationEnded: false, outputKind: null, blobDone: false,
+  micStream: null, micSource: null,
+  connectionId: 0, micEpoch: 0,
+  micHint: null, micHintReason: null,
 };
 
 function log(who, text) {
   const div = document.createElement("div");
   div.className = `entry ${who}`;
-  div.innerHTML = `<span class="who">${who === "customer" ? "customer" : who === "agent" ? "agent" : "system"}</span> ${text}`;
+  const label = document.createElement("span");
+  label.className = "who";
+  label.textContent = who === "customer" ? "customer" : who === "agent" ? "agent" : "system";
+  const content = document.createElement("span");
+  content.textContent = ` ${text}`;
+  div.appendChild(label);
+  div.appendChild(content);
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -123,61 +156,167 @@ async function loadOrders() {
     div.innerHTML = `<span class="id">#${order.id}</span> ${order.merchant_name}<br/>
       <span class="meta">${order.delivery_address_summary}<br/>
       window ${order.window_start?.slice(11, 16) ?? "?"}–${order.window_end?.slice(11, 16) ?? "?"} ·
-      ${order.payment_mode} · OTP: ${order.requires_otp ? "yes" : "no"} · value ₹${order.declared_value}</span>`;
+      ${order.payment_mode} · OTP: ${order.requires_otp ? "yes" : "no"} · value ₹${order.declared_value_inr}</span>`;
     div.onclick = () => startCall(order.id);
     $("orders").appendChild(div);
   }
 }
 
 async function startCall(orderId) {
+  if (state.connecting) return;
+  state.connecting = true;
+  try {
   log("system", `starting call for order ${orderId}…`);
-  const created = await (await fetch(`/api/orders/${orderId}/call`, { method: "POST" })).json();
-  const sessionId = created.id;
-  await fetch(`/api/sessions/${sessionId}/connect`, { method: "POST" });
-  await fetch(`/api/sessions/${sessionId}/context-confirmation`, { method: "POST" });
-  log("system", `session ${sessionId} ready`);
-  connectSocket(sessionId);
+  // The AudioContext must exist before the socket connects: the server is told
+  // its sample rate and synthesises the agent voice at exactly that rate.
+  try {
+    await ensureAudio();
+  } catch (error) {
+    log("error", `audio output unavailable: ${error.message}`);
+  }
+  let created = await fetch(`/api/orders/${orderId}/call`, { method: "POST" });
+  let call;
+  if (created.status === 409) {
+    const active = await fetch(`/api/orders/${orderId}/active-call`);
+    if (!active.ok) {
+      log("error", (await created.json()).detail);
+      return;
+    }
+    call = await active.json();
+    setState(call.state);
+    log("system", `resuming active call ${call.id} (${call.state})`);
+  } else if (created.ok) {
+    call = await created.json();
+  } else {
+    log("error", (await created.json()).detail);
+    return;
+  }
+  for (const [from, action] of [["CALLING", "connect"], ["CONNECTED", "context-confirmation"]]) {
+    if (call.state !== from) continue;
+    const response = await fetch(`/api/sessions/${call.id}/${action}`, { method: "POST" });
+    if (!response.ok) {
+      log("error", (await response.json()).detail);
+      return;
+    }
+    call = await response.json();
+  }
+  if (!["DISCOVERY", "NEGOTIATION", "PENDING_CONFIRMATION"].includes(call.state)) {
+    log("error", `Call cannot accept voice in ${call.state}.`);
+    return;
+  }
+  log("system", `session ${call.id} ready`);
+  await connectSocket(call.id);
+  } catch (error) {
+    log("error", `call connection failed: ${error.message}`);
+  } finally {
+    state.connecting = false;
+  }
 }
 
-function connectSocket(sessionId) {
+async function connectSocket(sessionId) {
+  if (state.ws && state.sessionId === sessionId && state.ws.readyState <= 1) return;
+  const previous = state.ws;
+  state.ws = null;
+  state.streaming = false;
+  stopPlayback();
+  if (previous && previous.readyState !== 3) {
+    await new Promise((resolve) => {
+      previous.addEventListener("close", resolve, { once: true });
+      previous.close();
+    });
+  }
   state.sessionId = sessionId;
+  state.lastGenerationId = 0;
+  state.connectionId += 1;
+  if (state.player) state.player.port.postMessage({ type: "connection", connection_id: state.connectionId });
   const ws = new WebSocket(`${wsUrl}/ws/sessions/${sessionId}/voice`);
   state.ws = ws;
   ws.binaryType = "arraybuffer";
   $("commit-btn").disabled = false;
   $("end-btn").disabled = false;
 
-  ws.onopen = () => log("system", "socket open, waiting for ready…");
-  ws.onclose = () => { log("system", "socket closed"); setState("IDLE"); };
+  ws.onopen = () => { if (state.ws === ws) log("system", "socket open, waiting for ready…"); };
+  ws.onclose = () => {
+    if (state.ws !== ws) return;
+    state.ws = null;
+    state.streaming = false;
+    stopPlayback();
+    releaseMic();
+    state.demoRunning = false;
+    state.demoQueue = [];
+    log("system", "socket closed");
+    setState("IDLE");
+  };
 
   const handleEvent = async (event) => {
     switch (event.type) {
       case "ready":
         setState(event.state);
         log("system", `ready — call state ${event.state}`);
-        if (state.auto) sendStart();
+        sendAudioConfig();
+        if (!state.demoRunning && state.auto) {
+          sendStart();
+        }
+        break;
+      case "config_ack":
+        log("system", `agent audio rate ${event.tts_sample_rate} Hz`);
         break;
       case "listening":
         state.streaming = true;
+        state.micHint = state.micHintReason = null;
+        $("mic-status").textContent = "Listening";
         log("system", "listening…");
         break;
+      case "audio_level":
+        if (event.speech || (state.micHintReason === "NO_AUDIO_FRAMES" && event.received_frames > 0)) {
+          state.micHint = state.micHintReason = null;
+        }
+        meterEl.style.background = event.noise_limited ? "var(--warn)" : "var(--ok)";
+        $("mic-status").textContent = state.micHint || (event.calibrating
+          ? "Adjusting to room noise — stay quiet briefly."
+          : event.noise_limited ? "Background noise is too loud — move somewhere quieter."
+          : event.speech ? "Heard you" : "Listening");
+        break;
+      case "no_speech": {
+        const hints = {
+          NO_AUDIO_FRAMES: "No microphone audio is reaching the server. Start mic or check microphone permission.",
+          NO_SPEECH_DETECTED: "No speech detected. Move closer to the microphone and try again.",
+          EXCESSIVE_NOISE: "Background noise is too loud. Move somewhere quieter or reduce microphone gain.",
+          AUDIO_STREAM_STOPPED: "Microphone audio stopped. Reconnect the call, then start mic again.",
+          SPEECH_TOO_SHORT: "Heard only a short sound. Please repeat your full instruction.",
+        };
+        state.micHintReason = event.reason;
+        state.micHint = hints[event.reason] || hints.NO_SPEECH_DETECTED;
+        $("mic-status").textContent = state.micHint;
+        log("system", state.micHint);
+        break;
+      }
       case "speech_start":
+        state.micHint = state.micHintReason = null;
+        $("mic-status").textContent = "Heard you";
         log("system", "speech detected");
         break;
       case "speech_end":
+        $("mic-status").textContent = "Processing your reply…";
         log("system", `utterance end (${event.duration_ms} ms)`);
         break;
       case "stop_speaking":
-        state.speaking = false;
-        stopPlayback();
+        if (event.generation_id !== state.generationId) break;
+        stopPlayback(event.generation_id);
         log("system", "barge-in: agent stopped speaking");
         break;
       case "turn":
+        if (!acceptGeneration(event.generation_id)) break;
         setState(event.state);
         log("customer", `“${event.transcript}” (${event.detected_language ?? "?"}, conf ${event.transcript_confidence})`);
-        log("agent", `“${event.agent_message}”${event.audio_error ? ` [TTS ${event.audio_error}]` : ""}`);
+        log("agent", `“${event.agent_message}”`);
         log("system", `turn ${event.turn.turn_count} · ${event.planner.model} · ${event.planner.action} · ` +
-          `stt ${fmtMs(event.timings.stt_ms)} · planner ${fmtMs(event.timings.planner_ms)} · tts ${fmtMs(event.timings.tts_ms)} · total ${fmtMs(event.timings.total_ms)}`);
+          `${event.planner.response_language ?? "?"} · wording ${event.planner.wording_source ?? "?"}` +
+          `${event.planner.fallback_reason ? ` (${event.planner.fallback_reason})` : ""} · ` +
+          `stt ${fmtMs(event.timings.stt_ms)} · planner ${fmtMs(event.timings.planner_ms)}`);
+        if (event.stt_fallback_reason) {
+          log("system", `streaming recognition fallback: ${event.stt_fallback_reason}`);
+        }
         if (event.turn.verdict) {
           verdictEl.innerHTML = `<b>Plan verdict:</b> ${event.turn.verdict.valid ? "valid" : "INVALID"}` +
             (event.turn.verdict.violations?.length
@@ -186,14 +325,42 @@ function connectSocket(sessionId) {
         if (event.turn.customer_confirmed) {
           log("system", "customer confirmed — committing plan");
           await commitPlan();
-        } else if (event.audio_error && state.auto) {
-          setTimeout(sendStart, 600);
         }
         break;
+      case "agent_audio_chunk":
+        if (!acceptGeneration(event.generation_id)) break;
+        state.speaking = true;
+        playChunk(event.chunk_base64, event.generation_id);
+        break;
       case "agent_audio":
+        if (!acceptGeneration(event.generation_id)) break;
         if (event.audio_base64) {
           state.speaking = true;
-          playAudio(event.audio_base64, event.content_type);
+          await playAudio(event.audio_base64, event.content_type, event.generation_id, ws);
+        }
+        break;
+      case "agent_audio_end":
+        if (!acceptGeneration(event.generation_id)) break;
+        state.generationEnded = true;
+        latencyEl.innerHTML = event.timings?.first_audio_ms
+          ? `first audio <b>${event.timings.first_audio_ms} ms</b>`
+          : "";
+        log("system", `audio done — first audio ${fmtMs(event.timings?.first_audio_ms)} · ` +
+          `tts ${fmtMs(event.timings?.tts_ms)} · total ${fmtMs(event.timings?.total_ms)}` +
+          `${event.ack_played ? " · ack" : ""}` +
+          `${event.audio_error ? ` [TTS ${event.audio_error}]` : ""}`);
+        if (state.outputKind === "blob") {
+          if (state.blobDone) finishPlayback(event.generation_id, ws);
+        } else if (state.player) {
+          if (state.outputKind === null) {
+            state.player.port.postMessage({ type: "begin", generation_id: event.generation_id,
+              connection_id: state.connectionId });
+          }
+          state.player.port.postMessage({ type: "end", generation_id: event.generation_id,
+            connection_id: state.connectionId });
+        } else {
+          log("error", "audio output unavailable; reply is shown as text");
+          finishPlayback(event.generation_id, ws);
         }
         break;
       case "error":
@@ -202,45 +369,151 @@ function connectSocket(sessionId) {
     }
   };
   ws.onmessage = (event) => {
-    if (typeof event.data === "string") handleEvent(JSON.parse(event.data));
+    if (state.ws !== ws) return;
+    if (typeof event.data === "string") {
+      handleEvent(JSON.parse(event.data)).catch((error) => log("error", `voice event failed: ${error.message}`));
+    }
   };
 }
 
 function sendStart() {
-  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "start" }));
+  if (state.ws && state.ws.readyState === 1) {
+    state.streaming = true;
+    state.ws.send(JSON.stringify({ type: "start" }));
+  }
 }
 function sendStop() {
   if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify({ type: "stop" }));
 }
 
-function stopPlayback() {
-  if (state.playing) { try { state.playing.stop(); } catch {} state.playing = null; }
+// The agent is synthesised at the browser's native rate so playback needs no
+// resampling and the first chunk is audible as soon as it exists.
+function sendAudioConfig() {
+  if (!state.ws || state.ws.readyState !== 1) return;
+  const rate = state.audioCtx ? Math.round(state.audioCtx.sampleRate) : 16000;
+  state.ws.send(JSON.stringify({ type: "config", tts_sample_rate: rate,
+    playback_tracking: true, audio_feedback: true }));
 }
 
-async function playAudio(base64, contentType) {
-  if (!state.audioCtx) return;
+function stopPlayback(generationId = state.generationId) {
+  state.generationId = null;
+  state.generationEnded = false;
+  state.outputKind = null;
+  state.blobDone = false;
+  state.speaking = false;
+  if (state.playing) {
+    const source = state.playing;
+    state.playing = null;
+    source.onended = null;
+    source.stop();
+  }
+  if (state.player) state.player.port.postMessage({ type: "flush", generation_id: generationId,
+    connection_id: state.connectionId });
+}
+
+function acceptGeneration(generationId) {
+  if (!Number.isInteger(generationId) || generationId < state.lastGenerationId) return false;
+  if (generationId === state.generationId) return true;
+  if (generationId === state.lastGenerationId) return false;
+  stopPlayback();
+  state.lastGenerationId = generationId;
+  state.generationId = generationId;
+  return true;
+}
+
+function finishPlayback(generationId, ws) {
+  if (state.ws !== ws || state.generationId !== generationId || !state.generationEnded) return;
+  state.generationId = null;
+  state.speaking = false;
+  if (ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "playback_done", generation_id: generationId }));
+  if (state.demoRunning) {
+    setTimeout(() => { if (state.ws === ws && state.generationId === null) nextDemoTurn(); }, 400);
+  } else if (state.auto) {
+    sendStart();
+  }
+}
+
+async function ensureAudio() {
+  if (state.audioCtx) return;
+  state.audioCtx = new AudioContext();
+  await state.audioCtx.audioWorklet.addModule("/worklet.js");
+  await state.audioCtx.audioWorklet.addModule("/pcm-player.js");
+  const player = new AudioWorkletNode(state.audioCtx, "pcm-player");
+  player.port.onmessage = (event) => {
+    if (event.data.type === "drained" && event.data.connection_id === state.connectionId) {
+      finishPlayback(event.data.generation_id, state.ws);
+    }
+  };
+  player.connect(state.audioCtx.destination);
+  state.player = player;
+  await state.audioCtx.resume();
+}
+
+function playChunk(base64, generationId) {
+  if (!state.player) return;
+  if (state.outputKind !== "pcm") {
+    state.outputKind = "pcm";
+    state.player.port.postMessage({ type: "begin", generation_id: generationId,
+      connection_id: state.connectionId });
+  }
   const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-  const buffer = await state.audioCtx.decodeAudioData(bytes.buffer);
+  const view = new DataView(bytes.buffer);
+  const samples = new Float32Array(Math.floor(bytes.length / 2));
+  for (let i = 0; i < samples.length; i++) {
+    const value = view.getInt16(i * 2, true);
+    samples[i] = value < 0 ? value / 32768 : value / 32767;
+  }
+  state.player.port.postMessage({ type: "pcm", generation_id: generationId,
+    connection_id: state.connectionId, samples }, [samples.buffer]);
+}
+
+async function playAudio(base64, contentType, generationId, ws) {
+  state.outputKind = "blob";
+  if (!state.audioCtx) {
+    state.blobDone = true;
+    log("error", "audio output unavailable; reply is shown as text");
+    return;
+  }
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  let buffer;
+  try {
+    buffer = await state.audioCtx.decodeAudioData(bytes.buffer);
+  } catch (error) {
+    if (state.ws !== ws || state.generationId !== generationId) return;
+    state.blobDone = true;
+    log("error", `audio playback failed: ${error.message}`);
+    finishPlayback(generationId, ws);
+    return;
+  }
+  if (state.ws !== ws || state.generationId !== generationId) return;
   const source = state.audioCtx.createBufferSource();
   source.buffer = buffer;
   source.connect(state.audioCtx.destination);
   state.playing = source;
   source.onended = () => {
-    if (state.playing === source) state.playing = null;
-    state.speaking = false;
-    if (state.auto) sendStart();
+    if (state.playing !== source || state.ws !== ws || state.generationId !== generationId) return;
+    state.playing = null;
+    state.blobDone = true;
+    finishPlayback(generationId, ws);
   };
   source.start();
 }
 
 async function ensureMic() {
-  if (state.audioCtx) return;
-  state.audioCtx = new AudioContext();
-  await state.audioCtx.audioWorklet.addModule("/worklet.js");
+  const epoch = state.micEpoch;
+  await ensureAudio();
+  if (state.node) return;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true },
   });
+  if (epoch !== state.micEpoch || state.node) {
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
   const source = state.audioCtx.createMediaStreamSource(stream);
+  state.micStream = stream;
+  state.micSource = source;
   state.node = new AudioWorkletNode(state.audioCtx, "mic-resampler");
   state.node.port.onmessage = (event) => {
     if (event.data.type === "audio") {
@@ -252,22 +525,48 @@ async function ensureMic() {
     }
   };
   source.connect(state.node);
-  await state.audioCtx.resume();
   log("system", "microphone on — audio is streamed only while listening");
+}
+
+function releaseMic() {
+  state.micEpoch += 1;
+  if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+  if (state.micSource) state.micSource.disconnect();
+  if (state.node) { state.node.port.onmessage = null; state.node.disconnect(); }
+  state.micStream = state.micSource = state.node = null;
+  meterEl.style.width = "0%";
+  $("mic-btn").disabled = false;
+  state.micHint = state.micHintReason = null;
+  $("mic-status").textContent = "Microphone off";
+}
+
+function nextDemoTurn() {
+  if (!state.demoRunning) return;
+  const text = state.demoQueue.shift();
+  if (!text) {
+    state.demoRunning = false;
+    log("system", "demo finished");
+    return;
+  }
+  log("system", `scripted turn: “${text}”`);
+  state.ws.send(JSON.stringify({ type: "scripted_turn", text }));
 }
 
 async function commitPlan() {
   const sessionId = state.sessionId;
+  const ws = state.ws;
   const result = await fetch(`/api/sessions/${sessionId}/commit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ idempotency_key: `demo-${sessionId}` }),
   });
+  if (state.ws !== ws || state.sessionId !== sessionId) return;
   if (!result.ok) {
     log("error", `commit failed: ${(await result.json()).detail}`);
     return;
   }
   const body = await result.json();
+  if (state.ws !== ws || state.sessionId !== sessionId) return;
   setState(body.state);
   log("system", `plan committed (${body.reused ? "reused" : "new"} commit ${body.commit_id})`);
   courierEl.innerHTML = "<b>Courier card</b>";
@@ -277,13 +576,66 @@ async function commitPlan() {
 }
 
 $("mic-btn").onclick = async () => {
-  await ensureMic();
   $("mic-btn").disabled = true;
+  try {
+    await ensureMic();
+  } catch (error) {
+    $("mic-btn").disabled = false;
+    log("error", `microphone blocked (${error.name || error.message}). ` +
+      "Allow microphone access for this page in the browser's site settings, or type below instead.");
+  }
 };
-$("ptt").addEventListener("pointerdown", () => {
+$("send-btn").onclick = sendTypedLine;
+$("text-input").onkeydown = (event) => {
+  if (event.key === "Enter") sendTypedLine();
+};
+function sendTypedLine() {
+  const input = $("text-input");
+  const text = input.value.trim();
+  if (!text) return;
+  if (!state.ws || state.ws.readyState !== 1) {
+    log("error", "start a call first — click an order on the left");
+    return;
+  }
+  state.auto = false;
+  $("auto-listen").checked = false;
+  input.value = "";
+  log("system", "typed input submitted");
+  stopPlayback();
+  state.ws.send(JSON.stringify({ type: "reset" }));
+  state.ws.send(JSON.stringify({ type: "scripted_turn", text }));
+}
+$("demo-btn").onclick = async () => {
+  await ensureAudio();
+  state.demoQueue = [...DEMO_TURNS];
+  state.demoRunning = true;
+  state.auto = false;
+  $("auto-listen").checked = false;
+  log("system", "scripted demo — customer turns skip speech recognition");
+  if (state.ws && state.ws.readyState === 1) {
+    nextDemoTurn();
+  } else {
+    const orders = await (await fetch("/api/orders")).json();
+    if (!orders.length) {
+      log("error", "no orders to demo");
+      state.demoRunning = false;
+      return;
+    }
+    await startCall(orders[0].id);
+  }
+};
+$("ptt").addEventListener("pointerdown", async () => {
   if (!state.ws) return;
   state.auto = false;
   $("auto-listen").checked = false;
+  try {
+    await ensureMic();
+  } catch (error) {
+    log("error", `microphone blocked (${error.name || error.message}) — type below instead`);
+    return;
+  }
+  stopPlayback();
+  state.ws.send(JSON.stringify({ type: "reset" }));
   sendStart();
   state.streaming = true;
   $("ptt").classList.add("held");
