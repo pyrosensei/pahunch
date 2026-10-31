@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pahunch operator dashboard</title>
+<link rel="stylesheet" href="/demo.css"><script defer src="/dashboard.js"></script></head>
+<body><header><h1>Pahunch · Operator dashboard</h1><nav><a href="/shop">SwiftCart shop</a><a href="/index.html">Browser voice fallback</a></nav></header>
+<main><p class="notice">Synthetic demonstration. A browser session is a local attempt; it does not mean a telephone rang.</p>
+<div class="row"><button id="refresh">Refresh now</button><span id="sync" class="dim">Loading…</span></div><p id="message" role="status" aria-live="polite"></p>
+<div class="columns"><section><div class="panel"><h2>Orders &amp; eligibility</h2><div id="orders"></div></div>
+<div class="panel"><h2>Calls</h2><label for="filter">Show</label><select id="filter"><option value="all">All calls</option><option value="active">Active calls</option><option value="completed">Completed calls</option></select><div id="calls"></div></div></section>
+<section class="panel"><h2 id="conversation-title">Conversation</h2><div id="transcript">Select a call.</div></section>
+<aside><section class="panel"><h2>Plan &amp; outcome</h2><pre id="details">Select a call.</pre></section><section class="panel"><h2>Audit trail</h2><pre id="audit">Select a call.</pre></section></aside></div></main></body></html>

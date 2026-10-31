@@ -5,13 +5,14 @@ from pathlib import Path
 from typing import Annotated, cast
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
 from app.calls import ADMISSION_LOCK, CallService
 from app.config import settings
 from app.db import engine, get_session, init_db
+from app.demo import router as demo_router
 from app.dialer import Dialer
 from app.errors import DomainError
 from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
@@ -118,6 +119,7 @@ def create_app(
         (lambda: build_streaming_stt_client(settings.model_copy(update={"realtime_sample_rate": 8000})))
         if streaming_stt_client is _SPEECH_UNSET else new_streaming_stt
     )
+    app.include_router(demo_router)
     app.include_router(telephony_router)
     app.include_router(phone_media_router)
 
@@ -322,6 +324,15 @@ def create_app(
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
     if static_dir.is_dir():
+        @app.get("/", include_in_schema=False)
+        @app.get("/dashboard", include_in_schema=False)
+        def dashboard_page():
+            return FileResponse(static_dir / "dashboard.html")
+
+        @app.get("/shop", include_in_schema=False)
+        def shop_page():
+            return FileResponse(static_dir / "shop.html")
+
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
     return app

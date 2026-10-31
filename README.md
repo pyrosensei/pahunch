@@ -403,3 +403,4 @@ MIT — see [LICENSE](LICENSE).
 - `fix/voice-session-runtime`: see the focused commits on this stacked branch.
 - `fix/voice-session-runtime`: see the focused commits on this stacked branch.
 - `feat/guarded-phone-adapter`: see the focused commits on this stacked branch.
+- `feat/synthetic-shop-dashboard`: see the focused commits on this stacked branch.
