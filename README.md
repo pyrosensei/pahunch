@@ -10,6 +10,7 @@ Prisma v3.0 streaming STT · Timbre v3.0 TTS · NVIDIA NIM planner · FastAPI ·
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
 [![NVIDIA NIM](https://img.shields.io/badge/planner-NVIDIA%20NIM-76B900.svg)](https://build.nvidia.com)
+[![Tests](https://img.shields.io/badge/tests-360%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -41,7 +42,7 @@ customer speaks  →  agent proposes a plan  →  policy validates  →  agent n
                                             courier card + audit trail + committed plan
 ```
 
-1. **Listens** — streaming Prisma STT over a live WebSocket, with barge-in (the customer can cut the agent off mid-sentence), VAD endpointing, and noise robustness.
+1. **Listens** — streaming Prisma STT over a live WebSocket, with calibrated energy detection, retained onset audio and sustained-speech barge-in. Real microphone and acoustic echo performance remain to be measured.
 2. **Proposes** — an LLM planner turns noisy Hinglish into a structured `PlanProposal` (primary + fallback, window, named recipient, retry rule). It never commits anything.
 3. **Validates** — the policy engine checks the proposal against the order: OTP rules, COD rules, high-value thresholds, drop permissions, named-recipient requirements, slot availability. It returns a verdict and a list of **allowed alternatives**.
 4. **Negotiates** — if the proposal is illegal, the agent explains *which rule* blocked it and offers a permitted alternative, instead of a flat refusal.
@@ -111,14 +112,83 @@ Consequences that matter in production:
 |---|---|---|
 | client → server | `{"type":"start"}` / `{"type":"stop"}` / `{"type":"reset"}` | start / stop / reset the mic capture |
 | client → server | binary PCM16 frames | 16 kHz mono audio |
+| client → server | `{"type":"config","tts_sample_rate":48000,"playback_tracking":true,"audio_feedback":true}` | configure browser output rate, playback acknowledgements and microphone feedback |
+| client → server | `{"type":"playback_done","generation_id":1}` | acknowledge the final rendered sample of the current output generation |
+| client → server | `{"type":"scripted_turn","text":"..."}` | typed/scripted input; bypasses STT, uses the real planner/policy path |
 | server → client | `{"type":"ready","session_id","state"}` | socket accepted |
 | server → client | `{"type":"speech_start"}` / `{"type":"speech_end","duration_ms"}` | VAD events |
 | server → client | `{"type":"turn", transcript, agent_message, timings, planner, ...}` | the processed turn |
 | server → client | `{"type":"agent_audio","audio_base64","content_type"}` | synthesised agent speech |
-| server → client | `{"type":"stop_speaking"}` | barge-in: the agent stops mid-playback |
+| server → client | `{"type":"agent_audio_chunk","chunk_base64","sample_rate","generation_id"}` | streamed PCM16 output |
+| server → client | `{"type":"agent_audio_end","generation_id",timings,...}` | synthesis ended; playback may still be queued |
+| server → client | `{"type":"stop_speaking","generation_id"}` | cancel and flush that output generation |
 | server → client | `{"type":"error","detail"}` | protocol or provider error |
+| server → client | `{"type":"audio_level",rms,noise_floor,threshold,calibrating,noise_limited,received_frames,speech}` | throttled detector feedback when audio_feedback is enabled |
+| server → client | `{"type":"no_speech",reason,elapsed_ms,...}` | actionable missing-audio, quiet-input, high-noise, stopped-stream or too-short-input hint |
 
-Close codes `1013` (speech not configured) and `4404` (session not found).
+Output `turn`, audio chunks/blobs and audio-end messages carry `generation_id`.
+The browser worklet distinguishes an underrun from final drain, and uses a local
+connection ID so delayed callbacks cannot affect a replacement socket. Old clients
+may omit `playback_tracking`; a subsequent `start` remains their playback handoff.
+With tracking enabled, an early, stale or duplicate acknowledgement cannot release
+the active generation. `start` during generation is deferred; `reset` cancels it.
+
+The receive loop stays available while STT, planning and synthesis run. Frames
+received while a turn is busy and has not started playback are dropped and counted
+in `REALTIME_FRAMES_DROPPED`, rather than queued into the next utterance. Barge-in
+invalidates output before cancelling its tasks, so late chunks cannot restart it.
+STT has at most 50 queued frames and one second of queued PCM (excluding one
+in-flight send); provider operations have explicit deadlines. Overflow or failure
+uses the captured utterance for REST recognition, with an audited phase and a
+`stt_fallback_reason` on the turn. Provider transcript queues hold at most 16
+segments and fail visibly on overflow.
+
+One socket owns each call session in a single application process. A duplicate is
+audited and rejected before greeting or provider connection. Close codes are
+`1013` (voice not configured), `4404` (session not found), and `4409` (duplicate
+socket). Disconnect awaits turn, planner, greeting, acknowledgement and STT cleanup;
+the browser also releases microphone tracks. It leaves the logical call row
+available for deliberate reconnect during the scheduler's disconnect grace period.
+The scheduler then records an explicit timeout disposition. Cross-process socket
+ownership is not implemented.
+
+The microphone detector calibrates on the first 300 ms of listening audio. Stay
+quiet briefly when the page displays its adjustment hint. It uses a lower
+quantile of recent idle-frame RMS, a 3x noise margin and bounded thresholds
+(120–12000 PCM16 RMS by default). Noise learning pauses during candidate speech,
+an utterance and agent playback. Calibration persists between turns on the same
+socket. A fresh socket calibrates again; speech covering the entire calibration
+period can be mistaken for background noise and may need repeating.
+
+Normal onset requires 100 ms of sustained energy; barge-in requires 160 ms.
+The detector retains 200 ms before onset and sends that audio, including the
+candidate speech, to STT. Idle/calibration frames are not sent to STT. Short
+rejected utterances are audited, reset and reported to the page without a planner
+call. The utterance cap counts actual buffered samples, including pre-roll and
+pauses, and cannot overrun on a large frame. The existing 600 ms silence window
+remains unchanged.
+
+The page displays server detection status beside its local microphone meter.
+Feedback is throttled to 250 ms. After five seconds without usable speech it
+distinguishes no frames, no speech, excessive background noise and stopped capture;
+the hint/audit is emitted once per listening episode, and does not create a
+customer turn. Thresholds and timings are configurable with the `REALTIME_*`
+settings in `.env.example`; `REALTIME_ADAPTIVE_VAD=false` selects the explicit
+fixed-threshold mode using `REALTIME_VAD_THRESHOLD`. Existing `.env` files need
+no new entries to use the defaults.
+
+Offline check, from `backend` in PowerShell:
+
+```powershell
+$env:PYTHONPATH = (Get-Location).Path
+.\.venv\Scripts\python.exe scripts/vad_probe.py
+```
+
+This generates PCM, not speech recognition. After a one-second ambient prelude,
+the quiet, normal and steady-noise speech-level signals measured 100 ms onset
+and 600 ms endpoint delay. The steady-noise-only case had zero false onsets.
+These are audio-sample timing measurements, not microphone/provider latency.
+Before/after results and remaining limits: [A2 review](A2_REVIEW.md).
 
 ### 4.2 Call state machine
 
@@ -157,7 +227,20 @@ The verdict also returns `allowed_alternatives` — the set of actions that *are
 
 ### 4.4 The planner
 
-`PlannerDecision` is emitted as strict JSON Schema (`additionalProperties: false`, every property required) and parsed into a Pydantic model. Four actions: `ASK_CLARIFICATION`, `PROPOSE_PLAN`, `CONFIRM_PLAN`, `ESCALATE_TO_HUMAN`.
+`PlannerDecision` is emitted as strict JSON Schema (`additionalProperties: false`, every property required) and parsed into a Pydantic model. Five actions: `RESPOND`, `ASK_CLARIFICATION`, `PROPOSE_PLAN`, `CONFIRM_PLAN`, `ESCALATE_TO_HUMAN`. `RESPOND` answers greetings and questions without creating a proposal or granting permission to commit.
+
+For a proposal, the model selects a recognized contextual wrapper around
+`{plan_summary} {confirmation_question}`. The backend inserts the policy-validated
+action, window, recipient and fallback; unknown, contradictory, unsafe or
+wrong-language wrappers use deterministic wording. Delivery-window, payment and
+handoff-policy answers use server-filled factual placeholders too. This is an
+exact template contract, with no multilingual natural-language parser.
+
+General `RESPOND` replies may use natural model wording, subject to conservative
+language, length, OTP and action-claim filters. The backend records
+`response_language`, `wording_source` (`model` or `template`) and `fallback_reason`
+in response metadata and audits. `model` means its wording/template was accepted;
+the backend still supplies plan and order facts. The browser displays these fields.
 
 The model is **not trusted**. A layer of deterministic guards runs before and after it:
 
@@ -170,9 +253,28 @@ The model is **not trusted**. A layer of deterministic guards runs before and af
 | `ACTION_NOT_ALLOWED` | The model cannot take an action that the current state forbids |
 | `CONFIRMATION_WITHOUT_OFFER` | A bare "haan" after a clarification or degraded turn cannot commit |
 | `PLAN_NORMALIZED` | `HAND_TO_CUSTOMER` for any window other than the order's own window is rewritten to `RESCHEDULE` |
-| `safe_model_message` | Model output that is empty, over-long, or claims success ("done", "delivered", "OTP") is replaced with a safe line |
+| Wording validation | Empty, over-long, unsafe, wrong-language or unrecognized proposal wording falls back to a deterministic line |
+| `PLAN_REJECTED` | An unchanged rejected plan cannot be reoffered as a new agreement |
+| `CLARIFICATION_REQUESTED` | Clarification turns consume the existing clarification budget; terminal outcomes get terminal wording |
+| OTP redaction | Recognized volunteered 4–8 digit or common spelled-out OTPs are redacted before model use, stored text and returned voice transcripts |
 
 Invalid model output triggers **one repair call** with the validation error attached; a second failure degrades the turn rather than guessing.
+
+Each customer turn selects English (`en-IN`), Devanagari Hindi (`hi-IN`) or Roman
+Hinglish (`hi-en`) from transcript text using a script/token heuristic. This
+selection drives deterministic replies, streaming and blocking TTS, and cache
+keys. Cached acknowledgements play only for the matching language. The initial
+greeting remains Hinglish because no customer turn is available yet. Short or
+ambiguous mixed-language turns can be misclassified. Streaming STT requests
+`codemix` format: synthetic provider checks preserved English confirmations as
+English and Hindi confirmations as Devanagari. Human speech and voice quality
+remain unverified. See [synthetic test review](SYNTHETIC_TEST_REVIEW.md).
+
+Any non-confirmation customer turn clears previous confirmation. An intervening
+question or degraded reply requires a fresh plan offer before a later yes can
+confirm it. The explicit-confirmation vocabulary and policy-at-commit checks are
+unchanged. OTP redaction covers recognized forms, not every possible obfuscation;
+the UI waits for backend-redacted text before displaying typed input.
 
 ### 4.5 Repository map
 
@@ -184,9 +286,13 @@ Invalid model output triggers **one repair call** with the validation error atta
 | `backend/app/gnani.py` | Gnani REST client: batch STT + TTS |
 | `backend/app/voice.py` | Speech orchestration: transcribe → plan → synthesise |
 | `backend/app/planner.py` | LLM planner, prompt, guards, repair, normalisation |
+| `backend/app/language.py` | Language selection, localized wording, placeholder validation and OTP redaction |
 | `backend/app/policy.py` | Pure policy engine — the only component allowed to say "allowed" |
 | `backend/app/state_machine.py` | Call states, legal transitions, terminal states |
 | `backend/app/calls.py` | Call lifecycle, turns, proposals, commits, idempotency, audit |
+| `backend/app/dialer.py` | Automatic browser scheduling, recovery, current skip state and change-only audit |
+| `backend/app/demo.py` | Synthetic checkout, readiness and bounded operator APIs |
+| `backend/app/telephony.py`, `backend/app/phone_media.py`, `backend/app/phone_audio.py` | Gated Twilio dispatch, signed callbacks, phone audio/playback adaptation and consent |
 | `backend/app/tools.py` | Tool names and per-state tool permissions |
 | `backend/app/models.py` | SQLModel entities: Order, DeliverySlot, CallSession, Turn, Proposal, Decision, Commit, AuditEvent |
 | `backend/app/schemas.py` | Pydantic request/response contracts |
@@ -196,13 +302,153 @@ Invalid model output triggers **one repair call** with the validation error atta
 | `backend/static/` | Browser voice demo (mic / push-to-talk, live transcript, plan verdict, courier card) |
 | `evals/` | Deterministic scenarios, live planner cases, live voice matrix + reports |
 
+### 4.6 Automatic browser scheduling
+
+With `DIALER_ENABLED=true` (the default), startup performs an eligibility sweep
+and starts one background task, repeating every five seconds. Shutdown stops and
+awaits that task before closing clients. A worker failure appears in logs and in
+`GET /api/dialer/status`; a later successful sweep clears its error.
+
+Automatic candidates must be `OUT_FOR_DELIVERY`, have complete metadata and no
+opt-out, and have a prior failed delivery, COD payment, OTP requirement or value
+of at least INR 25,000. Their window must satisfy
+`window_start - 60 minutes <= now < window_end`. Naive order timestamps follow
+policy's IST interpretation; stored call timestamps without a zone use UTC.
+
+Manual starts and sweeps share admission checks and a process lock. All call
+session rows count toward a maximum of three attempts per order. A retry waits
+one hour from the latest attempt's end (or start if no end is recorded), also
+respecting `last_call_completed_at`. `prior_attempts` remains the count of failed
+deliveries. Committed, escalated and turn-budget-exhausted history blocks retries.
+`NO_ANSWER` and `UNREACHABLE` can retry after eligibility/cooldown checks;
+`TOOL_FAILURE` needs an explicitly recorded transient disposition. Unknown failures
+require human review. One active demo call reserves capacity across all orders.
+
+The default transport is **browser**. A `STARTED` event means a local
+attempt/session was created, with no phone or provider acceptance implied. The
+existing order button attaches to that session, completes connection/context
+steps as necessary, and checks their responses before opening voice.
+
+Unanswered browser attempts expire after 120 seconds. Disconnect keeps a
+30-second reconnect grace; an abandoned connected session without a live socket
+expires after 300 seconds without activity. Live socket ownership prevents
+abandonment expiry. These are configurable via `DIALER_WAITING_TIMEOUT_SECONDS`,
+`DIALER_DISCONNECT_GRACE_SECONDS` and `DIALER_IDLE_TIMEOUT_SECONDS`. Recovery retains
+attempt history and cannot overwrite a concurrent answer or commit. The timing
+tests use an injected clock; recovery runs on the next sweep after a deadline.
+
+`DialerEvent` records `STARTED`, observed `DISPOSITION_CHANGED` and `SKIP_CHANGED`
+events. Unchanged sweeps do not append duplicates. `DialerOrderState` separately
+holds the last evaluated skip reason, session link and `checked_at`, exposed by
+the additive read-only `/api/dialer/status` endpoint. Existing session state audits
+remain intact. Three new tables are created through the existing `create_all`
+startup path; existing table columns are unchanged.
+
+Run **one application process/worker**. Locks and socket ownership are local to
+that process; this implementation does not provide distributed scheduling.
+Fixed seed windows are unchanged, so they are eligible only near their documented dates.
+Set `DIALER_ENABLED=false` to stop automatic scheduling and timeout recovery.
+
+### 4.7 SwiftCart shop and operator dashboard
+
+The root page `/` (also `/dashboard`) is now the operator dashboard. `/shop`
+creates fictional SwiftCart deliveries; `/index.html` retains browser voice.
+Checkout accepts payment mode, a fixed standard/high-value parcel choice and an
+OTP-requirement checkbox. Prices and synthetic delivery details are generated
+server-side. No payment, name, phone number or address is collected. New orders
+start PENDING with a two-hour window beginning 15 minutes after checkout and two
+available slots. Only the explicit readiness action moves them OUT_FOR_DELIVERY.
+Readiness is idempotent and cannot rewrite historical seed orders.
+
+Additive APIs:
+
+| Endpoint | Contract |
+|---|---|
+| `POST /api/orders` | Synthetic checkout choices only; unknown/personal fields are rejected |
+| `POST /api/orders/{id}/out-for-delivery` | Deliberately mark a checkout order ready |
+| `GET /api/sessions?active=true&order_id=1050&limit=50` | Bounded summaries, proposal/verdict, confirmation, transport and courier card; limit at most 100 |
+| `GET /api/sessions/{id}/turns?after_id=0&limit=100` | Ordered transcript and planner metadata, redacted at read time too; limit at most 200 |
+| `GET /api/dialer/events?order_id=1050&limit=50` | Latest bounded order events; limit at most 100 |
+
+The dashboard polls every two seconds and shows active/completed calls,
+transcripts, response language, wording source/fallback reason, policy results,
+confirmation, courier cards, scheduler reasons and audits. Untrusted text is
+rendered through `textContent`. Refresh failures mark displayed data as possibly
+stale. These local demo pages/APIs have no added authentication and are not a
+public deployment.
+
+### 4.8 Gated phone adapter: locally tested, live validation pending
+
+The adapter uses existing `httpx` and standard-library audio/signature code; no
+Twilio SDK or codec dependency was installed. It reuses the browser voice engine
+for VAD, cancellation, planning and TTS orchestration. Native 8 kHz mu-law Timbre
+requests are adapted to PCM16 for that engine, and outgoing audio is encoded as
+raw mu-law for Twilio. Streaming and blocking fallback carry the turn language.
+Media framing, playback marks and clear-on-interruption are tested with mocks.
+Twilio specifies this audio format and playback protocol in its
+[Media Streams reference](https://www.twilio.com/docs/voice/media-streams/websocket-messages).
+
+`TELEPHONY_PROVIDER=none` retains browser-only operation. Phone dispatch also
+requires configured credentials, a public HTTPS endpoint, a verified console
+test, confirmed streaming access, Gnani permission and approval for one exact
+existing local session. These gates default closed:
+
+```dotenv
+TWILIO_CONSOLE_VERIFIED=false
+TWILIO_STREAMING_VERIFIED=false
+GNANI_PHONE_DEMO_APPROVED=false
+TWILIO_APPROVED_SESSION_ID=
+```
+
+Setting credentials alone does not authorize a call. After approval immediately
+before a live test, only the approved CALLING session can be dispatched by the
+sweep; a retry or another order needs a new session-specific approval. The only
+recipient is the handset read from local Settings. No dial endpoint accepts an
+arbitrary recipient. Keep number, credentials and public URL in local `.env`.
+There is no call recording request or audio-file persistence.
+
+The answer webhook asks for DTMF consent to speak. Pressing 1 starts the media
+stream; it does not confirm a delivery plan. Refusal or ambiguous consent ends
+with human-review disposition. HTTP callbacks validate signatures over all form
+parameters. The WebSocket validates its signed public WSS URL, account/call/stream
+binding, format and consent. Callback sequences and terminal fences reject
+replays/regressions. The signature tests include an
+[official SDK duplicate-parameter vector](https://github.com/twilio/twilio-python/blob/main/tests/unit/test_request_validator.py).
+The validator is a deliberately narrow form/WSS implementation; exact configured
+URLs must match. It has not been verified through a real proxy/provider handshake.
+
+An accepted, requesting or ambiguous provider call keeps its capacity reservation
+until a provider outcome or explicit reconciliation resolves it. Ambiguous POST
+timeouts and server errors are not blindly retried. This can deliberately block
+the demo if callbacks are missing. Only an explicit 429 rejection is recorded as
+a transient dispatch failure. Provider error bodies, phone numbers and secret
+URLs are excluded from audit payloads and dashboard summaries.
+
+The dashboard distinguishes phone consent, dispatch state and delivery-plan
+confirmation. A phone turn commits only through the same explicit-confirmation
+and policy-revalidation path as browser calling. A completed provider callback
+cannot overwrite a committed plan. Before any live test, obtain Gnani permission,
+verify the console call/account's streaming access, expose only `/twilio/*` through
+an approved HTTPS/WSS ingress, and obtain immediate approval to dial. No tunnel
+or public deployment was created in this pass. Twilio's current trial blocks
+`<Stream>`; basic trial minutes alone do not enable this bridge. See
+[Twilio trial restrictions](https://www.twilio.com/docs/usage/trials/try-out-voice#blocked-verbs).
+
+The live phone flow, handset audio quality, carrier delivery and proxy signature
+behavior remain unmeasured. Native 8 kHz audio and the adapter have since been
+exercised locally with real speech providers and mocked Twilio transport; this
+does not establish handset performance. Browser visual QA was also
+unavailable because the computer-use host was not connected; DOM and HTTP tests
+are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
+
 ---
 
 ## 5. Test & evaluation suites
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, voice socket, streaming STT against fakes — **142 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **360 tests** |
+| Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | NVIDIA NIM | The model returns schema-valid decisions for fixed Hinglish turns |
 | Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + NVIDIA NIM | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
@@ -227,6 +473,15 @@ The matrix drives the actual server over HTTP and WebSocket: it synthesises ever
 The two failing scenarios (T01, T04) fail **only** because their first planner call hit the 12 s provider timeout and the safe fallback consumed the turn — the degradation is counted in the report rather than hidden. Both scenarios pass when the provider responds normally.
 
 Full report: [`evals/reports/matrix-latest.md`](evals/reports/matrix-latest.md) · raw JSON with per-turn transcripts, policy verdicts, timings and full audit trails in `evals/reports/matrix-latest.json`.
+
+### Synthetic provider checks after the repairs
+
+On 31 October 2026, additional isolated tests exercised real Gnani speech and
+NVIDIA NIM, including English/Hindi confirmations, COD refusal and correction,
+greetings, OTP refusal, factual questions and native 8 kHz audio. Twilio HTTP,
+playback acknowledgements and the customer were simulated. Results, fixes,
+commands and timing limits are in [the review](SYNTHETIC_TEST_REVIEW.md). These
+checks do not replace or rerun the historical 21-case matrix above.
 
 ---
 
@@ -271,16 +526,21 @@ cd backend
 cp .env.example .env
 ```
 
-Fill in these three values in `.env` — everything else has a working default:
+Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
-GNANI_API_KEY=<your gnani key>
-LLM_API_KEY=<your nvidia nim key>
+GNANI_API_KEY=
+LLM_API_KEY=
 LLM_BASE_URL=https://integrate.api.nvidia.com/v1
 LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
 ```
 
 `.env` is gitignored. Keys are never committed and never printed.
+
+The synthetic checks used one primary Gnani key for speech and one NIM key for
+planning; extra Gnani keys were not required for these sequential conversations.
+Account concurrency and quota remain provider-controlled. Adding keys does not
+by itself prove that more concurrent calls are permitted.
 
 ### 2. Install and run
 
@@ -290,7 +550,12 @@ uv sync
 uv run uvicorn app.main:app --port 8000
 ```
 
-Open **http://127.0.0.1:8000** — the browser demo lists the seeded SwiftCart orders, starts a call, streams your microphone (or push-to-talk) over the voice WebSocket, and shows the live transcript, the plan verdict, the audit log and the courier card. Press **Commit plan** to exercise the real commit path.
+Open **http://127.0.0.1:8000** for the operator dashboard. Use **SwiftCart shop**
+to create a current-time synthetic order, then mark it out for delivery. Watch
+the scheduler create a local call session. **Browser voice fallback** opens
+`/index.html`, where selecting the order attaches to that session and enables
+microphone or typed turns. The guarded phone adapter remains disabled until its
+verification and per-session approval gates are met.
 
 The database is created and seeded automatically on startup (8 synthetic orders, ids `1042`–`1049`, covering OTP, COD, high-value, neighbour-drop, missing-metadata and already-delivered cases).
 
@@ -298,7 +563,8 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 142 tests, no network required
+uv run pytest              # 360 tests, no external network required
+node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
 ```
 
 ### 4. Run the evaluations
@@ -326,7 +592,7 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 | Role | Model / API | Notes |
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
-| Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, language `hi-en` |
+| Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
 | Planner | **NVIDIA NIM** — `nvidia/nemotron-3.5-lightning-30b-a3b` | 30B MoE / 3B active, strict JSON Schema output, thinking disabled for latency |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
 | Evaluation | NVIDIA NIM (planner) + Gnani Timbre + Prisma (speech) | 21 live scenarios over the real socket |
@@ -344,7 +610,7 @@ Honesty about this is deliberate — the evaluation claims only hold if the boun
 | Streaming Prisma STT over a live WebSocket, real barge-in and VAD | The customer is **synthesised** with Gnani Timbre — no human speaker, no telephone codec, no carrier jitter |
 | Timbre TTS synthesising every agent reply | White Gaussian noise at 8 dB SNR stands in for recorded street audio |
 | NVIDIA NIM producing the structured plan | Orders, customers and the SwiftCart merchant are **synthetic** |
-| Real policy evaluation, state machine, commit, SQLite writes, audit trail | No real telephony: the browser page is the call surface, a telephony adapter would be optional |
+| Real policy evaluation, state machine, commit, SQLite writes, audit trail | Twilio adapter is gated and tested with mocks; no real handset call was exercised |
 | Real commit-time revalidation and idempotency | Commit is a local revalidation + SQLite write, not a remote tool — so T19's failure semantics are covered by tests instead of a live timeout |
 | Real Prisma/Timbre/NIM calls in the live matrix | Prisma streaming STT emits **no confidence score**, so the live path relies on the explicit-confirmation gate; low-confidence rejection is covered by deterministic tests |
 
@@ -354,7 +620,8 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Latency is the main open problem.** Current voice turn is P50 3.87 s / P95 13.47 s end-to-end, dominated by planner variance and full-sentence TTS synthesis. The target is a sub-second *time-to-first-audio*, which requires overlapping the stages rather than summing them.
+- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; acknowledgements can precede the substantive answer. See the new review for measurements. The target remains sub-second time to first audio.
+- **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
 - **Planner stalls are external.** The 12 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.
 - **Single-order scope.** No multi-parcel routing, no courier-side app, no dispatch integration.
@@ -363,7 +630,7 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 ## 11. What's next
 
 - **Latency programme** — sub-second time-to-first-audio: overlapped speech-first planning, chunked TTS, tighter endpointing, a pre-synthesised fallback voice, and a smaller/faster planner model.
-- **Operator dashboard** — live calls, plan verdicts, courier cards and audit trails.
+- **Live phone validation** — an approved owner-handset test after account, ingress and challenge-permission checks.
 - **Public deployment** — a hosted instance so judges can try it, with credits-aware guardrails.
 - **Broader language coverage** and a telephony adapter.
 
@@ -376,7 +643,7 @@ pahunch/
 ├── backend/
 │   ├── app/            # the service
 │   ├── static/         # browser voice demo
-│   ├── tests/          # 142 unit + integration tests
+│   ├── tests/          # Python integration tests and Node browser-audio regressions
 │   └── scripts/        # realtime smoke test, STT latency spike
 ├── evals/
 │   ├── scenarios.json          # deterministic call scenarios
@@ -394,13 +661,3 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), [SQLModel](https://sqlmodel
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Feature stack snapshot
-
-- `feat/runtime-contracts`: see the focused commits on this stacked branch.
-- `feat/conversation-safety`: see the focused commits on this stacked branch.
-- `feat/call-scheduling`: see the focused commits on this stacked branch.
-- `fix/voice-session-runtime`: see the focused commits on this stacked branch.
-- `fix/voice-session-runtime`: see the focused commits on this stacked branch.
-- `feat/guarded-phone-adapter`: see the focused commits on this stacked branch.
-- `feat/synthetic-shop-dashboard`: see the focused commits on this stacked branch.
