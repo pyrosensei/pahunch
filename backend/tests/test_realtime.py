@@ -32,6 +32,8 @@ FAST_CONFIG = RealtimeConfig(
     silence_ms=300,
     min_speech_ms=100,
     max_utterance_ms=5_000,
+    adaptive_vad=False,
+    pre_roll_ms=0,
 )
 
 
@@ -486,6 +488,8 @@ def test_utterance_buffer_caps_on_max_duration():
         silence_ms=10_000,
         min_speech_ms=100,
         max_utterance_ms=500,
+        adaptive_vad=False,
+        pre_roll_ms=0,
     )
     buffer = UtteranceBuffer(config)
     buffer.add(loud())
@@ -503,6 +507,8 @@ def test_utterance_buffer_ignores_below_min_speech():
         silence_ms=10_000,
         min_speech_ms=300,
         max_utterance_ms=5_000,
+        adaptive_vad=False,
+        pre_roll_ms=0,
     )
     buffer = UtteranceBuffer(config)
     buffer.add(loud())

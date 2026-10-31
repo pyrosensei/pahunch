@@ -8,6 +8,7 @@ import math
 import sys
 import wave
 from array import array
+from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -43,6 +44,38 @@ class RealtimeConfig:
     quiet_ms: int = 600
     max_utterance_ms: int = 15_000
     min_speech_ms: int = 300
+    adaptive_vad: bool = True
+    vad_floor: int = 120
+    vad_ceiling: int = 12_000
+    noise_ratio: float = 3.0
+    calibration_ms: int = 300
+    speech_start_ms: int = 100
+    barge_in_ms: int = 160
+    pre_roll_ms: int = 200
+    no_speech_ms: int = 5_000
+
+    def __post_init__(self):
+        if not 0 < self.vad_floor < self.vad_ceiling <= 32767 or self.noise_ratio <= 1:
+            raise ValueError("Invalid VAD threshold bounds or noise ratio")
+        if (
+            min(
+                self.sample_rate,
+                self.vad_threshold,
+                self.calibration_ms,
+                self.speech_start_ms,
+                self.barge_in_ms,
+                self.no_speech_ms,
+                self.silence_ms,
+                self.quiet_ms,
+                self.min_speech_ms,
+            )
+            <= 0
+        ):
+            raise ValueError("Audio rates, thresholds and timing must be positive")
+        if self.pre_roll_ms < 0 or self.max_utterance_ms < self.pre_roll_ms + max(
+            self.speech_start_ms, self.barge_in_ms
+        ):
+            raise ValueError("Utterance cap must hold pre-roll and speech onset")
 
 
 def build_realtime_config(settings) -> RealtimeConfig:
@@ -53,6 +86,15 @@ def build_realtime_config(settings) -> RealtimeConfig:
         quiet_ms=settings.realtime_quiet_ms,
         max_utterance_ms=settings.realtime_max_utterance_ms,
         min_speech_ms=settings.realtime_min_speech_ms,
+        adaptive_vad=settings.realtime_adaptive_vad,
+        vad_floor=settings.realtime_vad_floor,
+        vad_ceiling=settings.realtime_vad_ceiling,
+        noise_ratio=settings.realtime_noise_ratio,
+        calibration_ms=settings.realtime_calibration_ms,
+        speech_start_ms=settings.realtime_speech_start_ms,
+        barge_in_ms=settings.realtime_barge_in_ms,
+        pre_roll_ms=settings.realtime_pre_roll_ms,
+        no_speech_ms=settings.realtime_no_speech_ms,
     )
 
 
@@ -85,46 +127,125 @@ def frame_is_speech(frame: bytes, threshold: int) -> bool:
 
 
 class UtteranceBuffer:
-    """Accumulates PCM16 frames and applies energy endpointing.
-
-    Two thresholds end an utterance: a hard silence window for frames that
-    have fallen to the noise floor, and a shorter quiet window for frames
-    that are merely much quieter than speech. The quiet window is what keeps
-    a natural pause from adding a full second of dead air to every turn.
-    """
+    """Retain onset audio while calibrating only on idle listening frames."""
 
     QUIET_FLOOR_RATIO = 0.35
 
     def __init__(self, config: RealtimeConfig):
         self._config = config
+        self._noise_levels: deque[tuple[float, int]] = deque(maxlen=50)
+        self._calibration_samples = 0
+        self.noise_floor = config.vad_threshold / config.noise_ratio
+        self.rms = 0.0
         self.pcm = bytearray()
-        self.speech_ms = 0
-        self.silence_ms = 0
-        self.quiet_ms = 0
-        self._saw_speech = False
+        self._lead = bytearray()
+        self.reset()
 
-    def add(self, frame: bytes) -> bool:
-        """Returns True when this frame is the first speech frame."""
-        frame_ms = round(len(frame) / 2 / self._config.sample_rate * 1000)
-        rms = frame_rms(frame)
-        is_speech = rms >= self._config.vad_threshold
-        started = False
-        if is_speech:
-            if not self._saw_speech:
-                self._saw_speech = True
-                started = True
-            self.speech_ms += frame_ms
-            self.silence_ms = 0
-            self.quiet_ms = 0
-        elif self._saw_speech:
-            self.silence_ms += frame_ms
-            if rms >= self._config.vad_threshold * self.QUIET_FLOOR_RATIO:
-                self.quiet_ms += frame_ms
+    @property
+    def threshold(self) -> float:
+        if not self._config.adaptive_vad:
+            return self._config.vad_threshold
+        return max(
+            self._config.vad_floor,
+            min(self._config.vad_ceiling, self.noise_floor * self._config.noise_ratio),
+        )
+
+    @property
+    def calibrating(self) -> bool:
+        return self._config.adaptive_vad and self._calibration_samples * 1000 < (
+            self._config.calibration_ms * self._config.sample_rate
+        )
+
+    @property
+    def noise_limited(self) -> bool:
+        return self._config.adaptive_vad and (
+            self.noise_floor * self._config.noise_ratio >= self._config.vad_ceiling
+        )
+
+    @property
+    def pre_roll(self) -> bytes:
+        return bytes(self._lead)
+
+    @property
+    def speech_ms(self) -> int:
+        return round(self._speech_samples * 1000 / self._config.sample_rate)
+
+    @property
+    def silence_ms(self) -> int:
+        return round(self._silence_samples * 1000 / self._config.sample_rate)
+
+    @property
+    def quiet_ms(self) -> int:
+        return round(self._quiet_samples * 1000 / self._config.sample_rate)
+
+    def _observe_noise(self, samples: int) -> None:
+        if not self._config.adaptive_vad:
+            return
+        self._noise_levels.append((self.rms, samples))
+        self._calibration_samples += samples
+        target = sum(count for _, count in self._noise_levels) * 0.2
+        observed = 0
+        for level, count in sorted(self._noise_levels):
+            observed += count
+            if observed >= target:
+                self.noise_floor = level
+                break
+
+    def add(self, frame: bytes, *, calibrate: bool = True, start_ms: int | None = None) -> bool:
+        usable = frame[: len(frame) - len(frame) % 2]
+        samples = len(usable) // 2
+        self.rejected_ms = 0
+        if not samples or self.complete:
+            return False
+        self.rms = frame_rms(usable)
+        if not self._saw_speech:
+            limit_ms = self._config.pre_roll_ms + max(
+                self._config.speech_start_ms, self._config.barge_in_ms
+            )
+            self._lead.extend(usable)
+            del self._lead[
+                : max(0, len(self._lead) - limit_ms * self._config.sample_rate * 2 // 1000)
+            ]
+            if calibrate and self.calibrating:
+                self._observe_noise(samples)
+                return False
+            if self.rms < self.threshold or self.noise_limited:
+                self.rejected_ms = round(self._candidate_samples * 1000 / self._config.sample_rate)
+                self._candidate_samples = 0
+                if calibrate:
+                    self._observe_noise(samples)
+                return False
+            self._candidate_samples += samples
+            required = self._config.speech_start_ms if start_ms is None else start_ms
+            if self._candidate_samples * 1000 < required * self._config.sample_rate:
+                return False
+            self._saw_speech = True
+            self._speech_threshold = self.threshold
+            self._speech_samples = self._candidate_samples
+            keep = (
+                self._config.pre_roll_ms * self._config.sample_rate // 1000
+                + self._candidate_samples
+            )
+            self.pcm.extend(self._lead[-keep * 2 :])
+            self._lead.clear()
+            del self.pcm[self._config.max_utterance_ms * self._config.sample_rate * 2 // 1000 :]
+            return True
+        remaining = self._config.max_utterance_ms * self._config.sample_rate * 2 // 1000 - len(
+            self.pcm
+        )
+        usable = usable[:remaining]
+        samples = len(usable) // 2
+        if self.rms >= self._speech_threshold:
+            self._speech_samples += samples
+            self._silence_samples = self._quiet_samples = 0
+        else:
+            self._silence_samples += samples
+            if self.rms >= self._speech_threshold * self.QUIET_FLOOR_RATIO:
+                self._quiet_samples += samples
             else:
-                self.quiet_ms = 0
-        if self._saw_speech:
-            self.pcm.extend(frame)
-        return started
+                self._quiet_samples = 0
+        self.pcm.extend(usable)
+        return False
 
     @property
     def has_utterance(self) -> bool:
@@ -132,19 +253,25 @@ class UtteranceBuffer:
 
     @property
     def complete(self) -> bool:
+        return self.end_reason is not None
+
+    @property
+    def end_reason(self) -> str | None:
         if not self._saw_speech:
-            return False
-        if self.quiet_ms >= self._config.quiet_ms:
-            return True
-        return self.silence_ms >= self._config.silence_ms or (
-            self.speech_ms + self.silence_ms >= self._config.max_utterance_ms
-        )
+            return None
+        if len(self.pcm) * 1000 >= self._config.max_utterance_ms * self._config.sample_rate * 2:
+            return "MAX_DURATION"
+        if self.quiet_ms >= self._config.quiet_ms or self.silence_ms >= self._config.silence_ms:
+            return "SILENCE"
+        return None
 
     def reset(self) -> None:
         self.pcm.clear()
-        self.speech_ms = 0
-        self.silence_ms = 0
-        self.quiet_ms = 0
+        self._lead.clear()
+        self.rms = 0.0
+        self._speech_samples = self._silence_samples = self._quiet_samples = 0
+        self._candidate_samples = 0
+        self.rejected_ms = 0
         self._saw_speech = False
 
 
