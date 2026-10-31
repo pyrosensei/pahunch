@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.errors import DomainError
+from app.language import has_otp_disclosure, redact_payload
 from app.models import (
     AuditEvent,
     CallOutcome,
@@ -156,6 +157,7 @@ class CallService:
         return call
 
     def _escalate(self, call: CallSession, reason: str) -> None:
+        call.customer_confirmed = False
         self._transition(call, CallState.ESCALATED)
         call.outcome = CallOutcome.ESCALATED
         call.ended_at = utc_now()
@@ -172,10 +174,21 @@ class CallService:
             raise DomainError(409, "Proposal has no policy decision")
         return decision
 
-    def submit_turn(self, session_id: str, request: CustomerTurnRequest) -> TurnResult:
+    def submit_turn(
+        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False
+    ) -> TurnResult:
         call = self.get_call(session_id)
         if call.state in TERMINAL_STATES:
             raise DomainError(409, "Call session is already terminal")
+        original = request.model_dump(mode="json")
+        cleaned = redact_payload(original)
+        if has_otp_disclosure(request.text):
+            cleaned.update(confirmation=False, proposal=None, escalation_reason=None)
+        if cleaned != original:
+            self._audit(call.id, "SENSITIVE_TEXT_REDACTED", {"reason": "OTP_DISCLOSURE"})
+        request = CustomerTurnRequest.model_validate(cleaned)
+        if not request.confirmation:
+            call.customer_confirmed = False
 
         turn = Turn(
             session_id=call.id,
@@ -190,6 +203,7 @@ class CallService:
         verdict = None
 
         if call.turn_count > MAX_TURNS:
+            call.customer_confirmed = False
             self._transition(call, CallState.TURN_BUDGET_EXHAUSTED)
             call.outcome = CallOutcome.TURN_BUDGET_EXHAUSTED
             call.ended_at = utc_now()
@@ -198,6 +212,11 @@ class CallService:
         elif request.escalation_reason:
             self._escalate(call, request.escalation_reason)
         else:
+            if clarification:
+                call.clarification_count += 1
+                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count})
+                if call.clarification_count > MAX_CLARIFICATIONS:
+                    self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
             if request.proposal is not None:
                 require_tool(call.state, ToolName.PROPOSE_PLAN)
                 order = self._order(call.order_id)

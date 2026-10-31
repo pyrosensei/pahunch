@@ -398,3 +398,4 @@ MIT — see [LICENSE](LICENSE).
 ## Feature stack snapshot
 
 - `feat/runtime-contracts`: see the focused commits on this stacked branch.
+- `feat/conversation-safety`: see the focused commits on this stacked branch.
