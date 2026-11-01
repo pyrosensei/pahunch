@@ -92,7 +92,7 @@ def main() -> int:
     llm = build_llm_client(settings)
     if llm is None:
         print(
-            "Live planner eval skipped: set LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL."
+            "Live planner eval skipped: set GROQ_API_KEY, LLM_BASE_URL, and LLM_MODEL."
         )
         return 2
 

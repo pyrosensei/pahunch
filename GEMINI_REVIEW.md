@@ -1,3 +1,6 @@
+> Historical review: Gemini has been removed from the active configuration.
+> See [GROQ_REVIEW.md](GROQ_REVIEW.md) for the current planner setup.
+
 # Gemini planner configuration review
 
 1 November 2026. The user selected `gemini-3.1-flash-lite` and entered its API

@@ -89,27 +89,23 @@ class OpenAICompatibleClient:
         api_key: str,
         model: str,
         timeout_seconds: float = 8.0,
-        max_tokens: int = 320,
+        max_tokens: int = 1024,
         temperature: float = 0.1,
         structured_mode: Literal["json_schema", "json_object"] = "json_schema",
-        enable_thinking: bool = False,
-        provider: Literal["nim", "gemini"] = "nim",
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base_url = base_url.rstrip("/")
-        if provider == "gemini" and self._base_url not in {
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        if self._base_url not in {
+            "https://api.groq.com/openai/v1",
+            "https://api.groq.com/openai/v1/chat/completions",
         }:
-            raise ValueError("Gemini base URL must use the official Google HTTPS endpoint.")
+            raise ValueError("Groq base URL must use the official Groq HTTPS endpoint.")
         self._api_key = api_key
-        self._provider = provider
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._structured_mode = structured_mode
-        self._enable_thinking = enable_thinking
         self._transport = transport
         self._pool = HttpClientPool(timeout=timeout_seconds, transport=transport)
 
@@ -151,14 +147,11 @@ class OpenAICompatibleClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
+            "max_completion_tokens": self._max_tokens,
+            "reasoning_effort": "low",
+            "include_reasoning": False,
             "response_format": self._response_format(schema_name, schema),
         }
-        if self._provider == "gemini":
-            # Gemini 3 cannot disable thinking; use its minimum supported level.
-            payload["reasoning_effort"] = "minimal"
-        else:
-            payload["chat_template_kwargs"] = {"enable_thinking": self._enable_thinking}
         try:
             response = await self._pool.get().post(
                 self.chat_completions_url,
@@ -201,7 +194,7 @@ class OpenAICompatibleClient:
 
 
 def build_llm_client(settings: Settings) -> OpenAICompatibleClient | None:
-    api_key = settings.gemini_api_key if settings.llm_provider == "gemini" else settings.llm_api_key
+    api_key = settings.groq_api_key
     if not (api_key and settings.llm_base_url and settings.llm_model):
         return None
     return OpenAICompatibleClient(
@@ -212,6 +205,4 @@ def build_llm_client(settings: Settings) -> OpenAICompatibleClient | None:
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
         structured_mode=settings.llm_structured_mode,
-        enable_thinking=settings.llm_enable_thinking,
-        provider=settings.llm_provider,
     )

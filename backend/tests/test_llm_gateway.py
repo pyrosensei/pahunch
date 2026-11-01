@@ -27,7 +27,7 @@ db = planner_database
 
 def make_client(handler) -> OpenAICompatibleClient:
     return OpenAICompatibleClient(
-        base_url="https://llm.example/v1",
+        base_url="https://api.groq.com/openai/v1",
         api_key="test-key",
         model="test-model",
         timeout_seconds=2,
@@ -67,11 +67,15 @@ def test_openai_compatible_request_and_response_parsing():
         )
     )
 
-    assert captured["url"] == "https://llm.example/v1/chat/completions"
+    assert captured["url"] == "https://api.groq.com/openai/v1/chat/completions"
     assert captured["authorization"] == "Bearer test-key"
     payload = captured["payload"]
     assert payload["model"] == "test-model"
-    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in payload
+    assert payload["reasoning_effort"] == "low"
+    assert payload["include_reasoning"] is False
+    assert payload["max_completion_tokens"] == 1024
+    assert "max_tokens" not in payload
     assert payload["response_format"]["type"] == "json_schema"
     assert payload["response_format"]["json_schema"]["strict"] is True
     assert completion.text == '{"ok": true}'
@@ -91,7 +95,7 @@ def test_json_object_mode_does_not_send_a_strict_schema():
         )
 
     client = OpenAICompatibleClient(
-        base_url="https://llm.example/v1/chat/completions",
+        base_url="https://api.groq.com/openai/v1/chat/completions",
         api_key="test-key",
         model="test-model",
         structured_mode="json_object",
@@ -188,14 +192,14 @@ def test_planner_decision_rejects_unknown_fields():
         )
 
 
-def test_gemini_uses_minimal_reasoning_and_keeps_complete_plan_schema():
+def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     schema = _planner_schema()
 
     def handler(request):
         payload = json.loads(request.content)
-        assert str(request.url) == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        assert payload["model"] == "gemini-3.1-flash-lite"
-        assert payload["reasoning_effort"] == "minimal"
+        assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
+        assert payload["model"] == "openai/gpt-oss-20b"
+        assert payload["reasoning_effort"] == "low"
         assert "chat_template_kwargs" not in payload
         assert payload["response_format"]["json_schema"]["schema"] == schema
         assert payload["response_format"]["json_schema"]["strict"] is True
@@ -209,8 +213,8 @@ def test_gemini_uses_minimal_reasoning_and_keeps_complete_plan_schema():
 
     async def run():
         client = OpenAICompatibleClient(
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key="test-gemini-key", model="gemini-3.1-flash-lite", provider="gemini",
+            base_url="https://api.groq.com/openai/v1/",
+            api_key="test-groq-key", model="openai/gpt-oss-20b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -223,25 +227,21 @@ def test_gemini_uses_minimal_reasoning_and_keeps_complete_plan_schema():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("provider,expected_key", [("nim", "test-nim-key"), ("gemini", "test-gemini-key")])
-def test_builder_selects_only_the_chosen_providers_key(provider, expected_key):
+def test_builder_uses_only_groq_credentials():
     config = Settings(
-        _env_file=None, llm_provider=provider, llm_api_key="test-nim-key",
-        gemini_api_key="test-gemini-key", llm_model="gemini-3.1-flash-lite" if provider == "gemini" else "test-nim-model",
-        llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai" if provider == "gemini" else "https://nim.example/v1",
+        _env_file=None, groq_api_key="test-groq-key", llm_api_key="test-old-key",
+        gemini_api_key="test-old-key",
     )
     client = build_llm_client(config)
     assert client is not None
+    assert "test-groq-key" not in repr(config)
 
     def handler(request):
-        assert request.headers["authorization"] == f"Bearer {expected_key}"
+        assert request.headers["authorization"] == "Bearer test-groq-key"
         payload = json.loads(request.content)
-        if provider == "gemini":
-            assert payload["reasoning_effort"] == "minimal"
-            assert "chat_template_kwargs" not in payload
-        else:
-            assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-            assert "reasoning_effort" not in payload
+        assert payload["reasoning_effort"] == "low"
+        assert payload["include_reasoning"] is False
+        assert "chat_template_kwargs" not in payload
         return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
 
     client._pool._transport = httpx.MockTransport(handler)
@@ -255,26 +255,37 @@ def test_builder_selects_only_the_chosen_providers_key(provider, expected_key):
     asyncio.run(run())
 
 
-def test_missing_gemini_key_does_not_fall_back_to_nim_credentials():
+def test_missing_groq_key_does_not_fall_back_to_removed_credentials():
     config = Settings(
-        _env_file=None, llm_provider="gemini", gemini_api_key="", llm_api_key="test-nim-key",
-        llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai", llm_model="gemini-3.1-flash-lite",
+        _env_file=None, groq_api_key="", llm_api_key="test-old-key",
+        gemini_api_key="test-old-key", nvidia_api_key="test-old-key",
     )
     assert build_llm_client(config) is None
 
 
-@pytest.mark.parametrize("url", ["https://nim.example/v1", "http://generativelanguage.googleapis.com/v1beta/openai", "https://generativelanguage.googleapis.com.example/v1beta/openai"])
-def test_gemini_key_cannot_be_sent_to_another_provider(url):
+@pytest.mark.parametrize("provider", ["nim", "gemini"])
+def test_removed_providers_are_rejected(provider):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_provider=provider)
+
+
+@pytest.mark.parametrize("url", [
+    "https://integrate.api.nvidia.com/v1",
+    "https://generativelanguage.googleapis.com/v1beta/openai",
+    "http://api.groq.com/openai/v1",
+    "https://api.groq.com.example/openai/v1",
+])
+def test_groq_key_cannot_be_sent_to_another_provider(url):
     config = Settings(
-        _env_file=None, llm_provider="gemini", gemini_api_key="test-gemini-key",
-        llm_base_url=url, llm_model="gemini-3.1-flash-lite",
+        _env_file=None, llm_provider="groq", groq_api_key="test-groq-key",
+        llm_base_url=url, llm_model="openai/gpt-oss-20b",
     )
-    with pytest.raises(ValueError, match="Gemini base URL"):
+    with pytest.raises(ValueError, match="Groq base URL"):
         build_llm_client(config)
 
 
 @pytest.mark.parametrize("unsafe", [False, True])
-def test_gemini_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
+def test_groq_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
     requests = []
     proposal = valid_proposal()
     order = db.get(Order, 1043)
@@ -294,8 +305,8 @@ def test_gemini_plan_still_requires_policy_and_explicit_confirmation(db, unsafe)
 
     async def run():
         llm = OpenAICompatibleClient(
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            api_key="test-gemini-key", model="gemini-3.1-flash-lite", provider="gemini",
+            base_url="https://api.groq.com/openai/v1",
+            api_key="test-groq-key", model="openai/gpt-oss-20b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -305,13 +316,13 @@ def test_gemini_plan_still_requires_policy_and_explicit_confirmation(db, unsafe)
             assert result.turn.verdict.valid == (not unsafe)
             assert not result.turn.customer_confirmed
             with pytest.raises(DomainError):
-                planner.calls.commit_plan(call.id, "gemini-before-confirmation")
+                planner.calls.commit_plan(call.id, "groq-before-confirmation")
             if not unsafe:
                 confirmed = await planner.handle_turn(call.id, AgentTurnRequest(text="Yes please go ahead"))
                 assert confirmed.turn.customer_confirmed
-                committed = planner.calls.commit_plan(call.id, "gemini-confirmed-plan")
+                committed = planner.calls.commit_plan(call.id, "groq-confirmed-plan")
                 assert committed.state == "COMMITTED"
-                assert planner.calls.commit_plan(call.id, "gemini-confirmed-plan").reused
+                assert planner.calls.commit_plan(call.id, "groq-confirmed-plan").reused
             assert len(requests) == 1
         finally:
             await llm.aclose()
@@ -319,17 +330,18 @@ def test_gemini_plan_still_requires_policy_and_explicit_confirmation(db, unsafe)
     asyncio.run(run())
 
 
-def test_gemini_busy_response_falls_back_without_retry_or_commit(db):
+@pytest.mark.parametrize("status", [429, 503])
+def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
     requests = []
 
     def handler(request):
         requests.append(request)
-        return httpx.Response(503, json={"error": {"message": "synthetic busy response"}})
+        return httpx.Response(status, json={"error": {"message": "synthetic busy response"}})
 
     async def run():
         llm = OpenAICompatibleClient(
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            api_key="test-gemini-key", model="gemini-3.1-flash-lite", provider="gemini",
+            base_url="https://api.groq.com/openai/v1",
+            api_key="test-groq-key", model="openai/gpt-oss-20b",
             transport=httpx.MockTransport(handler),
         )
         try:
