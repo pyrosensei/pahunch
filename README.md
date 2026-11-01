@@ -4,13 +4,13 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · NVIDIA NIM planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Gemini 3.1 Flash-Lite planner · FastAPI · SQLite
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![NVIDIA NIM](https://img.shields.io/badge/planner-NVIDIA%20NIM-76B900.svg)](https://build.nvidia.com)
-[![Tests](https://img.shields.io/badge/tests-369%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Gemini](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-4285F4.svg)](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
+[![Tests](https://img.shields.io/badge/tests-379%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Nemotron 30B)  │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (Gemini)        │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (NVIDIA NIM, JSON Schema)   │  │
+       │                          │  │ Planner (Gemini, JSON Schema)      │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -457,17 +457,19 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **369 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **379 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
-| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | NVIDIA NIM | The model returns schema-valid decisions for fixed Hinglish turns |
-| Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + NVIDIA NIM | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
+| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
+| Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + configured planner | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
 
 ### Live voice matrix
 
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
-**Latest published run: 19 / 21 live scenarios pass.**
+**Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
+describe Gemini performance. Model-switch checks are recorded separately in
+[the Gemini configuration review](GEMINI_REVIEW.md).
 
 | Metric | Value |
 |---|---|
@@ -527,7 +529,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and an NVIDIA NIM API key
+- A Gnani API key (Prisma + Timbre) and a Google Gemini API key
 
 ### 1. Configure
 
@@ -540,9 +542,33 @@ Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
 GNANI_API_KEY=
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+LLM_MODEL=gemini-3.1-flash-lite
+LLM_MAX_TOKENS=512
+LLM_STRUCTURED_MODE=json_schema
+```
+
+Gemini uses its documented `reasoning_effort=minimal` setting; Gemini 3 does not
+support disabling thinking entirely. The provider JSON schema remains intact,
+and the backend still validates output, policy, wording and explicit confirmation.
+No search, tools, audio generation or additional model call is enabled.
+
+The existing `LLM_API_KEY` field is reserved for optional NIM use. Gemini reads
+only `GEMINI_API_KEY`, so changing providers never sends the NIM credential to
+Google. A missing Gemini key leaves the planner unconfigured. Gemini mode only
+accepts the official Google HTTPS compatibility endpoint.
+
+To deliberately switch back to NIM, retain its credential and select:
+
+```dotenv
+LLM_PROVIDER=nim
 LLM_API_KEY=
 LLM_BASE_URL=https://integrate.api.nvidia.com/v1
 LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+LLM_MAX_TOKENS=320
+LLM_ENABLE_THINKING=false
 ```
 
 `.env` is gitignored. Keys are never committed and never printed.
@@ -573,7 +599,7 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 369 tests, no external network required
+uv run pytest              # 379 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
 ```
 
@@ -583,10 +609,10 @@ node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.
 # deterministic scenarios, no network
 cd backend && uv run python ../evals/runner.py
 
-# live planner cases (NVIDIA NIM)
+# live planner cases (configured planner)
 cd backend && uv run python ../evals/planner_runner.py
 
-# live voice matrix (Gnani + NVIDIA NIM) — use a disposable database
+# live voice matrix (Gnani + configured planner) — use a disposable database
 cd backend
 DATABASE_URL=sqlite:///./matrix.db uv run uvicorn app.main:app --port 8000
 DATABASE_URL=sqlite:///./matrix.db uv run python ../evals/matrix_runner.py
@@ -603,9 +629,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **NVIDIA NIM** — `nvidia/nemotron-3.5-lightning-30b-a3b` | 30B MoE / 3B active, strict JSON Schema output, thinking disabled for latency |
+| Planner | **Google Gemini** — `gemini-3.1-flash-lite` | JSON Schema output, minimal thinking; NIM remains an explicit optional configuration |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | NVIDIA NIM (planner) + Gnani Timbre + Prisma (speech) | 21 live scenarios over the real socket |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; Gemini results are reported separately |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -619,7 +645,7 @@ Honesty about this is deliberate — the evaluation claims only hold if the boun
 |---|---|
 | Streaming Prisma STT over a live WebSocket, real barge-in and VAD | The customer is **synthesised** with Gnani Timbre — no human speaker, no telephone codec, no carrier jitter |
 | Timbre TTS synthesising every agent reply | White Gaussian noise at 8 dB SNR stands in for recorded street audio |
-| NVIDIA NIM producing the structured plan | Orders, customers and the SwiftCart merchant are **synthetic** |
+| Configured planner producing the structured plan when available | Orders, customers and the SwiftCart merchant are **synthetic** |
 | Real policy evaluation, state machine, commit, SQLite writes, audit trail | Twilio adapter is gated and tested with mocks; no real handset call was exercised |
 | Real commit-time revalidation and idempotency | Commit is a local revalidation + SQLite write, not a remote tool — so T19's failure semantics are covered by tests instead of a live timeout |
 | Real Prisma/Timbre/NIM calls in the live matrix | Prisma streaming STT emits **no confidence score**, so the live path relies on the explicit-confirmation gate; low-confidence rejection is covered by deterministic tests |
@@ -630,6 +656,7 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
+- **Gemini generation is not live-validated yet.** The saved key reached the model metadata endpoint (HTTP 200), but both native and compatibility generation returned HTTP 503 for high demand. Safe unavailable handling is covered by tests; successful live plans and latency remain unmeasured. See [the Gemini review](GEMINI_REVIEW.md).
 - **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; acknowledgements can precede the substantive answer. See the new review for measurements. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.

@@ -93,10 +93,17 @@ class OpenAICompatibleClient:
         temperature: float = 0.1,
         structured_mode: Literal["json_schema", "json_object"] = "json_schema",
         enable_thinking: bool = False,
+        provider: Literal["nim", "gemini"] = "nim",
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base_url = base_url.rstrip("/")
+        if provider == "gemini" and self._base_url not in {
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        }:
+            raise ValueError("Gemini base URL must use the official Google HTTPS endpoint.")
         self._api_key = api_key
+        self._provider = provider
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._max_tokens = max_tokens
@@ -146,10 +153,12 @@ class OpenAICompatibleClient:
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
             "response_format": self._response_format(schema_name, schema),
-            # Without this, reasoning models consume the whole token budget in
-            # reasoning_content and return content=None.
-            "chat_template_kwargs": {"enable_thinking": self._enable_thinking},
         }
+        if self._provider == "gemini":
+            # Gemini 3 cannot disable thinking; use its minimum supported level.
+            payload["reasoning_effort"] = "minimal"
+        else:
+            payload["chat_template_kwargs"] = {"enable_thinking": self._enable_thinking}
         try:
             response = await self._pool.get().post(
                 self.chat_completions_url,
@@ -192,15 +201,17 @@ class OpenAICompatibleClient:
 
 
 def build_llm_client(settings: Settings) -> OpenAICompatibleClient | None:
-    if not (settings.llm_api_key and settings.llm_base_url and settings.llm_model):
+    api_key = settings.gemini_api_key if settings.llm_provider == "gemini" else settings.llm_api_key
+    if not (api_key and settings.llm_base_url and settings.llm_model):
         return None
     return OpenAICompatibleClient(
         base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
+        api_key=api_key,
         model=settings.llm_model,
         timeout_seconds=settings.llm_timeout_seconds,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
         structured_mode=settings.llm_structured_mode,
         enable_thinking=settings.llm_enable_thinking,
+        provider=settings.llm_provider,
     )

@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = "Shivani"
     gnani_tts_language: str = "hi-en"
     gnani_timeout_seconds: float = 30.0
+    llm_provider: Literal["nim", "gemini"] = "nim"
     llm_api_key: str = ""
+    gemini_api_key: str = Field(default="", repr=False)
     llm_base_url: str = ""
     llm_model: str = ""
     llm_timeout_seconds: float = 12.0
