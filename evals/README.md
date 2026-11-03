@@ -6,8 +6,8 @@ Four suites, from cheapest to most realistic:
 |---|---|---|---|
 | Unit and integration tests | `cd backend && uv run pytest` | none | Policy, state machine, planner gates, voice socket, streaming STT against fakes |
 | Deterministic call scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
-| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | NVIDIA NIM | The model returns schema-valid decisions for fixed Hinglish turns |
-| Live voice matrix | `matrix_runner.py` (below) | Gnani STT/TTS + NVIDIA NIM | The real WebSocket voice path, policy, commit, and audit trail for T01–T22 |
+| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Groq | The model returns schema-valid decisions for fixed Hinglish turns |
+| Live voice matrix | `matrix_runner.py` (below) | Gnani STT/TTS + Groq | The real WebSocket voice path, policy, commit, and audit trail for T01–T22 |
 
 ## Live voice matrix
 
@@ -46,5 +46,10 @@ Reports land in `evals/reports/matrix-<UTC timestamp>.json` plus `matrix-latest.
 - Prisma streaming STT returns no confidence and no partials. The live path relies on the explicit-confirmation gate before commit; low-confidence rejection is covered only by deterministic tests.
 - T19 is deterministic-only. This architecture commits through local policy revalidation and a SQLite write, not a remote tool, so its failure semantics live in the test suite.
 - Each scenario uses a fresh fixture order in a throwaway database. Production cooldowns and order lifecycle edges are exercised by unit tests.
-- Planner calls time out at 12 s. NVIDIA NIM latency for the structured planner schema was measured at 0.7–7 s for the same prompt, so a stalled provider shows up as an `LLM_TIMEOUT` degraded turn and a failed scenario; that is provider variance, not a policy outcome.
+- Planner calls time out at 12 s. Historical NVIDIA NIM latency for the structured planner schema was measured at 0.7–7 s for the same prompt, so a stalled provider shows up as an `LLM_TIMEOUT` degraded turn and a failed scenario; that is provider variance, not a policy outcome.
 - The matrix measures the current configuration. Changing the planner model, prompts, VAD thresholds, or TTS settings invalidates comparisons with older reports.
+
+The current planner uses `GROQ_API_KEY` and `openai/gpt-oss-20b`. Older published
+NIM results are historical; rerun the selected live checks before making Groq
+quality or latency claims. Groq limits apply at the organization level; inspect
+your account limits before running a full matrix.
