@@ -3,7 +3,6 @@ import base64
 import io
 import json
 import struct
-import time
 import wave
 from contextlib import contextmanager
 from datetime import datetime
@@ -20,6 +19,7 @@ from app.llm import LLMCompletion
 from app.main import create_app
 from app.realtime import RealtimeConfig, UtteranceBuffer, frame_is_speech, pcm16_to_wav
 from app.seed import seed_database
+from app.speech_text import spoken_text
 from app.streaming_stt import StreamingSTTError, StreamingTranscript
 
 START = datetime.fromisoformat("2026-11-05T18:00:00+05:30")
@@ -223,7 +223,7 @@ def test_realtime_turn_streams_stt_planner_policy_and_tts(scripted_llm, scripted
         assert wav["filename"] == "audio.wav"
         assert wav["content_type"] == "audio/wav"
         assert wav["bytes"] == 44 + 600 * RATE // 1000 * 2
-        assert speech.synthesize_calls == [turn["agent_message"]]
+        assert speech.synthesize_calls == [spoken_text(turn["agent_message"], turn["planner"]["response_language"])]
 
         events = client.get(f"/api/sessions/{session_id}/events").json()
         types = [event["event_type"] for event in events]
@@ -598,7 +598,7 @@ def test_streaming_stt_path_skips_rest_transcription(scripted_llm, scripted_spee
     assert stream.frames == [loud(), loud(), loud(), silence(), silence(), silence()]
     assert stream.closed == 1
     assert speech.transcribe_calls == []
-    assert speech.synthesize_calls == [turn["agent_message"]]
+    assert speech.synthesize_calls == [spoken_text(turn["agent_message"], turn["planner"]["response_language"])]
 
 
 def test_streaming_failure_falls_back_to_rest(scripted_llm, scripted_speech):
@@ -803,6 +803,10 @@ def test_config_message_sets_the_tts_sample_rate(scripted_llm):
             assert ack == {"type": "config_ack", "tts_sample_rate": 24_000}
 
             # The agent opens the call before the microphone is released.
+            introduction = ws.receive_json()
+            assert introduction["type"] == "opening"
+            assert "1042" in introduction["agent_message"]
+            assert "available" in introduction["agent_message"]
             opening = ws.receive_json()
             assert opening["type"] == "agent_audio_chunk"
             assert opening["sample_rate"] == 24_000
@@ -844,7 +848,7 @@ def test_scripted_turn_runs_the_planner_without_a_microphone(scripted_llm):
             assert ws.receive_json()["type"] == "agent_audio_chunk"
             assert ws.receive_json()["type"] == "agent_audio_end"
 
-    assert speech.stream_calls[0]["text"] == turn["agent_message"]
+    assert speech.stream_calls[0]["text"] == spoken_text(turn["agent_message"], turn["planner"]["response_language"])
 
 
 def test_scripted_turn_without_text_is_rejected(scripted_llm):
@@ -963,7 +967,7 @@ class SlowLLM:
         )
 
 
-def test_slow_planner_plays_the_acknowledgement_first(scripted_llm):
+def test_slow_planner_only_plays_substantive_reply(scripted_llm):
     speech = StreamingSpeech([b"\x09\x0a"])
 
     with realtime_client(
@@ -977,25 +981,19 @@ def test_slow_planner_plays_the_acknowledgement_first(scripted_llm):
             ws.receive_json()  # ready
             ws.send_json({"type": "config", "tts_sample_rate": RATE})
             assert ws.receive_json()["type"] == "config_ack"
+            assert ws.receive_json()["type"] == "opening"
             assert ws.receive_json()["type"] == "agent_audio_chunk"  # greeting
             assert ws.receive_json()["type"] == "agent_audio_end"
-
-            deadline = time.time() + 5
-            while not speech.ack_ready and time.time() < deadline:
-                time.sleep(0.05)
-            assert speech.ack_ready
 
             ws.send_json({"type": "start"})
             ws.receive_json()  # listening
             send_utterance(ws)
             ws.receive_json()  # speech_start
             ws.receive_json()  # speech_end
-            first = ws.receive_json()
-            assert first["type"] == "agent_audio_chunk"
-            assert base64.b64decode(first["chunk_base64"]) == speech.ack
             turn = ws.receive_json()
             assert turn["type"] == "turn"
             assert ws.receive_json()["type"] == "agent_audio_chunk"
             end = ws.receive_json()
             assert end["type"] == "agent_audio_end"
-            assert end["ack_played"] is True
+            assert end["ack_played"] is False
+            assert not speech.ack_ready

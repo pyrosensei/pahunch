@@ -154,6 +154,7 @@ class PlannerMeta(BaseModel):
     response_language: Literal["en-IN", "hi-IN", "hi-en"] = "hi-en"
     wording_source: Literal["model", "template"] = "template"
     fallback_reason: str | None = None
+    operator_revision_id: str | None = None
 
 
 class AgentTurnResponse(BaseModel):

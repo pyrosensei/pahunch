@@ -18,25 +18,19 @@ from fastapi import WebSocket
 from sqlmodel import Session
 from starlette.websockets import WebSocketDisconnect
 
-from app.calls import CallService, utc_now
+from app.calls import ADMISSION_LOCK, CallService, acknowledge_operator_revision, utc_now
 from app.errors import DomainError
 from app.gnani import GnaniError, SpeechClient
-from app.language import phrase
 from app.llm import StructuredLLM
-from app.models import AuditEvent
-from app.planner import MIN_CONFIDENCE, MIN_TRANSCRIPT_CONFIDENCE
+from app.models import AuditEvent, Speaker, Turn
+from app.planner import MIN_CONFIDENCE, MIN_TRANSCRIPT_CONFIDENCE, outbound_opening
+from app.speech_text import spoken_text
 from app.streaming_stt import StreamingSTTClient, StreamingSTTError
 from app.voice import MAX_AUDIO_BYTES, VoiceTurnService
 
 MIN_TTS_SAMPLE_RATE = 8_000
 MAX_TTS_SAMPLE_RATE = 48_000
 
-# An outbound call opens with the agent identifying itself; the customer should
-# never have to speak into a silent line to find out who called.
-OPENING_LINE = (
-    "Namaste, main SwiftCart ki delivery team se baat kar rahi hoon. "
-    "Aapke parcel ke baare mein ek minute baat karni hai — boliye?"
-)
 
 
 @dataclass(frozen=True)
@@ -410,13 +404,18 @@ class _StreamingInput:
     def abort(self):
         capture, self.capture = self.capture, None
         previous = self.barrier
-        if capture is not None and capture.task is not None:
+        # A completed commit is already a clean stream boundary. Reconnecting
+        # it during barge-in needlessly stalls the new capture behind cleanup.
+        needs_discard = capture is not None and capture.task is not None and (
+            not capture.task.done() or capture.fallback_reason is not None
+        )
+        if needs_discard:
             capture.task.cancel()
 
         async def cleanup():
             if previous is not None:
                 await previous
-            if capture is not None and capture.task is not None:
+            if needs_discard:
                 await asyncio.gather(capture.task, return_exceptions=True)
                 await self._discard()
 
@@ -494,11 +493,10 @@ async def handle_voice_socket(
     closed = False
     generation = 0
     playback_generation: int | None = None
+    revision_generations: dict[int, str] = {}
     generation_done = False
     output_task: asyncio.Task | None = None
     output_tasks: set[asyncio.Task] = set()
-    ack_tasks: dict[tuple[int, str], asyncio.Task] = {}
-    ack_pcm: dict[tuple[int, str], bytes] = {}
     greeting_started = False
     tts_sample_rate = config.sample_rate
     dropped_frames = 0
@@ -602,6 +600,7 @@ async def handle_voice_socket(
     async def invalidate(reason, *, notify=True):
         nonlocal generation, playback_generation, generation_done, output_task
         old_generation = playback_generation if playback_generation is not None else generation
+        revision_generations.pop(old_generation, None)
         active = playback_generation is not None or (
             output_task is not None and not output_task.done()
         )
@@ -623,27 +622,7 @@ async def handle_voice_socket(
             if notify:
                 await send({"type": "stop_speaking", "generation_id": old_generation})
 
-    def prepare_ack(rate, language="hi-en"):
-        key = (rate, language)
-        if (
-            key in ack_pcm
-            or (key in ack_tasks and not ack_tasks[key].cancelled())
-            or getattr(speech, "synthesize_pcm", None) is None
-        ):
-            return
-
-        async def run():
-            try:
-                ack_pcm[key] = await speech.synthesize_pcm(phrase("ack", language), sample_rate=rate, language=language)
-            except GnaniError as error:
-                audit("ACK_UNAVAILABLE", {"error_type": type(error).__name__})
-            except Exception as error:
-                audit("REALTIME_TASK_FAILED", {"phase": "ack", "error_type": type(error).__name__})
-                raise
-
-        ack_tasks[key] = asyncio.create_task(run())
-
-    def start_output(job):
+    def start_output(job, *, recover_audio=False):
         nonlocal generation, generation_done, output_task, greeting_started
         generation += 1
         gen = generation
@@ -665,11 +644,19 @@ async def handle_voice_socket(
                 raise
             except DomainError as error:
                 audit("REALTIME_TURN_FAILED", {"status_code": error.status_code})
-                await send({"type": "error", "detail": error.detail}, gen=gen)
+                recoverable = recover_audio and (
+                    (error.status_code == 422 and error.detail == "No speech was detected in the audio.")
+                    or error.status_code in {502, 503, 504}
+                )
+                if recoverable:
+                    audit("STT_RECOVERY", {"status_code": error.status_code, "generation_id": gen})
+                    await send({"type": "no_speech", "reason": "RECOGNITION_EMPTY" if error.status_code == 422 else "RECOGNITION_UNAVAILABLE", "recoverable": True}, gen=gen)
+                else:
+                    await send({"type": "error", "detail": error.detail}, gen=gen)
                 if gen == generation and not closed:
                     generation_done = True
                     playback_generation = None
-                    if pending_start:
+                    if pending_start or recoverable:
                         await listen()
             except Exception as error:
                 audit(
@@ -727,11 +714,19 @@ async def handle_voice_socket(
         byte_count = 0
         error = None
         stream_pcm = getattr(speech, "stream_pcm", None)
+        with ADMISSION_LOCK, Session(bind) as opening_db:
+            message, meta = outbound_opening(opening_db, session_id)
+            current = CallService(opening_db).get_call(session_id)
+            opening_db.add(Turn(session_id=session_id, speaker=Speaker.AGENT, text=message,
+                structured_payload_json=json.dumps({"opening": True, "delivery_stage": "AVAILABILITY" if current.current_proposal_id is None else "PLAN_REVIEW", "planner": meta.model_dump(mode="json")}), created_at=utc_now()))
+            opening_db.commit()
+            opening_state = current.state.value
+        await send({"type": "opening", "opening": True, "agent_message": message, "state": opening_state, "planner": meta.model_dump(mode="json")}, gen=gen)
         try:
             if stream_pcm is None:
                 error = "TTS_UNAVAILABLE"
             else:
-                async for chunk in stream_pcm(OPENING_LINE, sample_rate=rate, language="hi-en"):
+                async for chunk in stream_pcm(spoken_text(message, meta.response_language), sample_rate=rate, language=meta.response_language):
                     if chunk:
                         if first_audio_ms is None:
                             first_audio_ms = round((perf_counter() - started) * 1000)
@@ -757,11 +752,11 @@ async def handle_voice_socket(
             {
                 "bytes": byte_count,
                 "first_audio_ms": first_audio_ms,
+                "tts_ms": round((perf_counter() - started) * 1000),
+                "total_ms": round((perf_counter() - started) * 1000),
                 "error": error,
             },
         )
-        for language in ("hi-en", "en-IN", "hi-IN"):
-            prepare_ack(rate, language)
 
     async def deliver(
         gen, rate, *, pcm=None, capture=None, text=None, language=None, ended_at=None
@@ -797,6 +792,8 @@ async def handle_voice_socket(
                     gen=gen,
                 ):
                     raise asyncio.CancelledError
+                if response.planner.operator_revision_id:
+                    revision_generations[gen] = response.planner.operator_revision_id
 
             async def audio_sink(chunk):
                 await chunk_sink(chunk, gen, rate)
@@ -804,16 +801,6 @@ async def handle_voice_socket(
             transcript = await stt.finish(capture) if pcm is not None else None
             if gen != generation or closed:
                 raise asyncio.CancelledError
-            # Optional warmup must never reserve a speech slot ahead of the reply.
-            warming = [task for task in ack_tasks.values() if not task.done()]
-            for task in warming:
-                if not task.cancelling():
-                    task.cancel()
-            if warming:
-                await asyncio.gather(*warming, return_exceptions=True)
-                audit("ACK_PREPARATION_CANCELLED", {"reason": "CUSTOMER_TURN", "tasks": len(warming)})
-            for (ack_rate, ack_language), data in ack_pcm.items():
-                service.set_ack(data, ack_rate, ack_language)
             if text is not None or transcript is not None:
                 response = await service.handle_transcript(
                     session_id,
@@ -851,6 +838,8 @@ async def handle_voice_socket(
                     },
                     gen=gen,
                 )
+            if response.audio_error or not (response.audio_streamed or response.audio_base64):
+                revision_generations.pop(gen, None)
             await audio_end(
                 {
                     "audio_streamed": response.audio_streamed,
@@ -860,8 +849,6 @@ async def handle_voice_socket(
                 },
                 gen,
             )
-            for ack_language in dict.fromkeys((response.planner.response_language, "hi-en", "en-IN", "hi-IN")):
-                prepare_ack(rate, ack_language)
 
     async def endpoint():
         nonlocal listening
@@ -880,7 +867,7 @@ async def handle_voice_socket(
         async def job(gen, rate):
             await deliver(gen, rate, pcm=pcm, capture=capture, ended_at=ended_at)
 
-        start_output(job)
+        start_output(job, recover_audio=True)
 
     feedback_task = asyncio.create_task(feedback())
     try:
@@ -1011,6 +998,10 @@ async def handle_voice_socket(
                 ):
                     playback_generation = None
                     audit("REALTIME_PLAYBACK_DONE", {"generation_id": acknowledged})
+                    revision_id = revision_generations.pop(acknowledged, None)
+                    if revision_id:
+                        with Session(bind) as review_db:
+                            acknowledge_operator_revision(review_db, session_id, revision_id)
                     if pending_start:
                         await listen()
             elif kind == "stop":
@@ -1065,7 +1056,7 @@ async def handle_voice_socket(
         # ASGI cancellation must not release socket ownership before cleanup ends.
         with CancelScope(shield=True):
             await invalidate("DISCONNECT", notify=False)
-            tasks = list(output_tasks) + list(ack_tasks.values()) + [feedback_task]
+            tasks = list(output_tasks) + [feedback_task]
             for task in tasks:
                 if not task.done() and not task.cancelling():
                     task.cancel()

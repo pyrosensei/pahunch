@@ -18,7 +18,7 @@ from app.gnani import (
     GnaniTimeoutError,
     SpeechClient,
 )
-from app.language import redact_customer_text, response_language
+from app.language import redact_customer_text
 from app.llm import StructuredLLM
 from app.models import AuditEvent
 from app.planner import (
@@ -28,14 +28,9 @@ from app.planner import (
     PlannerService,
 )
 from app.schemas import AgentTurnRequest, VoiceTimings, VoiceTurnResponse
+from app.speech_text import spoken_text
 
 MAX_AUDIO_BYTES = 10_000_000
-
-# The planner is a remote LLM call that cannot be made faster than the
-# provider allows. A short, pre-synthesised acknowledgement is played while it
-# runs. This is listening feedback, separate from the substantive reply.
-ACK_PHRASE = "Ji, main check kar rahi hoon."
-ACK_DELAY_SECONDS = 0.55
 
 # The realtime socket pushes the agent's text before its audio so the caller
 # can show the reply while the first audio chunk is still being synthesised.
@@ -120,14 +115,6 @@ class VoiceTurnService:
             min_confidence=min_confidence,
             min_transcript_confidence=min_transcript_confidence,
         )
-        self._acks: dict[tuple[int, str], bytes] = {}
-
-    def set_ack(self, pcm: bytes, sample_rate: int, language: str = "hi-en") -> None:
-        self._acks[(sample_rate, language)] = pcm
-
-    def _ack_for(self, sample_rate: int, language: str) -> bytes | None:
-        return self._acks.get((sample_rate, language))
-
     async def _speak(
         self,
         text: str,
@@ -145,6 +132,7 @@ class VoiceTurnService:
         fallback is skipped: repeating audio is worse than a truncated
         sentence.
         """
+        text = spoken_text(text, language)
         stream_pcm = getattr(self.speech, "stream_pcm", None)
         if stream_pcm is not None:
             for _ in range(2):
@@ -283,16 +271,7 @@ class VoiceTurnService:
         ack_played = False
         first_audio_at = None
         first_response_audio_at = None
-        language = response_language(text)
-        ack = self._ack_for(sample_rate, language) if audio_sink is not None else None
         try:
-            if ack is not None:
-                # An acknowledgement does not transfer ownership of the planner task.
-                done, _ = await asyncio.wait({planner_task}, timeout=ACK_DELAY_SECONDS)
-                if not done:
-                    first_audio_at = perf_counter()
-                    await audio_sink(ack)
-                    ack_played = True
             planner_response = await planner_task
         finally:
             if not planner_task.done():
@@ -351,7 +330,7 @@ class VoiceTurnService:
             for _ in range(2):
                 try:
                     speech_audio = await self.speech.synthesize(
-                        planner_response.agent_message,
+                        spoken_text(planner_response.agent_message, planner_response.planner.response_language),
                         language=planner_response.planner.response_language,
                     )
                 except GnaniTimeoutError as error:

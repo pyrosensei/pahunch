@@ -50,6 +50,41 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def pending_operator_revision(db: Session, session_id: str, proposal_id: str | None) -> bool:
+    if not proposal_id:
+        return False
+    revised = False
+    events = db.exec(select(AuditEvent).where(
+        AuditEvent.session_id == session_id,
+        AuditEvent.event_type.in_(["OPERATOR_PLAN_REVISED", "OPERATOR_REVISION_ACKNOWLEDGED"]),
+    ).order_by(AuditEvent.id)).all()
+    for event in events:
+        if json.loads(event.payload_json).get("proposal_id") == proposal_id:
+            revised = event.event_type == "OPERATOR_PLAN_REVISED"
+    return revised
+
+
+def acknowledge_operator_revision(db: Session, session_id: str, proposal_id: str) -> bool:
+    """Called only by a matching, completed playback acknowledgement, never an operator button."""
+    with ADMISSION_LOCK:
+        db.expire_all()
+        calls = CallService(db)
+        call = calls.get_call(session_id)
+        if call.current_proposal_id != proposal_id or call.state != CallState.PENDING_CONFIRMATION:
+            return False
+        if not pending_operator_revision(db, session_id, proposal_id):
+            return False
+        announcements = db.exec(select(AuditEvent).where(
+            AuditEvent.session_id == session_id,
+            AuditEvent.event_type == "OPERATOR_REVISION_ANNOUNCED",
+        )).all()
+        if not any(json.loads(event.payload_json).get("proposal_id") == proposal_id for event in announcements):
+            return False
+        calls._audit(session_id, "OPERATOR_REVISION_ACKNOWLEDGED", {"proposal_id": proposal_id})
+        db.commit()
+        return True
+
+
 def _call_mutation(method):
     @wraps(method)
     def serialized(self, *args, **kwargs):
@@ -325,6 +360,8 @@ class CallService:
         if cleaned != original:
             self._audit(call.id, "SENSITIVE_TEXT_REDACTED", {"reason": "OTP_DISCLOSURE"})
         request = CustomerTurnRequest.model_validate(cleaned)
+        if request.confirmation and pending_operator_revision(self.db, call.id, call.current_proposal_id):
+            raise DomainError(409, "The revised plan must be presented before fresh customer confirmation")
         if not request.confirmation:
             call.customer_confirmed = False
 
@@ -449,6 +486,8 @@ class CallService:
             return self._result(existing, reused=True)
 
         require_tool(call.state, ToolName.COMMIT_PLAN)
+        if pending_operator_revision(self.db, call.id, call.current_proposal_id):
+            raise DomainError(409, "The revised plan must be presented before fresh customer confirmation")
         if not call.customer_confirmed:
             raise DomainError(409, "Customer confirmation is required before commit")
         if not call.current_proposal_id:
@@ -484,6 +523,8 @@ class CallService:
         self.db.add(commit)
         if proposal.primary.action == PlanAction.RESCHEDULE:
             order.status = OrderStatus.RESCHEDULED
+            order.window_start = proposal.primary.window_start
+            order.window_end = proposal.primary.window_end
         order.last_call_completed_at = now
         self._transition(call, CallState.COMMITTED)
         call.outcome = CallOutcome.COMMITTED

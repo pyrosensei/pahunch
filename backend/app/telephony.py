@@ -1,6 +1,7 @@
 import base64
 import hmac
 import re
+from datetime import UTC
 from urllib.parse import parse_qsl, urlsplit
 from xml.etree.ElementTree import Element, SubElement, tostring
 
@@ -10,9 +11,16 @@ from fastapi.responses import Response
 from sqlmodel import Session
 from starlette.datastructures import FormData
 
-from app.calls import ADMISSION_LOCK, CallService
+from app.calls import ADMISSION_LOCK, CallService, utc_now
 from app.errors import DomainError
-from app.models import CallRuntime, CallState, TwilioBinding
+from app.models import (
+    CallRuntime,
+    CallSession,
+    CallState,
+    PhoneDemoApproval,
+    PhoneDemoPermit,
+    TwilioBinding,
+)
 from app.schemas import CustomerTurnRequest
 from app.state_machine import TERMINAL_STATES
 
@@ -82,16 +90,48 @@ class TwilioTransport:
         return self.settings.public_base_url.rstrip("/") + path
 
     def is_approved(self, session_id):
-        return (
-            all(self.readiness().values())
-            and self.settings.twilio_approved_session_id == session_id
-        )
+        ready = self.readiness()
+        if not all(value for key, value in ready.items() if key != "session_approval_present"):
+            return False
+        with Session(self.engine) as db:
+            permit = db.get(PhoneDemoPermit, 1)
+            if permit and permit.disarmed:
+                return False
+            if self.settings.twilio_approved_session_id == session_id:
+                return True
+            return db.get(PhoneDemoApproval, session_id) is not None
+
+    def _reserve_automatic_approval(self, session_id):
+        if self.settings.twilio_approved_session_id == session_id:
+            return
+        ready = self.readiness()
+        if not all(value for key, value in ready.items() if key != "session_approval_present"):
+            return
+        with ADMISSION_LOCK, Session(self.engine) as db:
+            call = db.get(CallSession, session_id)
+            if call is None or call.state != CallState.CALLING:
+                return
+            if db.get(TwilioBinding, session_id) or db.get(PhoneDemoApproval, session_id):
+                return
+            permit = db.get(PhoneDemoPermit, 1)
+            now = utc_now()
+            if permit is None or permit.disarmed or permit.remaining_calls < 1 or permit.expires_at.replace(tzinfo=permit.expires_at.tzinfo or UTC) <= now:
+                return
+            permit.remaining_calls -= 1
+            db.add(PhoneDemoApproval(session_id=session_id, approved_at=now))
+            CallService(db)._audit(session_id, "PHONE_AUTO_APPROVED", {"recipient": "owner-handset", "permit": "bounded-demo"})
+            db.commit()
 
     def dispatch_if_approved(self, session_id):
         cfg = self.settings
+        self._reserve_automatic_approval(session_id)
         if not self.is_approved(session_id):
             return False
         with ADMISSION_LOCK, Session(self.engine) as db:
+            # Disarm and binding reservation must serialize, even if approval was
+            # observed just before the operator disabled new calls.
+            if not self.is_approved(session_id):
+                return False
             calls = CallService(db)
             call = calls.get_call(session_id)
             binding = db.get(TwilioBinding, session_id)

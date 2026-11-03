@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     streaming_stt_candidates: str = "hi-IN,en-IN"
     streaming_stt_transcript_timeout_seconds: float = 3.0
     dialer_enabled: bool = True
+    operator_api_token: str = Field(default="", repr=False)
     dialer_interval_seconds: float = Field(default=5, ge=0.1)
     dialer_waiting_timeout_seconds: float = Field(default=120, ge=1)
     dialer_disconnect_grace_seconds: float = Field(default=30, ge=1)

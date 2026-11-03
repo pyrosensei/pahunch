@@ -128,7 +128,6 @@ def test_acknowledgement_never_plays_in_wrong_language(db):
     async def run():
         speech = LanguageSpeech("Please hand it to me")
         service = VoiceTurnService(db, SlowPlanner(), speech)
-        service.set_ack(b"HINGLISH_ACK", 16000)
         call = start_call(service.calls)
         chunks = []
 

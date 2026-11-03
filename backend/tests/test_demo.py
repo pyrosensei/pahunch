@@ -11,6 +11,7 @@ from app.models import DialerEvent, Order
 from app.seed import seed_database
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
+DELIVERY_START = datetime.fromisoformat("2026-11-01T10:00:00+05:30")
 
 
 @pytest.fixture
@@ -31,8 +32,8 @@ def demo(tmp_path, scripted_llm):
                 "proposal": {
                     "primary": {
                         "action": "HAND_TO_CUSTOMER",
-                        "window_start": (NOW + timedelta(minutes=15)).isoformat(),
-                        "window_end": (NOW + timedelta(minutes=135)).isoformat(),
+                        "window_start": DELIVERY_START.isoformat(),
+                        "window_end": (DELIVERY_START + timedelta(hours=2)).isoformat(),
                     }
                 },
             }
@@ -59,8 +60,9 @@ def test_checkout_creates_only_synthetic_pending_order_with_relative_windows(dem
     order = response.json()
     assert order["merchant_name"] == "SwiftCart"
     assert order["status"] == "PENDING" and order["payment_mode"] == payment
-    assert datetime.fromisoformat(order["window_start"]) == NOW + timedelta(minutes=15)
-    assert datetime.fromisoformat(order["window_end"]) == NOW + timedelta(minutes=135)
+    assert order["requires_otp"] == (payment == "PREPAID")
+    assert datetime.fromisoformat(order["window_start"]) == DELIVERY_START
+    assert datetime.fromisoformat(order["window_end"]) == DELIVERY_START + timedelta(hours=2)
     assert len(client.get(f"/api/orders/{order['id']}/slots").json()) == 2
     with Session(engine) as db:
         assert db.get(Order, 1042).window_start.date().isoformat() == "2026-11-05"
@@ -85,6 +87,8 @@ def test_readiness_is_deliberate_and_idempotent_and_does_not_touch_seed_order(de
     route = f"/api/orders/{order['id']}/out-for-delivery"
     assert client.post(route).json()["status"] == "OUT_FOR_DELIVERY"
     assert client.post(route).status_code == 200
+    assert dialer.sweep() == []  # Scheduled later; do not auto-call early.
+    dialer.clock = lambda: DELIVERY_START - timedelta(minutes=30)
     assert len(dialer.sweep()) == 1
     assert client.post("/api/orders/1042/out-for-delivery").status_code == 409
     with Session(engine) as db:
@@ -100,6 +104,7 @@ def test_dashboard_tracks_plan_confirmation_commit_and_safe_transcript(demo):
     client, dialer, _ = demo
     order = client.post("/api/orders", json={"payment_mode": "COD"}).json()
     client.post(f"/api/orders/{order['id']}/out-for-delivery")
+    dialer.clock = lambda: DELIVERY_START - timedelta(minutes=30)
     sid = dialer.sweep()[0]
     calls = client.get("/api/sessions", params={"order_id": order["id"], "active": True}).json()
     assert calls[0]["id"] == sid and calls[0]["transport"] == "browser"
@@ -151,6 +156,35 @@ def test_high_value_parcel_price_is_controlled_by_server(demo):
     )
     assert response.status_code == 201
     assert response.json()["declared_value_inr"] == 30000
+
+
+def test_catalog_contains_real_product_choices_and_server_owned_values(demo):
+    client = demo[0]
+    products = client.get('/api/catalog').json()
+    assert {product['id'] for product in products} == {'headphones', 'backpack', 'watch', 'laptop'}
+    for product in products:
+        response = client.post('/api/orders', json={'payment_mode': 'COD', 'product_id': product['id'], 'requires_otp': True})
+        assert response.status_code == 201
+        order = response.json()
+        assert order['declared_value_inr'] == product['price_inr']
+        assert order['requires_otp'] is False
+        saved = client.get(f"/api/orders/{order['id']}/product").json()
+        assert saved['product_id'] == product['id']
+        assert saved['product_name'] == product['name']
+    assert next(product for product in products if product['id'] == 'laptop')['direct_handoff_required']
+
+
+@pytest.mark.parametrize('payment,client_otp,expected', [('COD', True, False), ('PREPAID', False, True)])
+def test_payment_rule_cannot_be_overridden_by_checkout_client(demo, payment, client_otp, expected):
+    response = demo[0].post('/api/orders', json={'product_id': 'headphones', 'payment_mode': payment, 'requires_otp': client_otp})
+    assert response.status_code == 201
+    assert response.json()['requires_otp'] is expected
+
+
+def test_unknown_product_and_client_price_are_rejected(demo):
+    client = demo[0]
+    assert client.post('/api/orders', json={'payment_mode': 'COD', 'product_id': 'unknown'}).status_code == 422
+    assert client.post('/api/orders', json={'payment_mode': 'COD', 'product_id': 'laptop', 'price_inr': 1}).status_code == 422
 
 
 def test_dashboard_redacts_legacy_transcript_and_supports_cursor(demo):

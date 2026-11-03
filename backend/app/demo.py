@@ -8,14 +8,16 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from app.calls import ADMISSION_LOCK, CallService, utc_now
+from app.catalog import catalog_items, find_product
 from app.db import get_session
 from app.errors import DomainError
-from app.language import redact_customer_text, redact_payload
+from app.language import recorded_turn_text, redact_payload
 from app.models import (
     CallRuntime,
     CallSession,
     DeliveryCommit,
     DeliverySlot,
+    DemoOrderProduct,
     DialerEvent,
     Order,
     OrderStatus,
@@ -25,6 +27,7 @@ from app.models import (
     Turn,
     TwilioBinding,
 )
+from app.policy import IST
 from app.state_machine import TERMINAL_STATES
 
 router = APIRouter(prefix="/api")
@@ -34,8 +37,24 @@ SessionDep = Annotated[Session, Depends(get_session)]
 class DemoOrderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     payment_mode: PaymentMode
+    product_id: str | None = None
+    # Legacy clients may still submit these fields. Neither controls catalog
+    # value or the payment-derived verification rule.
     parcel_type: Literal["standard", "high_value"] = "standard"
-    requires_otp: bool = True
+    requires_otp: bool | None = None
+
+
+@router.get("/catalog")
+def catalog():
+    return catalog_items()
+
+
+@router.get("/orders/{order_id}/product", response_model=DemoOrderProduct)
+def order_product(order_id: int, db: SessionDep):
+    product = db.get(DemoOrderProduct, order_id)
+    if product is None:
+        raise DomainError(404, "No catalog product is associated with this order")
+    return product
 
 
 def _now(request: Request):
@@ -45,10 +64,14 @@ def _now(request: Request):
 
 @router.post("/orders", response_model=Order, status_code=201)
 def checkout(request: DemoOrderRequest, http_request: Request, db: SessionDep):
+    product = find_product(request.product_id) if request.product_id else None
+    if request.product_id is not None and product is None:
+        raise DomainError(422, "Choose a product from the SwiftCart catalog")
     with ADMISSION_LOCK:
         now = _now(http_request)
         order_id = (db.exec(select(func.max(Order.id))).one() or 0) + 1
-        start = now + timedelta(minutes=15)
+        # Checkout time is not a delivery promise. Use a separate future demo day.
+        start = (now.astimezone(IST) + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
         end = start + timedelta(hours=2)
         order = Order(
             id=order_id,
@@ -57,8 +80,8 @@ def checkout(request: DemoOrderRequest, http_request: Request, db: SessionDep):
             window_start=start,
             window_end=end,
             payment_mode=request.payment_mode,
-            requires_otp=request.requires_otp,
-            declared_value_inr=30000 if request.parcel_type == "high_value" else 1800,
+            requires_otp=request.payment_mode == PaymentMode.PREPAID,
+            declared_value_inr=product.price_inr if product else (30000 if request.parcel_type == "high_value" else 1800),
             safe_drop_allowed=True,
             neighbour_drop_allowed=True,
             security_drop_allowed=True,
@@ -66,8 +89,12 @@ def checkout(request: DemoOrderRequest, http_request: Request, db: SessionDep):
         )
         db.add(order)
         db.flush()
+        if product:
+            db.add(DemoOrderProduct(order_id=order_id, product_id=product.id,
+                                    product_name=product.name, price_inr=product.price_inr))
         for offset in (timedelta(), timedelta(days=1)):
-            db.add(DeliverySlot(order_id=order_id, start_at=start + offset, end_at=end + offset))
+            day = start + offset
+            db.add(DeliverySlot(order_id=order_id, start_at=day.replace(hour=8), end_at=day.replace(hour=18)))
         db.add(
             DialerEvent(
                 order_id=order_id,
@@ -187,7 +214,7 @@ def transcript(
         {
             "id": turn.id,
             "speaker": turn.speaker.value,
-            "text": redact_customer_text(turn.text),
+            "text": recorded_turn_text(turn.text, turn.speaker.value, json.loads(turn.structured_payload_json)),
             "created_at": turn.created_at,
             "structured_payload": redact_payload(json.loads(turn.structured_payload_json)),
         }
