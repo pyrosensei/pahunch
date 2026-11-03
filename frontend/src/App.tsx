@@ -1,0 +1,11 @@
+import { lazy, Suspense, useEffect } from 'react';
+import { Link, NavLink, Route, Routes, useLocation, Navigate } from 'react-router-dom';
+import { ArrowUpRight, Package, LayoutDashboard, ArrowLeft } from 'lucide-react';
+const Landing=lazy(()=>import('./pages/Landing'));
+const Shop=lazy(()=>import('./pages/Shop'));
+const Dashboard=lazy(()=>import('./pages/Dashboard'));
+const Voice=lazy(()=>import('./pages/Voice'));
+export function Brand({shop=false}:{shop?:boolean}) {return <Link className={`brand ${shop?'brand-shop':''}`} to={shop?'/shop':'/'} aria-label={shop?'SwiftCart shop':'Pahunch home'}><span className="brand-mark">{shop?<Package size={21}/>:<span>p<span className="brand-dot">.</span></span>}</span>{shop?'SwiftCart':'pahunch'}<span className="brand-caption">{shop?'DEMO STORE':''}</span></Link>}
+export default function App(){const location=useLocation();useEffect(()=>{window.scrollTo(0,0);},[location.pathname]);const landing=location.pathname==='/';const legacyOrder=landing?new URLSearchParams(location.search).get('order_id'):null;
+if(legacyOrder)return <Navigate to={`/dashboard${location.search}`} replace/>;
+return <><a className="skip-link" href="#main">Skip to content</a>{landing?<Suspense fallback={<main id="main" className="page loading-panel">Opening the delivery story?</main>}><Landing/></Suspense>:<><header className="app-header"><Brand shop={location.pathname==='/shop'}/><nav aria-label="Main navigation"><NavLink to="/dashboard"><LayoutDashboard size={16}/>Dashboard</NavLink><NavLink to="/shop"><Package size={16}/>SwiftCart</NavLink></nav><Link className="back-home" to="/"><ArrowLeft size={15}/>Back to story</Link></header><Suspense fallback={<main id="main" className="page"><div className="loading-panel">Opening your workspace…</div></main>}><Routes><Route path="/dashboard" element={<Dashboard/>}/><Route path="/shop" element={<Shop/>}/><Route path="/voice" element={<Voice/>}/><Route path="*" element={<main id="main" className="page empty"><h1>This page took a different route.</h1><Link className="button primary" to="/">Return home<ArrowUpRight size={17}/></Link></main>}/></Routes></Suspense><footer className="app-footer"><span>pahunch · Thoughtful conversations. Clearer deliveries.</span><span>Synthetic demonstration · No real purchases</span></footer></>}</>}
