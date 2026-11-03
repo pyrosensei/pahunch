@@ -26,8 +26,8 @@ def _slot_matches(step: PlanStep, slots: list[DeliverySlot]) -> bool:
     if step.window_start is None or step.window_end is None:
         return False
     return any(
-        _utc(slot.start_at) == _utc(step.window_start)
-        and _utc(slot.end_at) == _utc(step.window_end)
+        _utc(slot.start_at) <= _utc(step.window_start)
+        and _utc(step.window_end) <= _utc(slot.end_at)
         for slot in slots
     )
 

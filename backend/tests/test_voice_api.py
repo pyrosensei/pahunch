@@ -16,6 +16,7 @@ from app.gnani import (
 )
 from app.main import create_app
 from app.seed import seed_database
+from app.speech_text import spoken_text
 
 START = datetime.fromisoformat("2026-11-05T18:00:00+05:30")
 END = datetime.fromisoformat("2026-11-05T20:00:00+05:30")
@@ -148,7 +149,7 @@ def test_voice_turn_runs_stt_planner_policy_and_tts(scripted_llm, scripted_speec
                 "content_type": "audio/wav",
             }
         ]
-        assert speech.synthesize_calls == [body["agent_message"]]
+        assert speech.synthesize_calls == [spoken_text(body["agent_message"], body["planner"]["response_language"])]
 
         events = client.get(f"/api/sessions/{session_id}/events").json()
         voice_events = [event for event in events if event["event_type"] == "VOICE_TURN"]

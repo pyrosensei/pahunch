@@ -362,6 +362,63 @@ def test_reset_during_stt_connect_can_capture_again(scripted_llm):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("failure", ["empty", "timeout"])
+def test_recognition_failure_resumes_listening_without_consuming_turn(scripted_llm, failure):
+    from app.gnani import GnaniTimeoutError, Transcript
+
+    class RecoveringSpeech(StreamingSpeech):
+        attempts = 0
+
+        async def transcribe(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                if failure == "timeout":
+                    raise GnaniTimeoutError("test timeout")
+                return Transcript(text="", latency_ms=1)
+            return Transcript(text="6 se 8 aa jaana", latency_ms=1)
+
+    async def run():
+        speech = RecoveringSpeech([b"reply"])
+        async with voice(scripted_llm([proposal_decision()]), speech=speech) as (ws, _, calls, sid):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            feedback = await ws.event("no_speech")
+            assert feedback["recoverable"] is True
+            await ws.event("listening")
+            calls.db.expire_all()
+            assert calls.get_call(sid).turn_count == 0
+            ws.utterance()
+            await ws.event("turn")
+            await ws.event("agent_audio_end")
+            calls.db.expire_all()
+            assert calls.get_call(sid).turn_count == 1
+            assert speech.attempts == 2
+            assert not any(e["type"] == "error" for e in ws.history)
+    asyncio.run(run())
+
+
+def test_barge_in_after_completed_commit_reuses_clean_stt_connection(scripted_llm):
+    async def run():
+        stream = ScriptedStream([StreamingTranscript(text="6 se 8 aa jaana")])
+        async with voice(scripted_llm([proposal_decision()]), streaming=stream) as (ws, _, _, _):
+            ws.control("config", playback_tracking=True)
+            opening = await ws.event("agent_audio_end")
+            ws.control("playback_done", generation_id=opening["generation_id"])
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            await ws.event("agent_audio_end")
+            # Interrupt the queued playback after the previous STT commit ended.
+            ws.audio(loud())
+            ws.audio(loud())
+            await ws.event("speech_start")
+            await asyncio.sleep(0.02)
+            assert stream.connect_attempts == 1
+            assert stream.cancelled == 0
+    asyncio.run(run())
+
+
 def test_busy_scripted_turn_is_rejected_without_running_second_planner(scripted_llm):
     async def run():
         llm = HeldPlanner(scripted_llm)

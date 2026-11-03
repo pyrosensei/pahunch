@@ -130,6 +130,19 @@ def redact_customer_text(text: str) -> str:
     ]
 
 
+def recorded_turn_text(text: str, speaker: str, payload: dict) -> str:
+    """Keep server-rendered order facts readable; never exempt customer/model text."""
+    meta = payload.get("planner", {})
+    if (speaker == "AGENT" and isinstance(meta, dict)
+            and meta.get("model") == "rules:delivery-opening"
+            and (payload.get("opening") is True or meta.get("fallback_reason") == "OUTBOUND_DELIVERY_PURPOSE")):
+        # These two producers interpolate only stored order/catalog facts, never
+        # a customer OTP. Generic model responses and all customer turns still
+        # pass through the conservative OTP-disclosure redactor below.
+        return text
+    return redact_customer_text(text)
+
+
 def redact_payload(value):
     if isinstance(value, str):
         return redact_customer_text(value)
@@ -142,8 +155,8 @@ def redact_payload(value):
 
 MESSAGES = {
     "hi-en": {
-        "unclear": "Sorry, mujhe yeh theek se samajh nahi aaya. Kya aap time window aur handoff ek baar phir bata sakte hain?",
-        "unavailable": "Sorry, main abhi plan check nahi kar payi. Kya aap thodi der baad phir bata sakte hain?",
+        "unclear": "Aap scheduled time par parcel lenge, ya delivery ka doosra time chahiye?",
+        "unavailable": "Delivery plan ki jaanch abhi available nahi hai. Abhi koi badlav final nahi hua; aap apna preferred time bata sakte hain.",
         "confirmation_required": "Confirm karne ke liye haan ya theek hai boliye. Phir main isi plan ko aage badha sakti hoon.",
         "confirmation_accepted": "Theek hai, main is plan ko final karne ke liye aage badha rahi hoon.",
         "confirmation_question": "Kya main is plan ko aage badhaun?",
@@ -154,11 +167,11 @@ MESSAGES = {
         "heard": "Haan, aapki aawaz aa rahi hai. Boliye, delivery ke liye kya chahiye?",
         "repeat_plan": "Aapne yeh plan mana kiya hai. Koi doosra time ya handoff bataiye.",
         "turn_limit": "Hum is call mein plan tay nahi kar paye. Yahin call khatam karte hain; abhi koi plan final nahi hua hai.",
-        "ack": "Ji, main check kar rahi hoon.",
+        "ack": "Ji, aapki baat sun li.",
     },
     "en-IN": {
-        "unclear": "Sorry, I did not understand that clearly. Please tell me your preferred delivery window and handoff.",
-        "unavailable": "Sorry, I could not check the plan right now. Please try again later.",
+        "unclear": "Will you receive the parcel at the scheduled time, or would you prefer another delivery time?",
+        "unavailable": "The delivery plan check is temporarily unavailable. No change has been finalized; please tell me your preferred time.",
         "confirmation_required": "Please explicitly say yes to this plan before I take it forward.",
         "confirmation_accepted": "Thank you, I will submit this plan for the final check.",
         "confirmation_question": "May I take this plan forward?",
@@ -169,11 +182,11 @@ MESSAGES = {
         "heard": "Yes, I can hear you. What would you like to arrange for your delivery?",
         "repeat_plan": "You rejected that plan. Please suggest a different delivery window or handoff.",
         "turn_limit": "We could not agree on a plan within this call. I will end the conversation here; no plan has been finalized.",
-        "ack": "I am checking that for you.",
+        "ack": "I heard you.",
     },
     "hi-IN": {
-        "unclear": "क्षमा कीजिए, आपकी बात स्पष्ट नहीं समझ पाई। कृपया डिलीवरी का समय और पार्सल किसे देना है, फिर बताइए।",
-        "unavailable": "क्षमा कीजिए, अभी योजना जाँच नहीं पाई। कृपया थोड़ी देर बाद फिर बताइए।",
+        "unclear": "आप तय समय पर पार्सल लेंगे, या डिलीवरी का दूसरा समय चाहिए?",
+        "unavailable": "डिलीवरी योजना की जाँच अभी उपलब्ध नहीं है। अभी कोई बदलाव अंतिम नहीं हुआ; आप अपना पसंदीदा समय बता सकते हैं।",
         "confirmation_required": "इस योजना को आगे बढ़ाने से पहले कृपया स्पष्ट रूप से हाँ कहिए।",
         "confirmation_accepted": "धन्यवाद, अब इस योजना को अंतिम जाँच के लिए आगे बढ़ा रही हूँ।",
         "confirmation_question": "क्या मैं इस योजना को आगे बढ़ाऊँ?",
@@ -184,7 +197,7 @@ MESSAGES = {
         "heard": "हाँ, आपकी आवाज सुनाई दे रही है। डिलीवरी के लिए क्या व्यवस्था चाहिए?",
         "repeat_plan": "आपने यह योजना अस्वीकार की है। कृपया कोई दूसरा समय या पार्सल सौंपने का तरीका बताइए।",
         "turn_limit": "इस बातचीत में योजना तय नहीं हो पाई। अब बातचीत समाप्त करती हूँ; कोई योजना अंतिम नहीं हुई है।",
-        "ack": "जी, मैं इसकी जाँच कर रही हूँ।",
+        "ack": "जी, आपकी बात सुन ली।",
     },
 }
 
@@ -259,7 +272,12 @@ def conversational_input(text: str) -> str | None:
     cleaned = " ".join(re.sub(r"[?!.।,]", " ", text.casefold()).split())
     if cleaned in {"hello", "helo", "hi", "hey", "namaste", "नमस्ते", "हेलो"}:
         return "greeting"
-    if cleaned in {
+    audio_check = cleaned
+    for greeting in ("hello ", "hi ", "हेलो ", "नमस्ते "):
+        if audio_check.startswith(greeting):
+            audio_check = audio_check[len(greeting):]
+            break
+    if audio_check in {
         "can you hear me",
         "is my voice audible",
         "kya meri aawaz aa rahi hai",
@@ -274,3 +292,29 @@ def conversational_input(text: str) -> str | None:
 
 def is_rejection(text: str) -> bool:
     return bool(re.match(r"^\s*(?:no\b|nope\b|nahi\b|nahin\b|नहीं|नही)", text, re.IGNORECASE))
+
+
+def is_call_purpose_question(text: str) -> bool:
+    """Small conversational routing rule, not a delivery-instruction parser."""
+    cleaned = " ".join(re.sub(r"[?!.।,]", " ", text.casefold()).split())
+    return cleaned in {
+        "why are you calling", "why did you call", "what is this call about",
+        "what do you want to talk about", "what is this about", "what do you need",
+        "kya baat karni hai", "kya baat karni hai aapko", "kyun phone kiya",
+        "kisliye call kiya", "aapne kyon phone kiya", "kya baat hai",
+        "क्या बात करनी है आपको", "क्या बात करनी है", "आपने फोन क्यों किया",
+        "आपने फ़ोन क्यों किया", "क्यों फोन किया", "कॉल क्यों किया", "क्या काम है",
+        "हाँ क्या बात करनी है आपको", "हां क्या बात करनी है आपको",
+        "ji boliye", "haan boliye", "haan bataiye", "yes go on",
+        "हाँ बताइए", "हां बताइए", "जी बताइए", "जी बोलिए",
+    }
+
+
+def is_availability_acceptance(text: str) -> bool:
+    cleaned = " ".join(re.sub(r"[?!.।,]", " ", text.casefold()).split())
+    return cleaned in {
+        "yes", "yes i am available", "yes i'll be home", "yes i will be home",
+        "haan", "han", "haan main ghar par hoon", "haan available hoon",
+        "हाँ", "हां", "जी हाँ", "हाँ मैं घर पर हूँ", "हां मैं घर पर हूं",
+        "हाँ उपलब्ध हूँ", "हां उपलब्ध हूं",
+    }

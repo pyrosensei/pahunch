@@ -2,6 +2,7 @@ from app.errors import DomainError
 from app.models import CallSession, CallState
 
 TERMINAL_STATES = {
+    CallState.CANCELLED,
     CallState.COMMITTED,
     CallState.NO_ANSWER,
     CallState.UNREACHABLE,
@@ -51,6 +52,7 @@ ALLOWED_TRANSITIONS = {
 
 def transition(call: CallSession, target: CallState) -> None:
     allowed = ALLOWED_TRANSITIONS.get(call.state, set())
-    if target not in allowed:
+    # Cancellation is a terminal order action, available only while a call is open.
+    if target not in allowed and not (target == CallState.CANCELLED and call.state not in TERMINAL_STATES):
         raise DomainError(409, f"Illegal call transition: {call.state} -> {target}")
     call.state = target

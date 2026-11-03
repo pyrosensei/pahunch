@@ -10,7 +10,7 @@ from fastapi import APIRouter, WebSocket
 from sqlmodel import Session
 from starlette.websockets import WebSocketDisconnect
 
-from app.calls import ADMISSION_LOCK, CallService, utc_now
+from app.calls import ADMISSION_LOCK, CallService, acknowledge_operator_revision, utc_now
 from app.errors import DomainError
 from app.models import CallRuntime, CallSession, CallState, TwilioBinding
 from app.phone_audio import TelephoneSpeech, decode_mulaw, encode_mulaw
@@ -23,11 +23,14 @@ router = APIRouter()
 
 
 class PhoneSocket:
-    def __init__(self, websocket, stream_sid, audit, *, on_turn=None):
+    def __init__(self, websocket, stream_sid, audit, *, on_turn=None, on_revision_ack=None):
         self.websocket = websocket
         self.stream_sid = stream_sid
         self.audit = audit
         self.on_turn = on_turn
+        self.on_revision_ack = on_revision_ack
+        self.revision_notices = {}
+        self.revision_audio = set()
         self.controls = deque(
             [
                 {
@@ -82,6 +85,10 @@ class PhoneSocket:
                 name = mark.get("name")
                 gen = self.marks.pop(name, None)
                 if gen is not None and gen > self.cancelled:
+                    proposal_id = self.revision_notices.pop(gen, None)
+                    if proposal_id and gen in self.revision_audio and self.on_revision_ack:
+                        self.on_revision_ack(proposal_id)
+                    self.revision_audio.discard(gen)
                     if self.terminal:
                         await self.close()
                         break
@@ -126,12 +133,17 @@ class PhoneSocket:
         kind = event.get("type")
         gen = event.get("generation_id", 0)
         if kind == "turn" and self.on_turn is not None:
+            revision = event.get("planner", {}).get("operator_revision_id")
+            if revision:
+                self.revision_notices[gen] = revision
             self.terminal = await self.on_turn(event)
         elif kind == "stop_speaking":
             self.cancelled = max(self.cancelled, gen)
             self.marks = {
                 name: value for name, value in self.marks.items() if value > self.cancelled
             }
+            self.revision_notices = {key: value for key, value in self.revision_notices.items() if key > self.cancelled}
+            self.revision_audio = {key for key in self.revision_audio if key > self.cancelled}
             await self.websocket.send_json({"event": "clear", "streamSid": self.stream_sid})
         elif kind in {"agent_audio_chunk", "agent_audio_end"}:
             if gen <= self.cancelled or gen < self.generation:
@@ -141,6 +153,8 @@ class PhoneSocket:
                 if event.get("sample_rate") != 8000:
                     raise DomainError(400, "Invalid telephone output sample rate")
                 pcm = base64.b64decode(event["chunk_base64"], validate=True)
+                if pcm and gen in self.revision_notices:
+                    self.revision_audio.add(gen)
                 data = encode_mulaw(pcm)
                 for offset in range(0, len(data), 160):
                     await self.websocket.send_json(
@@ -154,6 +168,7 @@ class PhoneSocket:
                     )
             else:
                 if event.get("audio_error"):
+                    self.revision_notices.pop(gen, None)
                     self.audit("PHONE_AUDIO_FAILED", {"error": event["audio_error"]})
                     self.terminal = True
                 name = f"pahunch-{gen}"
@@ -269,7 +284,11 @@ async def phone_media(websocket: WebSocket, session_id: str):
         llm = websocket.app.state.phone_llm
         if speech is None or llm is None:
             raise DomainError(503, "Phone speech is not configured")
-        adapter = PhoneSocket(websocket, sid, audit, on_turn=on_turn)
+        def revision_ack(proposal_id):
+            with Session(transport.engine) as ack_db:
+                acknowledge_operator_revision(ack_db, session_id, proposal_id)
+
+        adapter = PhoneSocket(websocket, sid, audit, on_turn=on_turn, on_revision_ack=revision_ack)
         with Session(transport.engine) as db:
             await handle_voice_socket(
                 adapter,

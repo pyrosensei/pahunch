@@ -341,7 +341,8 @@ def test_unsafe_clarification_message_is_replaced(db, scripted_llm):
     assert result.state == CallState.DISCOVERY.value
     assert "OTP" not in result.agent_message
     assert "done" not in result.agent_message.lower()
-    assert "samajh nahi aaya" in result.agent_message
+    assert "scheduled time" in result.agent_message
+    assert "samajh nahi aaya" not in result.agent_message
 
 
 def test_planner_rejects_non_conversation_state(db, scripted_llm):
@@ -445,7 +446,8 @@ def test_failed_repair_degrades_safely(db, scripted_llm):
     assert result.planner.degraded is True
     assert result.planner.error_code == "LLM_INVALID_OUTPUT"
     assert result.turn.verdict is None
-    assert "samajh nahi aaya" in result.agent_message
+    assert "scheduled time" in result.agent_message
+    assert "samajh nahi aaya" not in result.agent_message
 
 
 def test_planner_schema_omits_unconsumed_descriptive_fields():
