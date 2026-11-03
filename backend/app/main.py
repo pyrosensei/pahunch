@@ -4,8 +4,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, cast
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
@@ -18,6 +18,8 @@ from app.errors import DomainError
 from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
 from app.llm import StructuredLLM, build_llm_client
 from app.models import AuditEvent, CallRuntime, CallSession, DeliverySlot, DialerOrderState, Order
+from app.operator import router as operator_router
+from app.phone_control import router as phone_control_router
 from app.phone_media import router as phone_media_router
 from app.planner import PlannerService
 from app.policy import validate_plan
@@ -41,6 +43,7 @@ from app.voice import MAX_AUDIO_BYTES, VoiceTurnService
 
 SessionDep = Annotated[Session, Depends(get_session)]
 _SPEECH_UNSET = object()
+_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 def create_app(
@@ -122,6 +125,8 @@ def create_app(
     app.include_router(demo_router)
     app.include_router(telephony_router)
     app.include_router(phone_media_router)
+    app.include_router(operator_router)
+    app.include_router(phone_control_router)
 
     @app.exception_handler(DomainError)
     def domain_error_handler(_, error: DomainError) -> JSONResponse:
@@ -323,15 +328,40 @@ def create_app(
                 voice_owners.discard(session_id)
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
-    if static_dir.is_dir():
+    frontend_index = _FRONTEND_DIST / "index.html"
+    frontend_built = frontend_index.is_file()
+    if frontend_built:
         @app.get("/", include_in_schema=False)
-        @app.get("/dashboard", include_in_schema=False)
-        def dashboard_page():
-            return FileResponse(static_dir / "dashboard.html")
+        def frontend_home(request: Request):
+            # Keep existing order links useful when the new app owns navigation.
+            if "order_id" in request.query_params:
+                return RedirectResponse(f"/dashboard?{request.url.query}", status_code=307)
+            return FileResponse(frontend_index)
 
+        @app.get("/dashboard", include_in_schema=False)
         @app.get("/shop", include_in_schema=False)
-        def shop_page():
-            return FileResponse(static_dir / "shop.html")
+        @app.get("/voice", include_in_schema=False)
+        def frontend_page():
+            return FileResponse(frontend_index)
+
+        assets_dir = _FRONTEND_DIST / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend-assets")
+
+    if static_dir.is_dir():
+        if not frontend_built:
+            @app.get("/", include_in_schema=False)
+            @app.get("/dashboard", include_in_schema=False)
+            def dashboard_page():
+                return FileResponse(static_dir / "dashboard.html")
+
+            @app.get("/shop", include_in_schema=False)
+            def shop_page():
+                return FileResponse(static_dir / "shop.html")
+
+            @app.get("/voice", include_in_schema=False)
+            def voice_page():
+                return FileResponse(static_dir / "index.html")
 
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 

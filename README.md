@@ -4,13 +4,13 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · NVIDIA NIM planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Groq GPT-OSS 20B planner · FastAPI · SQLite
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![NVIDIA NIM](https://img.shields.io/badge/planner-NVIDIA%20NIM-76B900.svg)](https://build.nvidia.com)
-[![Tests](https://img.shields.io/badge/tests-369%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Groq](https://img.shields.io/badge/planner-Groq%20GPT--OSS%2020B-F55036.svg)](https://console.groq.com/docs/models)
+[![Tests](https://img.shields.io/badge/tests-382%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Nemotron 30B)  │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (Groq)          │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (NVIDIA NIM, JSON Schema)   │  │
+       │                          │  │ Planner (Groq, JSON Schema)        │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -146,7 +146,7 @@ segments and fail visibly on overflow.
 One socket owns each call session in a single application process. A duplicate is
 audited and rejected before greeting or provider connection. Close codes are
 `1013` (voice not configured), `4404` (session not found), and `4409` (duplicate
-socket). Disconnect awaits turn, planner, greeting, acknowledgement and STT cleanup;
+socket). Disconnect awaits turn, planner, greeting and STT cleanup;
 the browser also releases microphone tracks. It leaves the logical call row
 available for deliberate reconnect during the scheduler's disconnect grace period.
 The scheduler then records an explicit timeout disposition. Cross-process socket
@@ -263,22 +263,20 @@ Invalid model output triggers **one repair call** with the validation error atta
 Each customer turn selects English (`en-IN`), Devanagari Hindi (`hi-IN`) or Roman
 Hinglish (`hi-en`) from transcript text using a script/token heuristic. This
 selection drives deterministic replies, streaming and blocking TTS, and cache
-keys. Cached acknowledgements play only for the matching language. The initial
+keys. Spoken acknowledgement filler is disabled. The initial
 greeting remains Hinglish because no customer turn is available yet. Short or
 ambiguous mixed-language turns can be misclassified. Streaming STT requests
 `codemix` format: synthetic provider checks preserved English confirmations as
 English and Hindi confirmations as Devanagari. Human speech and voice quality
 remain unverified. See [synthetic test review](SYNTHETIC_TEST_REVIEW.md).
 
-After synthesizing the opening, the socket prepares acknowledgements in all
-three supported languages at the selected output rate. Completed audio is used
-only for its matching language. A customer turn cancels unfinished preparation
-before planning or reply synthesis, so optional cache work cannot hold the shared
-speech slot ahead of the response. Cancelled preparation can resume after the
-reply, and disconnect awaits its cleanup. `VOICE_TURN` audits record
-`first_response_audio_ms` separately from `first_audio_ms`: a cached
-acknowledgement can precede the substantive reply. Measurements and limits are
-in [the first-turn audio review](FIRST_TURN_AUDIO_REVIEW.md).
+The agent synthesizes the opening and substantive replies only. It does not warm
+or play acknowledgement clips. The additive `ack_played` field remains false for
+existing clients. `VOICE_TURN` retains separate first-substantive-audio timings.
+Speech synthesis converts server-rendered date/time labels into natural spoken
+Hindi or English; stored timestamps and displayed plan facts stay exact.
+Empty or unavailable recognition resumes listening without a fabricated customer
+turn. See [the conversation repair review](CONVERSATION_REPAIR_REVIEW.md).
 
 Any non-confirmation customer turn clears previous confirmation. An intervening
 question or degraded reply requires a fresh plan offer before a later yes can
@@ -363,12 +361,16 @@ Set `DIALER_ENABLED=false` to stop automatic scheduling and timeout recovery.
 
 The root page `/` (also `/dashboard`) is now the operator dashboard. `/shop`
 creates fictional SwiftCart deliveries; `/index.html` retains browser voice.
-Checkout accepts payment mode, a fixed standard/high-value parcel choice and an
-OTP-requirement checkbox. Prices and synthetic delivery details are generated
-server-side. No payment, name, phone number or address is collected. New orders
-start PENDING with a two-hour window beginning 15 minutes after checkout and two
-available slots. Only the explicit readiness action moves them OUT_FOR_DELIVERY.
-Readiness is idempotent and cannot rewrite historical seed orders.
+Checkout accepts a server-owned catalog product and payment mode. OTP verification
+is derived from payment: prepaid requires it, COD does not. Catalog price and
+synthetic delivery details are controlled by the server. No real payment or
+customer contact/address is collected. New orders start PENDING with delivery
+tomorrow, 10 am to noon IST. Delivery availability spans 8 am to 6 pm IST on that date and the following date; appointments can fit anywhere inside those periods. Checkout and
+delivery times are separate. The readiness action simulates OUT_FOR_DELIVERY;
+it is idempotent and cannot rewrite historical seed orders. Automatic dispatch
+still respects the delivery-window horizon. The explicit PC-demo button can
+start a rehearsal earlier. Explicit cancellation changes only a PENDING order;
+dispatched orders receive an explanation instead of a false cancellation.
 
 Additive APIs:
 
@@ -457,17 +459,19 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **369 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **382 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
-| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | NVIDIA NIM | The model returns schema-valid decisions for fixed Hinglish turns |
-| Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + NVIDIA NIM | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
+| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
+| Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + configured planner | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
 
 ### Live voice matrix
 
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
-**Latest published run: 19 / 21 live scenarios pass.**
+**Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
+describe Groq performance. Current configuration checks are recorded separately in
+[the Groq configuration review](GROQ_REVIEW.md).
 
 | Metric | Value |
 |---|---|
@@ -527,7 +531,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and an NVIDIA NIM API key
+- A Gnani API key (Prisma + Timbre) and a Groq API key
 
 ### 1. Configure
 
@@ -540,14 +544,27 @@ Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
 GNANI_API_KEY=
-LLM_API_KEY=
-LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-LLM_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+LLM_PROVIDER=groq
+GROQ_API_KEY=
+LLM_BASE_URL=https://api.groq.com/openai/v1
+LLM_MODEL=openai/gpt-oss-20b
+LLM_MAX_TOKENS=1024
+LLM_STRUCTURED_MODE=json_schema
 ```
+
+The planner uses Groq's documented low reasoning effort and strict JSON Schema
+output. Reasoning text is excluded from responses. The completion budget includes
+reasoning tokens; it is a cap, not a requested response length. The backend still
+validates output, policy, wording and explicit confirmation.
+
+Only `GROQ_API_KEY` is read for planning. Gemini and NVIDIA configuration and
+credential fallbacks have been removed. A missing Groq key leaves the planner
+unconfigured. Only the official Groq HTTPS endpoint is accepted. Gnani continues
+to handle speech recognition and synthesis.
 
 `.env` is gitignored. Keys are never committed and never printed.
 
-The synthetic checks used one primary Gnani key for speech and one NIM key for
+The historical synthetic checks used one primary Gnani key for speech and one NIM key for
 planning; extra Gnani keys were not required for these sequential conversations.
 Account concurrency and quota remain provider-controlled. Adding keys does not
 by itself prove that more concurrent calls are permitted.
@@ -573,7 +590,7 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 369 tests, no external network required
+uv run pytest              # 382 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
 ```
 
@@ -583,10 +600,10 @@ node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.
 # deterministic scenarios, no network
 cd backend && uv run python ../evals/runner.py
 
-# live planner cases (NVIDIA NIM)
+# live planner cases (configured planner)
 cd backend && uv run python ../evals/planner_runner.py
 
-# live voice matrix (Gnani + NVIDIA NIM) — use a disposable database
+# live voice matrix (Gnani + configured planner) — use a disposable database
 cd backend
 DATABASE_URL=sqlite:///./matrix.db uv run uvicorn app.main:app --port 8000
 DATABASE_URL=sqlite:///./matrix.db uv run python ../evals/matrix_runner.py
@@ -603,9 +620,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **NVIDIA NIM** — `nvidia/nemotron-3.5-lightning-30b-a3b` | 30B MoE / 3B active, strict JSON Schema output, thinking disabled for latency |
+| Planner | **Groq** (`openai/gpt-oss-20b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | NVIDIA NIM (planner) + Gnani Timbre + Prisma (speech) | 21 live scenarios over the real socket |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Groq checks are reported separately |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -619,7 +636,7 @@ Honesty about this is deliberate — the evaluation claims only hold if the boun
 |---|---|
 | Streaming Prisma STT over a live WebSocket, real barge-in and VAD | The customer is **synthesised** with Gnani Timbre — no human speaker, no telephone codec, no carrier jitter |
 | Timbre TTS synthesising every agent reply | White Gaussian noise at 8 dB SNR stands in for recorded street audio |
-| NVIDIA NIM producing the structured plan | Orders, customers and the SwiftCart merchant are **synthetic** |
+| Configured planner producing the structured plan when available | Orders, customers and the SwiftCart merchant are **synthetic** |
 | Real policy evaluation, state machine, commit, SQLite writes, audit trail | Twilio adapter is gated and tested with mocks; no real handset call was exercised |
 | Real commit-time revalidation and idempotency | Commit is a local revalidation + SQLite write, not a remote tool — so T19's failure semantics are covered by tests instead of a live timeout |
 | Real Prisma/Timbre/NIM calls in the live matrix | Prisma streaming STT emits **no confidence score**, so the live path relies on the explicit-confirmation gate; low-confidence rejection is covered by deterministic tests |
@@ -630,7 +647,8 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; acknowledgements can precede the substantive answer. See the new review for measurements. The target remains sub-second time to first audio.
+- **Groq live generation works with the saved key.** All 8 focused synthetic voice scenarios passed across 14 turns, with 9 successful model requests and no repairs or provider/audio errors. Model-driven substantive replies began in 1.48-2.14 s from the server utterance endpoint, excluding endpoint detection and physical playback. The observed 8,000-token/minute quota limits rapid model turns; tests were paced outside measured turns. See [the current live review](GROQ_LIVE_REVIEW.md) for evidence and limitations. Earlier provider reports remain historical.
+- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. See the new review for measurements. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
 - **Planner stalls are external.** The 12 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.
@@ -671,3 +689,74 @@ Built with [FastAPI](https://fastapi.tiangolo.com/), [SQLModel](https://sqlmodel
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## React frontend
+
+The React/Vite application lives in `frontend/` and uses the existing backend
+APIs and voice WebSocket. Keep provider credentials in `backend/.env`; they are
+not needed in the frontend environment or browser bundle.
+
+For frontend development, run the backend on `http://127.0.0.1:8000`, then:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Open the Vite URL printed in the terminal. Its development proxy forwards
+`/api`, `/health`, `/ws` and the audio worklets to the local backend.
+
+For one server hosting the built frontend and backend:
+
+```bash
+cd frontend
+npm run build
+cd ../backend
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Build before starting the backend, or restart it after the first frontend
+build. When `frontend/dist/index.html` exists at startup, the backend serves
+the React app at `/`, `/dashboard`, `/shop` and `/voice`, with compiled assets
+under `/assets`. Existing root links containing `order_id` redirect to
+`/dashboard` with their query string preserved.
+
+Without a frontend build, these pages use the original local HTML interfaces.
+The original `/index.html`, `/dashboard.html`, `/shop.html`, `/worklet.js` and
+`/pcm-player.js` remain available with either configuration. Unknown API and
+page paths retain their 404 responses rather than loading the React app.
+
+
+## Current deadline demo: PC voice + operator console
+
+The customer speaks in a separate PC participant tab; the main dashboard is the
+operator monitor. Use SwiftCart checkout, mark the order out for delivery, choose
+**Monitor delivery**, then **Open customer PC voice** from its active session.
+The participant connects and enables the microphone explicitly. Confirmed plans
+save automatically in this PC-demo mode; keyboard input is a collapsed fallback.
+
+Operator review controls require `OPERATOR_API_TOKEN` from the local ignored
+`backend/.env`, entered into the dashboard operator-key form. It is held only for
+that tab. Rejection and policy-validated revision require a reason and current
+proposal version. Revisions require presentation and fresh customer consent.
+
+See [PC_OPERATOR_DEMO_REVIEW.md](PC_OPERATOR_DEMO_REVIEW.md) for safeguards, tests
+and remaining validation. Phone integration is deferred; the current Twilio Trial
+account does not support the required streaming verb. Keep this app local.
+
+### Delivery availability and rescheduling
+
+Availability periods come from the backend, independently of the initial two-hour
+appointment. A 3 pm request within an 8 am–6 pm period can become a 3–5 pm proposal.
+A start-only request at 5 pm can use 5–6 pm; explicit endpoints are never silently
+shortened. Requests outside recorded days/hours are rejected with actual available
+periods, and availability questions bypass the model. Changes still require fresh
+customer confirmation before commit. Committing RESCHEDULE updates both the order
+appointment and courier card.
+
+Synthetic checkout currently assumes earliest delivery tomorrow; no warehouse,
+origin, carrier ETA or live route-capacity feed is connected. Those dates must come
+from fulfillment data when integrated. Existing unresolved synthetic checkout
+availability is widened on startup without changing its scheduled appointment or
+earliest stored date. Legacy seeded examples retain their recorded availability.

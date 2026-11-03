@@ -18,14 +18,14 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = "Shivani"
     gnani_tts_language: str = "hi-en"
     gnani_timeout_seconds: float = 30.0
-    llm_api_key: str = ""
-    llm_base_url: str = ""
-    llm_model: str = ""
+    llm_provider: Literal["groq"] = "groq"
+    groq_api_key: str = Field(default="", repr=False)
+    llm_base_url: str = "https://api.groq.com/openai/v1"
+    llm_model: str = "openai/gpt-oss-20b"
     llm_timeout_seconds: float = 12.0
-    llm_max_tokens: int = 320
+    llm_max_tokens: int = 1024
     llm_temperature: float = 0.1
     llm_structured_mode: Literal["json_schema", "json_object"] = "json_schema"
-    llm_enable_thinking: bool = False
     planner_min_confidence: float = 0.65
     planner_min_transcript_confidence: float = 0.55
     realtime_sample_rate: int = 16_000
@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     streaming_stt_candidates: str = "hi-IN,en-IN"
     streaming_stt_transcript_timeout_seconds: float = 3.0
     dialer_enabled: bool = True
+    operator_api_token: str = Field(default="", repr=False)
     dialer_interval_seconds: float = Field(default=5, ge=0.1)
     dialer_waiting_timeout_seconds: float = Field(default=120, ge=1)
     dialer_disconnect_grace_seconds: float = Field(default=30, ge=1)

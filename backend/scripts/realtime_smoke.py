@@ -1,4 +1,4 @@
-"""Live smoke test for the realtime voice WebSocket against real Gnani + NVIDIA.
+"""Live smoke test for the realtime voice WebSocket against real Gnani + Groq.
 
 Synthesizes each customer turn with Timbre, streams the audio as PCM16 frames
 through /ws/sessions/{id}/voice, and prints the full event stream. Requires the

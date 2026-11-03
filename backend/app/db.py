@@ -13,6 +13,8 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         seed_database(session)
+        from app.availability import expand_demo_availability
+        expand_demo_availability(session)
 
 
 def get_session() -> Generator[Session, None, None]:

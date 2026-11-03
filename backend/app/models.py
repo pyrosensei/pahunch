@@ -1,7 +1,10 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
+from pydantic import field_serializer
 from sqlmodel import Field, SQLModel
+
+DELIVERY_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 
 class PaymentMode(str, Enum):
@@ -34,12 +37,29 @@ class Order(SQLModel, table=True):
     call_opt_out: bool = False
     last_call_completed_at: datetime | None = None
 
+    @field_serializer("window_start", "window_end", when_used="json")
+    def serialize_delivery_window(self, value: datetime) -> datetime:
+        # SQLite drops offsets. Order/slot wall times follow the policy's IST
+        # convention; audit/session clocks remain UTC and are not changed here.
+        return value if value.tzinfo else value.replace(tzinfo=DELIVERY_TIMEZONE)
+
+
+class DemoOrderProduct(SQLModel, table=True):
+    order_id: int = Field(primary_key=True, foreign_key="order.id")
+    product_id: str
+    product_name: str
+    price_inr: int
+
 
 class DeliverySlot(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     order_id: int = Field(foreign_key="order.id", index=True)
     start_at: datetime
     end_at: datetime
+
+    @field_serializer("start_at", "end_at", when_used="json")
+    def serialize_delivery_window(self, value: datetime) -> datetime:
+        return value if value.tzinfo else value.replace(tzinfo=DELIVERY_TIMEZONE)
 
 
 class CallState(str, Enum):
@@ -56,6 +76,7 @@ class CallState(str, Enum):
     ESCALATED = "ESCALATED"
     TOOL_FAILURE = "TOOL_FAILURE"
     TURN_BUDGET_EXHAUSTED = "TURN_BUDGET_EXHAUSTED"
+    CANCELLED = "CANCELLED"
 
 
 class CallOutcome(str, Enum):
@@ -65,6 +86,7 @@ class CallOutcome(str, Enum):
     ESCALATED = "ESCALATED"
     TOOL_FAILURE = "TOOL_FAILURE"
     TURN_BUDGET_EXHAUSTED = "TURN_BUDGET_EXHAUSTED"
+    CANCELLED = "CANCELLED"
 
 
 class CallSession(SQLModel, table=True):
@@ -166,3 +188,16 @@ class TwilioBinding(SQLModel, table=True):
     provider_status: str = "queued"
     last_callback_sequence: int = -1
     consented: bool = False
+
+
+class PhoneDemoPermit(SQLModel, table=True):
+    id: int = Field(default=1, primary_key=True)
+    armed_at: datetime
+    expires_at: datetime
+    remaining_calls: int = 0
+    disarmed: bool = False
+
+
+class PhoneDemoApproval(SQLModel, table=True):
+    session_id: str = Field(primary_key=True, foreign_key="callsession.id")
+    approved_at: datetime
