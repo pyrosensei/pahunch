@@ -26,7 +26,7 @@ test('one landing canvas follows native scroll, pauses offscreen, and recovers f
   await canvas.evaluate(node => node.dispatchEvent(new Event('webglcontextlost', { cancelable: true })));
   await expect(canvas).toHaveCount(0);
   await expect(page.getByLabel('Parcel illustration')).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Try the SwiftCart demo' }).first()).toBeEnabled();
+  await expect(page.getByRole('link', { name: 'Try a delivery' }).first()).toBeEnabled();
 });
 
 test('document visibility suspends the scene and reduced-motion changes replace it with SVG', async ({ page }) => {

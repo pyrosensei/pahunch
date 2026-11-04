@@ -44,8 +44,8 @@ test('landing works without WebGL, respects reduced motion, and exposes keyboard
     } as typeof original;
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('Before the doorbell');
-  await expect(page.getByRole('link', { name: 'Try the SwiftCart demo' }).first()).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('Your delivery.');
+  await expect(page.getByRole('link', { name: 'Try a delivery' }).first()).toBeVisible();
   await expect(page.locator('canvas')).toHaveCount(0);
   await expect(page.getByLabel('Parcel illustration')).toBeVisible();
   await page.keyboard.press('Tab');
@@ -71,7 +71,7 @@ test('WebGL failure preserves the landing illustration and primary action', asyn
   await page.goto('/');
   await expect.poll(() => page.evaluate(() => (window as unknown as { __webgl: { attempts: number } }).__webgl.attempts), { timeout: 15_000 }).toBeGreaterThan(0);
   await expect(page.getByLabel('Parcel illustration')).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Try the SwiftCart demo' }).first()).toBeEnabled();
+  await expect(page.getByRole('link', { name: 'Try a delivery' }).first()).toBeEnabled();
 });
 
 test('voice connects only on request and saves a plan only after backend confirmation', async ({ page }) => {
@@ -167,8 +167,8 @@ test('a phone-owned ready session stays on the dashboard instead of offering bro
   await page.goto('/shop');
   await page.getByRole('button', { name: 'Place demo order' }).click();
   await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-  await expect(page.getByRole('status')).toContainText('The delivery assistant is ready');
-  await expect(page.getByRole('link', { name: 'Open conversation' })).toHaveCount(0);
+  await expect(page.getByRole('status')).toContainText('A phone conversation is active');
+  await expect(page.getByRole('link', { name: 'Start PC voice demo' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Monitor delivery' })).toBeVisible();
 });
 
@@ -252,6 +252,7 @@ for (const route of ['/', '/shop', '/dashboard', '/voice']) {
     const widths = await page.evaluate(() => ({ content: document.documentElement.scrollWidth, viewport: innerWidth }));
     expect(widths.content).toBeLessThanOrEqual(widths.viewport + 1);
     const path = testInfo.outputPath(`${route === '/' ? 'landing' : route.slice(1)}.png`);
+    await page.screenshot({ path: testInfo.outputPath(`${route === '/' ? 'landing' : route.slice(1)}-viewport.png`), animations: 'disabled' });
     await page.screenshot({ path, fullPage: true, animations: 'disabled' });
     await testInfo.attach('Page screenshot', { path, contentType: 'image/png' });
   });

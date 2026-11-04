@@ -106,6 +106,7 @@ test('operator monitor is separate from customer PC voice and uses tab-only auth
   const backend = await operatorBackend(page); const sockets: string[] = []; page.on('websocket', socket => { if (socket.url().includes('/ws/sessions/')) sockets.push(socket.url()); });
   await page.goto('/dashboard');
   await expect(page.getByRole('heading', { name: 'Agent activity' })).toBeVisible();
+  await page.getByText('Customer request & outcome', { exact: true }).click();
   await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText(CUSTOMER_NEED);
   await expect(page.getByRole('region', { name: 'Customer needs' })).not.toContainText(SYSTEM_NOTE);
   const pc = page.getByRole('link', { name: 'Start customer voice demo' });
@@ -188,6 +189,7 @@ test('prepared PC session explains the next action and separates opening timings
   await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('Confirm availability');
   await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('No OTP is required');
   await expect(page.getByRole('link', { name: 'Start customer voice demo' })).toHaveAttribute('target', '_blank');
+  await page.getByText('Customer request & outcome', { exact: true }).click();
   await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText('The customer has not replied yet');
   await page.getByRole('tab', { name: 'Performance' }).click();
   await expect(page.getByRole('heading', { name: 'Start the PC voice demo to measure it.' })).toBeVisible();
