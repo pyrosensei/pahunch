@@ -547,7 +547,7 @@ GNANI_API_KEY=
 LLM_PROVIDER=groq
 GROQ_API_KEY=
 LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_MODEL=openai/gpt-oss-20b
+LLM_MODEL=openai/gpt-oss-120b
 LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
@@ -620,7 +620,7 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Groq** (`openai/gpt-oss-20b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
+| Planner | **Groq** (`openai/gpt-oss-120b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
 | Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Groq checks are reported separately |
 
@@ -646,6 +646,9 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 ---
 
 ## 10. Known limits
+
+- **Groq live generation works with the saved key.** All 8 focused synthetic voice scenarios passed across 14 turns, with 9 successful model requests and no repairs or provider/audio errors. Model-driven substantive replies began in 1.48-2.14 s from the server utterance endpoint, excluding endpoint detection and physical playback. The observed 8,000-token/minute quota limits rapid model turns; tests were paced outside measured turns. See [the current live review](GROQ_LIVE_REVIEW.md) for evidence and limitations. Earlier provider reports remain historical.
+- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. See the new review for measurements. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
 - **Planner stalls are external.** The 12 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.

@@ -198,7 +198,7 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     def handler(request):
         payload = json.loads(request.content)
         assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
-        assert payload["model"] == "openai/gpt-oss-20b"
+        assert payload["model"] == "openai/gpt-oss-120b"
         assert payload["reasoning_effort"] == "low"
         assert "chat_template_kwargs" not in payload
         assert payload["response_format"]["json_schema"]["schema"] == schema
@@ -214,7 +214,7 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     async def run():
         client = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1/",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -278,7 +278,7 @@ def test_removed_providers_are_rejected(provider):
 def test_groq_key_cannot_be_sent_to_another_provider(url):
     config = Settings(
         _env_file=None, llm_provider="groq", groq_api_key="test-groq-key",
-        llm_base_url=url, llm_model="openai/gpt-oss-20b",
+        llm_base_url=url, llm_model="openai/gpt-oss-120b",
     )
     with pytest.raises(ValueError, match="Groq base URL"):
         build_llm_client(config)
@@ -306,7 +306,7 @@ def test_groq_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
     async def run():
         llm = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -341,7 +341,7 @@ def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
     async def run():
         llm = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:
