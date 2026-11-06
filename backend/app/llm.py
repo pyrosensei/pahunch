@@ -12,7 +12,10 @@ from app.http_pool import HttpClientPool
 
 
 class LLMGatewayError(Exception):
-    pass
+    def __init__(self, message, *, status_code=None, category="gateway"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.category = category
 
 
 class LLMTimeoutError(LLMGatewayError):
@@ -164,19 +167,19 @@ class OpenAICompatibleClient:
         except httpx.TimeoutException as error:
             raise LLMTimeoutError("LLM provider timed out") from error
         except httpx.HTTPError as error:
-            raise LLMGatewayError("LLM provider request failed") from error
+            raise LLMGatewayError("LLM provider request failed", category="transport") from error
 
         if response.status_code >= 400:
-            raise LLMResponseError(f"LLM provider returned HTTP {response.status_code}")
+            raise LLMResponseError(f"LLM provider returned HTTP {response.status_code}", status_code=response.status_code, category="http")
 
         try:
             data = response.json()
             message = data["choices"][0]["message"]
             content = message["content"]
         except (ValueError, KeyError, IndexError, TypeError) as error:
-            raise LLMResponseError("LLM provider returned an unexpected response") from error
+            raise LLMResponseError("LLM provider returned an unexpected response", category="invalid_response") from error
         if not isinstance(content, str) or not content.strip():
-            raise LLMResponseError("LLM provider returned empty structured output")
+            raise LLMResponseError("LLM provider returned empty structured output", category="empty_output")
 
         usage = data.get("usage") if isinstance(data, dict) else None
         usage = usage if isinstance(usage, dict) else {}

@@ -94,7 +94,7 @@ def checkout(request: DemoOrderRequest, http_request: Request, db: SessionDep):
                                     product_name=product.name, price_inr=product.price_inr))
         for offset in (timedelta(), timedelta(days=1)):
             day = start + offset
-            db.add(DeliverySlot(order_id=order_id, start_at=day.replace(hour=8), end_at=day.replace(hour=18)))
+            db.add(DeliverySlot(order_id=order_id, start_at=day.replace(hour=10), end_at=day.replace(hour=18)))
         db.add(
             DialerEvent(
                 order_id=order_id,

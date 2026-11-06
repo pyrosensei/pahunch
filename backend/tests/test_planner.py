@@ -664,3 +664,17 @@ def test_confirmation_after_plan_offer_still_confirms(db, scripted_llm):
     assert result.planner.model == "rules:explicit-confirmation"
     assert result.planner.error_code is None
     assert result.turn.customer_confirmed is True
+
+
+def test_audio_complaint_reaches_model_with_observations_and_natural_wording(db, scripted_llm):
+    calls = CallService(db)
+    call = start_call(calls)
+    calls._audit(call.id, "BROWSER_PLAYBACK_UNDERRUN", {"generation_id": 1, "source": "browser_report"})
+    db.commit()
+    llm = scripted_llm([decision(PlannerAction.RESPOND, "My playback seems to have paused. I am calling about your delivery.")])
+    result = run(PlannerService(db, llm), call.id, "I cannot hear your voice")
+    assert result.planner.wording_source == "model"
+    assert result.agent_message == "My playback seems to have paused. I am calling about your delivery."
+    context = json.loads(llm.requests[0]["user_prompt"])
+    assert context["customer_utterance"] == "I cannot hear your voice"
+    assert context["communication_observations"]["earlier_events"][-1]["event"] == "BROWSER_PLAYBACK_UNDERRUN"

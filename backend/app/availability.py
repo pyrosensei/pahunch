@@ -53,10 +53,10 @@ def expand_demo_availability(db: Session) -> None:
         # Keep the existing days; only widen their synthetic operational hours.
         for slot in slots:
             day = _utc(slot.start_at).astimezone(IST)
-            slot.start_at = day.replace(hour=8, minute=0, second=0, microsecond=0)
+            slot.start_at = day.replace(hour=10, minute=0, second=0, microsecond=0)
             slot.end_at = day.replace(hour=18, minute=0, second=0, microsecond=0)
         if len(slots) == 1:
             day = first + timedelta(days=1)
-            db.add(DeliverySlot(order_id=order_id, start_at=day.replace(hour=8, minute=0, second=0, microsecond=0),
+            db.add(DeliverySlot(order_id=order_id, start_at=day.replace(hour=10, minute=0, second=0, microsecond=0),
                                 end_at=day.replace(hour=18, minute=0, second=0, microsecond=0)))
     db.commit()

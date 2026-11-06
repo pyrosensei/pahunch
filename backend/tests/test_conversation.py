@@ -65,7 +65,7 @@ def test_action_examples_use_current_order_facts_and_provider_output_shape(db, s
             assert set(item["decision"]["proposal"]) == {"primary", "fallback"}
             assert "notes" not in item["decision"]["proposal"]["primary"]
             assert decision.message in context["proposal_wording_templates"]
-    assert actions == ["PROPOSE_PLAN", "PROPOSE_PLAN", "RESPOND", "RESPOND"]
+    assert actions == ["PROPOSE_PLAN", "PROPOSE_PLAN", "RESPOND"]
 
 
 @pytest.mark.parametrize("text", ["What is my delivery window?", "डिलीवरी कब आएगी?", "Delivery kab hai?"])

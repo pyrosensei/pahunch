@@ -58,12 +58,11 @@ def _allowed_alternatives(order: Order) -> list[PlanAction]:
         PlanAction.RETRY_AFTER_DELAY,
     ]
     direct_handoff_only = (
-        order.requires_otp
-        or order.payment_mode == PaymentMode.COD
+        order.payment_mode == PaymentMode.COD
         or order.declared_value_inr >= HIGH_VALUE_THRESHOLD_INR
     )
     if not direct_handoff_only and order.safe_drop_allowed:
-        if order.security_drop_allowed:
+        if order.security_drop_allowed and not order.requires_otp:
             alternatives.append(PlanAction.LEAVE_WITH_SECURITY)
         if order.neighbour_drop_allowed:
             alternatives.append(PlanAction.LEAVE_WITH_NEIGHBOR)
@@ -113,11 +112,11 @@ def validate_plan(
             )
 
         if step.action in THIRD_PARTY_ACTIONS:
-            if order.requires_otp:
+            if order.requires_otp and (step.action != PlanAction.LEAVE_WITH_NEIGHBOR or not step.call_on_arrival):
                 violations.append(
                     PolicyViolation(
                         code=ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY,
-                        message="An OTP-verified parcel requires direct handoff to the customer.",
+                        message="OTP delivery requires courier verification with the customer; an authorized neighbour handoff requires a call on arrival.",
                         path=path,
                     )
                 )

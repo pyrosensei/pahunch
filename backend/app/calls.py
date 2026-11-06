@@ -557,7 +557,7 @@ class CallService:
         if primary.call_on_arrival:
             lines.append("Call customer on arrival")
         if order.requires_otp:
-            lines.append("Collect OTP; do not leave with security or a neighbour")
+            lines.append("Courier must verify OTP directly with the customer before handoff, including to an authorized named neighbour. If customer cannot be reached or verification fails, do not hand over; arrange the next available delivery. Never collect OTP through the AI assistant.")
         if order.payment_mode == PaymentMode.COD:
             lines.append("Collect cash on delivery")
         if proposal.fallback is not None:

@@ -94,6 +94,26 @@ def response_language(text: str) -> str:
     return "en-IN"
 
 
+def conversation_language(text: str, previous: str = "hi-IN") -> str:
+    """Short acknowledgements preserve language; full turns provide evidence."""
+    words = re.findall(r"[a-z]+", text.casefold())
+    if re.search(r"(?:speak|reply|continue|talk).{0,12}(?:in )?english", text, re.I):
+        return "en-IN"
+    if re.search(r"(?:hindi mein|हिंदी में)", text, re.I):
+        return "hi-IN"
+    if len(words) <= 2 and not _HINDI.search(text):
+        return previous
+    hindi_words = re.findall(r"[\u0900-\u097f]+", text)
+    if hindi_words:
+        if len(words) >= 3 and len(hindi_words) >= 2:
+            return "hi-en"
+        if len(words) > len(hindi_words) * 3:
+            return "en-IN"
+        return "hi-IN"
+    cues = sum(w in _HINGLISH_WORDS for w in words)
+    return "hi-en" if cues >= 2 else "en-IN"
+
+
 def language_matches(text: str, language: str) -> bool:
     if language == "hi-IN":
         return bool(_HINDI.search(text))
@@ -238,13 +258,18 @@ FACT_TEMPLATES = {
 }
 
 
-def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False):
+def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False, source_text: str = ""):
     compact = " ".join(unicodedata.normalize("NFKC", message).split())
     if not compact:
         return "EMPTY_MESSAGE"
     if len(compact) > 280:
         return "MESSAGE_TOO_LONG"
-    if OTP_WORD.search(compact) or _UNSAFE.search(compact):
+    checked = compact
+    if source_text and not proposal:
+        numbers = re.findall(r"\d+", compact)
+        if numbers and all(n in re.findall(r"\d+", source_text) for n in numbers):
+            checked = re.sub(r"\d+", "", compact)
+    if OTP_WORD.search(compact) or _UNSAFE.search(checked):
         return "UNSAFE_WORDING"
     if proposal:
         if compact.count("{plan_summary}") != 1 or compact.count("{confirmation_question}") != 1:
