@@ -223,3 +223,17 @@ describe('playback generations and cleanup', () => {
     expect(f.controller.sendText('Please hand it to me')).toBe(true); f.controller.disconnect();
   });
 });
+
+
+it('reports playback starvation only for the current generation and connection', async () => {
+  const f = fixture(); await f.connect();
+  f.sockets[0].event({ type: 'agent_audio_chunk', generation_id: 1, chunk_base64: 'AAA=' });
+  const report = (generation: number, connection: number) => f.player.port.onmessage?.({ data: {
+    type: 'underrun', generation_id: generation, connection_id: connection,
+  } });
+  report(1, 0); report(2, 1);
+  expect(f.sockets[0].sent.filter(event => event.type === 'playback_underrun')).toHaveLength(0);
+  report(1, 1);
+  expect(f.sockets[0].sent).toContainEqual({ type: 'playback_underrun', generation_id: 1 });
+  f.controller.disconnect();
+});

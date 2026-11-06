@@ -282,6 +282,12 @@ export class VoiceController {
         if (epoch !== this.actionEpoch) { await context.close(); return; }
         const player = this.env.worklet(context, 'pcm-player'); this.player = player;
         player.port.onmessage = event => {
+          if (event.data.type === 'underrun' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
+            this.send({ type: 'playback_underrun', generation_id: this.generation });
+          }
+          if (event.data.type === 'underrun' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
+            this.send({ type: 'playback_underrun', generation_id: this.generation });
+          }
           if (event.data.type === 'drained' && event.data.connection_id === this.connectionId) this.finishPlayback(event.data.generation_id, this.ws);
         };
         player.connect(context.destination);

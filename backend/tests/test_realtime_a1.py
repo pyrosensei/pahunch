@@ -539,3 +539,74 @@ def test_turn_timings_include_stream_finish_wait(scripted_llm, rest_fallback):
             assert end["timings"]["total_ms"] >= stream.waited_ms - 2
 
     asyncio.run(run())
+
+
+def test_failed_stt_capture_is_discarded_once_and_reconnects_before_next_capture():
+    from app.realtime import _StreamingInput
+    from app.streaming_stt import StreamingSTTError
+
+    class Stream:
+        connects = 0
+        cancels = 0
+        async def connect(self):
+            self.connects += 1
+        async def begin_utterance(self):
+            pass
+        async def send_audio(self, frame):
+            pass
+        async def finish_utterance(self):
+            raise StreamingSTTError("test failure")
+        async def cancel_utterance(self):
+            self.cancels += 1
+        async def close(self):
+            pass
+
+    async def run():
+        stream = Stream()
+        stt = _StreamingInput(stream, 16000, lambda *args: None)
+        capture = stt.begin()
+        assert await stt.finish(capture) is None
+        await stt.connection
+        assert stream.connects == 2
+        stt.abort()
+        await stt.barrier
+        assert stream.cancels == 1
+        await stt.close()
+        assert stream.cancels == 1
+    asyncio.run(run())
+
+
+def test_barge_in_does_not_inherit_quiet_room_threshold():
+    import struct
+
+    from app.realtime import RealtimeConfig, UtteranceBuffer
+    buffer = UtteranceBuffer(RealtimeConfig())
+    buffer.noise_floor = 0
+    weak = struct.pack("<320h", *([250] * 320))
+    strong = struct.pack("<320h", *([1000] * 320))
+    assert buffer.threshold == 120
+    for _ in range(20):
+        assert not buffer.add(weak, calibrate=False, start_ms=160, minimum_threshold=500)
+    assert not buffer.has_utterance
+    starts = [buffer.add(strong, calibrate=False, start_ms=160, minimum_threshold=500) for _ in range(8)]
+    assert starts[-1]
+
+
+def test_playback_observation_accepts_current_generation_once(scripted_llm):
+    async def run():
+        async with voice(scripted_llm([])) as (ws, _, calls, sid):
+            ws.control("config", playback_tracking=True)
+            opening = await ws.event("agent_audio_end")
+            gen = opening["generation_id"]
+            ws.control("playback_underrun", generation_id=gen - 1)
+            ws.control("playback_underrun", generation_id=gen)
+            ws.control("playback_underrun", generation_id=gen)
+            await asyncio.sleep(0.03)
+            from sqlmodel import select
+
+            from app.models import AuditEvent
+            rows = calls.db.exec(select(AuditEvent).where(AuditEvent.session_id == sid,
+                AuditEvent.event_type == "BROWSER_PLAYBACK_UNDERRUN")).all()
+            assert len(rows) == 1
+            assert json.loads(rows[0].payload_json)["source"] == "browser_report"
+    asyncio.run(run())
