@@ -87,26 +87,31 @@ def test_pre_roll_preserves_first_syllable_and_is_bounded():
     assert len(buffer.pre_roll) <= 360 * RATE * 2 // 1000
 
 
-def test_cap_uses_actual_buffer_length_including_intervening_pauses():
+def test_continuous_speech_beyond_fifteen_seconds_waits_for_silence():
     buffer = calibrated(max_utterance_ms=1000)
-    elapsed = 0
-    for i in range(100):
-        buffer.add(frame(1600 if i % 15 < 10 else 20))
-        elapsed += FRAME_MS
-        if buffer.complete:
-            break
-    assert buffer.complete
-    assert buffer.end_reason == "MAX_DURATION"
-    assert len(buffer.pcm) == RATE * 2
-    assert elapsed <= 1000
+    feed(buffer, 1600, 20000)
+    assert not buffer.complete
+    assert buffer.speech_ms == 20000
+    assert len(buffer.pcm) > 20 * RATE * 2
+    assert buffer.pcm.file._rolled  # PCM leaves memory, not the conversation.
+    feed(buffer, 20, 600)
+    assert buffer.end_reason == "SILENCE"
+    assert bytes(buffer.pcm).endswith(frame(20) * 30)
+    buffer.pcm.close()
 
 
-def test_large_frame_cannot_overrun_utterance_cap():
+def test_large_frame_is_preserved_without_forcing_an_endpoint():
     buffer = calibrated(max_utterance_ms=1000)
     feed(buffer, 1600, 300)
-    buffer.add(frame(1600) * 100)
-    assert buffer.complete
-    assert len(buffer.pcm) == RATE * 2
+    before = bytes(buffer.pcm)
+    extra = frame(1600) * 100
+    buffer.add(extra)
+    assert not buffer.complete
+    assert bytes(buffer.pcm) == before + extra
+    assert buffer.pcm.file._rolled
+    buffer.reset()
+    assert len(buffer.pcm) == 0
+    buffer.pcm.close()
 
 
 def test_reset_keeps_calibration_but_discards_old_pre_roll():
@@ -162,3 +167,45 @@ def test_environment_settings_reach_realtime_detector():
     assert (config.vad_floor, config.vad_ceiling, config.noise_ratio) == (150, 9000, 2.5)
     assert (config.calibration_ms, config.speech_start_ms, config.barge_in_ms) == (400, 120, 200)
     assert (config.pre_roll_ms, config.no_speech_ms) == (240, 6000)
+
+
+def test_audio_spool_copy_never_uses_unbounded_reads():
+    from app.realtime import _AudioSpool
+
+    source, target = _AudioSpool(16), _AudioSpool(16)
+    content = b"abcd" * 100_000
+    source.extend(content)
+    original_read = source.file.read
+    sizes = []
+
+    def bounded_read(size=-1):
+        assert 0 <= size <= 64 * 1024
+        sizes.append(size)
+        return original_read(size)
+
+    source.file.read = bounded_read
+    try:
+        source.copy_to(target)
+        assert bytes(target) == content
+        assert len(sizes) > 1
+    finally:
+        source.close()
+        target.close()
+
+
+def test_audio_spool_oversized_materialization_fails_before_read(monkeypatch):
+    from app import realtime
+    from app.errors import DomainError
+
+    spool = realtime._AudioSpool(16)
+    spool.extend(b"abcd" * 100)
+    monkeypatch.setattr(realtime, "MAX_AUDIO_BYTES", 100)
+    def forbidden_read(*args):
+        pytest.fail("Oversized recording must not be read or silently truncated")
+    spool.file.read = forbidden_read
+    try:
+        with pytest.raises(DomainError) as error:
+            bytes(spool)
+        assert error.value.status_code == 413
+    finally:
+        spool.close()

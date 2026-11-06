@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta, timezone
 
 from app.models import DeliverySlot, Order, PaymentMode
 from app.schemas import (
@@ -45,6 +45,12 @@ def _window_is_deliverable(
         step.window_end
     ) == _utc(order.window_end):
         return True
+    start = _utc(step.window_start).astimezone(IST)
+    end = _utc(step.window_end).astimezone(IST)
+    # Existing promises above are preserved; every newly requested window
+    # must fit the operating day as well as recorded order availability.
+    if start.date() != end.date() or start.time() < time(10, 0) or end.time() > time(18, 0):
+        return False
     return _slot_matches(step, slots)
 
 

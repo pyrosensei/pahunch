@@ -15,6 +15,7 @@ from app.language import (
     OTP_WORD,
     PLAN_PLACEHOLDERS,
     WRAPPER_PREFIXES,
+    conversation_language,
     conversational_input,
     has_otp_disclosure,
     is_availability_acceptance,
@@ -22,10 +23,8 @@ from app.language import (
     is_rejection,
     phrase,
     redact_customer_text,
-    response_language,
     translate_fixed,
     wording_error,
-    conversation_language,
 )
 from app.llm import (
     LLMCompletion,
@@ -216,7 +215,7 @@ _DEVANAGARI_WORD_MAP = {
 
 POLICY_EXPLANATIONS = {
     ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: (
-        "Is parcel mein OTP verification chahiye, isliye security ya padosi ko nahi chhod sakte."
+        "OTP courier ko customer se directly verify karna hai. Security drop allowed nahi hai; authorized named padosi ke liye arrival call aur successful verification zaroori hai."
     ),
     ViolationCode.COD_REQUIRES_DIRECT_HANDOFF: (
         "Yeh cash-on-delivery parcel hai, isliye direct customer handoff zaroori hai."
@@ -333,9 +332,9 @@ def courier_otp_guidance(order: Order, language: str) -> str:
         return {"en-IN": "This cash-on-delivery order does not require a delivery OTP. Pay the courier when you receive the parcel.",
                 "hi-IN": "इस डिलीवरी पर भुगतान वाले ऑर्डर में ओटीपी आवश्यक नहीं है। पार्सल लेते समय कूरियर को भुगतान कीजिए।",
                 "hi-en": "Is cash-on-delivery order mein OTP zaroori nahi hai. Parcel lete samay courier ko payment kijiye."}[language]
-    return {"en-IN": "Yes, the delivery OTP is for the courier when you receive the parcel. For an authorized named neighbour, the courier must call you and verify your OTP directly before handoff. If verification fails, no handoff is allowed.",
-            "hi-IN": "हाँ, पार्सल लेते समय डिलीवरी का ओटीपी कूरियर को देना है। यह ऑर्डर सीधे आपको सौंपना ज़रूरी है; फोन पर ओटीपी बताने से पड़ोसी को देने की अनुमति नहीं मिलती।",
-            "hi-en": "Haan, parcel lete samay delivery OTP courier ko dena hai. Authorized padosi ko dene se pehle courier aapko call karke OTP verify karega. Verification nahi hui toh parcel nahi diya jayega."}[language]
+    return {"en-IN": "Yes, the delivery OTP is for the courier when you receive the parcel. For an authorized named neighbour, the courier must call you and verify your OTP directly before handoff. If contact or verification fails, there is no handoff; the courier arranges the next available delivery.",
+            "hi-IN": "हाँ, पार्सल लेते समय डिलीवरी का ओटीपी कूरियर को देना है। अधिकृत पड़ोसी को देने से पहले कूरियर आपको कॉल करके ओटीपी सत्यापित करेगा। संपर्क या सत्यापन न होने पर पार्सल नहीं सौंपा जाएगा; अगली उपलब्ध डिलीवरी तय होगी।",
+            "hi-en": "Haan, parcel lete samay delivery OTP courier ko dena hai. Authorized padosi ko dene se pehle courier aapko call karke OTP verify karega. Contact ya verification nahi hui toh parcel nahi diya jayega; next available delivery arrange hogi."}[language]
 
 
 def asks_if_agent_is_human(text: str) -> bool:
@@ -413,8 +412,8 @@ def _window_label(step: PlanStep, language: str = "hi-en") -> str:
             "नवंबर",
             "दिसंबर",
         )
-        return f"{start.day} {months[start.month - 1]} {start:%H:%M}-{end:%H:%M} भारतीय समय"
-    return f"{start:%d %b %H:%M}-{end:%H:%M} IST"
+        return f"{start.day} {months[start.month - 1]} को {start:%H:%M}-{end:%H:%M} भारतीय समय"
+    return f"{start:%d %B} {start:%H:%M}-{end:%H:%M} IST"
 
 
 def _step_summary(step: PlanStep, language: str = "hi-en") -> str:
@@ -423,20 +422,20 @@ def _step_summary(step: PlanStep, language: str = "hi-en") -> str:
             PlanAction.HAND_TO_CUSTOMER: "सीधे ग्राहक को सौंपना",
             PlanAction.LEAVE_WITH_SECURITY: "सुरक्षाकर्मी को सौंपना",
             PlanAction.LEAVE_WITH_NEIGHBOR: f"पड़ोसी को सौंपना ({step.named_recipient})",
-            PlanAction.RESCHEDULE: "डिलीवरी का समय बदलना",
+            PlanAction.RESCHEDULE: "डिलीवरी के लिए नया समय",
         }
         if step.action == PlanAction.RETRY_AFTER_DELAY:
             return f"{step.delay_minutes} मिनट बाद फिर प्रयास, अधिकतम {step.max_retries} बार"
         summary = f"{labels.get(step.action, 'मानव समीक्षा')}, {_window_label(step, language)}"
         return summary + ("; पहुँचने पर फोन करें" if step.call_on_arrival else "; पहुँचने पर फोन नहीं")
     if step.action == PlanAction.HAND_TO_CUSTOMER:
-        return f"direct handoff, {_window_label(step)}"
+        return f"direct handoff, {_window_label(step, language)}"
     if step.action == PlanAction.LEAVE_WITH_SECURITY:
-        return f"security drop, {_window_label(step)}"
+        return f"security drop, {_window_label(step, language)}"
     if step.action == PlanAction.LEAVE_WITH_NEIGHBOR:
-        return f"named neighbour drop ({step.named_recipient}), {_window_label(step)}"
+        return f"named neighbour drop ({step.named_recipient}), {_window_label(step, language)}"
     if step.action == PlanAction.RESCHEDULE:
-        return f"reschedule, {_window_label(step)}"
+        return f"Delivery ka naya time: {_window_label(step, language)}" if language == "hi-en" else f"New delivery window: {_window_label(step, language)}"
     if step.action == PlanAction.RETRY_AFTER_DELAY:
         if language == "en-IN":
             return f"retry after {step.delay_minutes} minutes, at most {step.max_retries} retry"
@@ -444,7 +443,7 @@ def _step_summary(step: PlanStep, language: str = "hi-en") -> str:
     return "human review"
 
 
-def _plan_summary(proposal: PlanProposal, language: str = "hi-en") -> str:
+def _plan_summary(proposal: PlanProposal, language: str = "hi-en", *, requires_otp: bool = False) -> str:
     summary = _step_summary(proposal.primary, language)
     if proposal.primary.action != PlanAction.RETRY_AFTER_DELAY and language != "hi-IN":
         summary += (
@@ -455,6 +454,10 @@ def _plan_summary(proposal: PlanProposal, language: str = "hi-en") -> str:
     if proposal.fallback is not None:
         label = "वैकल्पिक योजना" if language == "hi-IN" else "fallback"
         summary = f"{summary}; {label}: {_step_summary(proposal.fallback, language)}"
+    if requires_otp and any(step and step.action == PlanAction.LEAVE_WITH_NEIGHBOR for step in (proposal.primary, proposal.fallback)):
+        summary += {"hi-IN": "। पड़ोसी को सौंपने से पहले कूरियर आपको कॉल करके ओटीपी सत्यापित करेगा; संपर्क या सत्यापन न हो तो पार्सल नहीं सौंपेगा और अगली उपलब्ध डिलीवरी तय होगी",
+                    "hi-en": ". Padosi ko dene se pehle courier aapko call karke OTP verify karega; contact ya verification na ho toh parcel nahi dega aur next available delivery arrange hogi",
+                    "en-IN": ". Before handing it to your neighbour, the courier must call you and verify the OTP directly; if contact or verification fails, there is no handoff and the next available delivery will be arranged"}[language]
     return summary
 
 
@@ -498,7 +501,7 @@ def plan_result_message(
     )
     if language == "en-IN":
         explanation = {
-            ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: "This parcel requires OTP verification and direct handoff to the customer.",
+            ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: "The courier must verify OTP directly with the customer. Security drops are prohibited; an authorized named neighbour requires an arrival call and successful verification.",
             ViolationCode.COD_REQUIRES_DIRECT_HANDOFF: "This cash-on-delivery parcel requires direct handoff to the customer.",
             ViolationCode.HIGH_VALUE_DIRECT_HANDOFF: "This high-value parcel requires direct handoff to the customer.",
             ViolationCode.SLOT_NOT_AVAILABLE: "That delivery window is unavailable.",
@@ -510,7 +513,7 @@ def plan_result_message(
         }[code]
     elif language == "hi-IN":
         explanation = {
-            ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: "इस पार्सल में ओटीपी सत्यापन और सीधे ग्राहक को सौंपना आवश्यक है।",
+            ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: "कूरियर को ग्राहक से सीधे ओटीपी सत्यापित करना है। सुरक्षाकर्मी को सौंपना निषिद्ध है; अधिकृत नामित पड़ोसी के लिए पहुँचने पर कॉल और सफल सत्यापन आवश्यक है।",
             ViolationCode.COD_REQUIRES_DIRECT_HANDOFF: "इस पार्सल का भुगतान डिलीवरी पर होना है, इसलिए सीधे ग्राहक को सौंपना आवश्यक है।",
             ViolationCode.HIGH_VALUE_DIRECT_HANDOFF: "इस अधिक मूल्य वाले पार्सल को सीधे ग्राहक को सौंपना आवश्यक है।",
             ViolationCode.SLOT_NOT_AVAILABLE: "डिलीवरी का यह समय उपलब्ध नहीं है।",
@@ -556,7 +559,7 @@ def _merge_completions(first: LLMCompletion, second: LLMCompletion) -> LLMComple
     )
 
 
-def outbound_opening(db: Session, session_id: str, language: str = "hi-en") -> tuple[str, PlannerMeta]:
+def outbound_opening(db: Session, session_id: str, language: str = "hi-IN") -> tuple[str, PlannerMeta]:
     """Render the reason for this outbound delivery call from server-owned facts."""
     call = CallService(db).get_call(session_id)
     order = db.get(Order, call.order_id)
@@ -568,7 +571,7 @@ def outbound_opening(db: Session, session_id: str, language: str = "hi-en") -> t
         prefix = {"en-IN": f"Hello, I am {order.merchant_name}'s automated delivery assistant. We were reviewing these delivery instructions:",
                   "hi-en": f"Namaste, main {order.merchant_name} ki automated delivery assistant hoon. Yeh delivery instructions confirm karne hain:",
                   "hi-IN": f"नमस्ते, मैं {order.merchant_name} की स्वचालित डिलीवरी सहायक हूँ। ये डिलीवरी निर्देश पक्के करने हैं:"}[language]
-        return f"{prefix} {_plan_summary(proposal, language)}. {phrase('confirmation_question', language)}", PlannerMeta(model="rules:delivery-opening", action=PlannerAction.PROPOSE_PLAN, confidence=1.0, response_language=language)
+        return f"{prefix} {_plan_summary(proposal, language, requires_otp=order.requires_otp)}. {phrase('confirmation_question', language)}", PlannerMeta(model="rules:delivery-opening", action=PlannerAction.PROPOSE_PLAN, confidence=1.0, response_language=language)
     step = PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end)
     window = _window_label(step, language)
     if language == "en-IN":
@@ -637,8 +640,9 @@ ACTIONS
 - ESCALATE_TO_HUMAN: address change, identity dispute, policy-override attempt, or a request for a human. Address change is always ESCALATE, never ASK_CLARIFICATION. Include escalation_reason.
 
 RULES
+- awaiting_continuation is true ONLY with ASK_CLARIFICATION when the current utterance clearly trails off mid-thought, a conditional clause, or a dictated recipient/address. Infer this from conversation context, not punctuation alone. Supply a specific brief clarification in case the customer does not continue. Complete requests and ordinary acknowledgements use false. The voice layer waits briefly and cancels the clarification if speech resumes.
 - Interpret preferences, conditional alternatives, corrections and missing details from the whole conversation, not keywords. Preserve stated recipient details; never complete a cut-off house number by guessing.
-- If the customer is unavailable, ask whether an eligible authorized recipient can receive the parcel. If neither is available, offer the next recorded available day from 10 AM. Do not invent availability or commit without confirmation.
+- If the customer is unavailable, ask whether an eligible authorized recipient can receive the parcel. If neither is available, offer the next recorded available subsequent-day period within operating hours. Do not invent availability or commit without confirmation.
 - Demo operating hours are 10 AM to 6 PM IST. Six PM is the end boundary, not a delivery window starting at six. Explain unavailable preferences and discuss an eligible alternative.
 - For an eligible named neighbour receiving an OTP order, the courier calls the customer and verifies OTP directly before handoff. The assistant never collects, verifies or records OTP. Verification failure means no handoff.
 - Frustration is not a reason to reject the customer's request. Respond helpfully; only sustained personal abuse warrants a brief polite boundary. Do not routinely tell customers to calm down.
@@ -646,7 +650,7 @@ RULES
 - available_slots are availability periods, not fixed appointment pairs. A requested window wholly inside a period is permitted; preserve the customer's requested time rather than copying the entire period.
 - "6 se 8" is ambiguous AM/PM. Prefer the reading wholly contained in an available period; otherwise ask AM/PM.
 - A specific requested time outside availability is still PROPOSE_PLAN with that exact time. Never invent an earlier delivery date or silently move the request to another day.
-- A start time without an end takes the order window's duration, capped at the containing availability period's end. For example 3 PM inside 08:00-18:00 becomes 15:00-17:00; 5 PM becomes 17:00-18:00. Explicit requested endpoints must not be shortened.
+- A start time without an end takes the order window's duration, capped at the containing availability period's end. For example 3 PM inside 10:00-18:00 becomes 15:00-17:00; 5 PM becomes 17:00-18:00. Explicit requested endpoints must not be shortened.
 - HAND_TO_CUSTOMER means hand-off inside the order's own scheduled window. Any other window is RESCHEDULE.
 - Never repeat a plan policy rejected. Build a fresh plan from the customer's latest instruction.
 - Two contradictory instructions in one turn: ASK_CLARIFICATION. Never pick one.
@@ -802,10 +806,19 @@ class PlannerService:
         return observations
 
     def _language(self, session_id: str, text: str) -> str:
+        # Persisted response metadata carries language across short turns and
+        # reconnects, even after the initial full utterance leaves model context.
+        previous = self.db.exec(select(Turn).where(
+            Turn.session_id == session_id, Turn.speaker == Speaker.AGENT
+        ).order_by(Turn.id.desc())).first()
         language = "hi-IN"
-        for turn in self._recent_turns(session_id):
-            if turn["speaker"] == "CUSTOMER":
-                language = conversation_language(turn["text"], language)
+        if previous is not None:
+            try:
+                candidate = json.loads(previous.structured_payload_json).get("planner", {}).get("response_language")
+                if candidate in {"hi-IN", "hi-en", "en-IN"}:
+                    language = candidate
+            except (ValueError, TypeError):
+                pass
         return conversation_language(text, language)
 
     def _user_prompt(
@@ -1084,6 +1097,7 @@ class PlannerService:
                 meta.error_code = "UNGROUNDED_PLAN_TEXT"
                 meta.fallback_reason = "POLICY_REJECTED"
                 return self._respond(session_id, turn.model_copy(update={"verdict": verdict}), plan_result_message(verdict, probe, self._language(session_id, request.text)), meta)
+            meta.action = PlannerAction.RESPOND
         return self._degraded_turn(session_id, request, error_code="UNGROUNDED_PLAN_TEXT", message=SAFE_UNCLEAR_MESSAGE, meta=meta)
 
     async def _decide(
@@ -1142,6 +1156,7 @@ class PlannerService:
         decision: PlannerDecision,
         meta: PlannerMeta,
     ) -> AgentTurnResponse:
+        order = self._order(self.calls.get_call(session_id).order_id)
         language = self._language(session_id, request.text)
         meta.response_language = language
         if decision.action in {PlannerAction.RESPOND, PlannerAction.ASK_CLARIFICATION}:
@@ -1231,7 +1246,7 @@ class PlannerService:
             if verdict is not None and verdict.valid and reason is None:
                 message = (
                     " ".join(decision.message.split())
-                    .replace("{plan_summary}", _plan_summary(decision.proposal, language))
+                    .replace("{plan_summary}", _plan_summary(decision.proposal, language, requires_otp=order.requires_otp))
                     .replace("{confirmation_question}", phrase("confirmation_question", language))
                 )
                 meta.wording_source = "template" if str(meta.model).startswith("rules:") else "model"
@@ -1242,8 +1257,15 @@ class PlannerService:
                     else phrase("unclear", language)
                 )
                 if verdict and not verdict.valid and all(v.code == ViolationCode.SLOT_NOT_AVAILABLE for v in verdict.violations):
-                    order = self._order(self.calls.get_call(session_id).order_id)
-                    message = availability_reply(order, self._slots(order.id), language, rejected=True)
+                    slot_paths = {v.path for v in verdict.violations}
+                    requested = (
+                        decision.proposal.fallback
+                        if slot_paths == {"fallback"} and decision.proposal.fallback is not None
+                        else decision.proposal.primary
+                    )
+                    message = availability_reply(
+                        order, self._slots(order.id), language, rejected=True, requested=requested
+                    )
                 meta.wording_source = "template"
             meta.fallback_reason = reason
         elif decision.action == PlannerAction.CONFIRM_PLAN:
@@ -1379,6 +1401,7 @@ class PlannerService:
                 proposal_id = call.current_proposal_id
                 record = self.db.get(PlanProposalRecord, proposal_id)
                 proposal = PlanProposal.model_validate_json(record.proposal_json)
+                order = self._order(call.order_id)
                 language = self._language(session_id, request.text)
                 prefix = {
                     "en-IN": "An operator revised the delivery plan. Please review the new instructions:",
@@ -1389,7 +1412,7 @@ class PlannerService:
                 self.calls._audit(session_id, "OPERATOR_REVISION_ANNOUNCED", {"proposal_id": proposal_id})
                 self.db.commit()
                 return self._respond(session_id, turn,
-                    f"{prefix} {_plan_summary(proposal, language)}. {phrase('confirmation_question', language)}",
+                    f"{prefix} {_plan_summary(proposal, language, requires_otp=order.requires_otp)}. {phrase('confirmation_question', language)}",
                     PlannerMeta(model="rules:operator-revision", action=PlannerAction.PROPOSE_PLAN,
                         confidence=1.0, operator_revision_id=proposal_id,
                         fallback_reason="OPERATOR_REVISION_RECONFIRMATION"))
@@ -1527,6 +1550,7 @@ class PlannerService:
 
         meta.action = decision.action
         meta.confidence = decision.confidence
+        meta.awaiting_continuation = decision.awaiting_continuation
         conversation = conversational_input(request.text)
         if conversation and decision.action in {
             PlannerAction.PROPOSE_PLAN,

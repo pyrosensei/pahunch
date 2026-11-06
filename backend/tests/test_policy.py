@@ -100,6 +100,23 @@ def test_otp_order_rejects_security_fallback():
     assert PlanAction.LEAVE_WITH_SECURITY not in verdict.allowed_alternatives
 
 
+@pytest.mark.parametrize("position", ["primary", "fallback"])
+def test_otp_order_allows_named_neighbour_only_with_courier_arrival_call(position):
+    order = make_order(requires_otp=True, safe_drop_allowed=True, neighbour_drop_allowed=True)
+    neighbour = step(
+        PlanAction.LEAVE_WITH_NEIGHBOR,
+        named_recipient="Sharma ji",
+        call_on_arrival=True,
+    )
+    plan = proposal(neighbour) if position == "primary" else proposal(step(PlanAction.HAND_TO_CUSTOMER), neighbour)
+    assert validate_plan(plan, order, [make_slot()]).valid
+
+    without_call = neighbour.model_copy(update={"call_on_arrival": False})
+    plan = proposal(without_call) if position == "primary" else proposal(step(PlanAction.HAND_TO_CUSTOMER), without_call)
+    verdict = validate_plan(plan, order, [make_slot()])
+    assert ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY in codes(verdict)
+
+
 def test_cod_order_rejects_neighbour_handoff():
     order = make_order(
         payment_mode=PaymentMode.COD,

@@ -568,7 +568,16 @@ class CallService:
                     f"maximum {fallback.max_retries} retry"
                 )
             else:
-                lines.append(f"Fallback: {fallback.action.value}")
+                fallback_instruction = {
+                    PlanAction.HAND_TO_CUSTOMER: "Direct handoff to customer",
+                    PlanAction.LEAVE_WITH_SECURITY: "Leave with building security",
+                    PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {fallback.named_recipient}",
+                    PlanAction.RESCHEDULE: "Deliver in the confirmed fallback window",
+                    PlanAction.ESCALATE_TO_HUMAN: "Human review required",
+                }[fallback.action]
+                lines.append(f"Fallback: {fallback_instruction}")
+                if fallback.call_on_arrival:
+                    lines.append("Fallback: call customer on arrival")
         return CourierCard(
             order_id=order.id,
             action=primary.action,

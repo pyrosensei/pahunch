@@ -1,12 +1,13 @@
 """Server-owned delivery availability; no model-written dates or origin claims."""
 
 import re
-from datetime import timedelta
+from datetime import time, timedelta
 
 from sqlmodel import Session, select
 
 from app.models import DeliverySlot, DialerEvent, Order, OrderStatus
 from app.policy import IST, _utc
+from app.schemas import PlanStep
 
 
 def availability_question(text: str) -> bool:
@@ -17,11 +18,40 @@ def availability_question(text: str) -> bool:
         r"(?:kaun|konsa|kaunsa).{0,20}(?:time|slot)", text, re.IGNORECASE))
 
 
-def availability_reply(order: Order, slots: list[DeliverySlot], language: str, *, rejected=False) -> str:
-    ordered = sorted(slots, key=lambda slot: _utc(slot.start_at))
+def availability_reply(
+    order: Order,
+    slots: list[DeliverySlot],
+    language: str,
+    *,
+    rejected=False,
+    requested: PlanStep | None = None,
+) -> str:
+    after_hours = False
+    requested_date = None
+    if requested is not None and requested.window_start is not None and requested.window_end is not None:
+        requested_start = _utc(requested.window_start).astimezone(IST)
+        requested_end = _utc(requested.window_end).astimezone(IST)
+        after_hours = (
+            requested_start.date() != requested_end.date()
+            or requested_start.time() >= time(18, 0)
+            or requested_end.time() > time(18, 0)
+        )
+        requested_date = requested_start.date()
+
+    alternatives = []
+    for slot in slots:
+        start = _utc(slot.start_at).astimezone(IST)
+        end = _utc(slot.end_at).astimezone(IST)
+        if after_hours and requested_date is not None and start.date() <= requested_date:
+            continue
+        start = max(start, start.replace(hour=10, minute=0, second=0, microsecond=0))
+        end = min(end, end.replace(hour=18, minute=0, second=0, microsecond=0))
+        if start < end:
+            alternatives.append((start, end))
+    alternatives.sort()
     windows = "; ".join(
-        f"{_utc(s.start_at).astimezone(IST):%d %B %H:%M}"
-        f"–{_utc(s.end_at).astimezone(IST):%H:%M} IST" for s in ordered[:3])
+        f"{start:%d %B %H:%M}-{end:%H:%M} IST" for start, end in alternatives[:3]
+    )
     if not windows:
         return {"en-IN": "No alternative delivery availability is recorded. This needs the delivery team's review; no change has been saved.",
                 "hi-IN": "डिलीवरी का कोई वैकल्पिक समय दर्ज नहीं है। डिलीवरी टीम की समीक्षा चाहिए; अभी कोई बदलाव नहीं हुआ है।",

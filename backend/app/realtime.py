@@ -127,7 +127,7 @@ def frame_is_speech(frame: bytes, threshold: int) -> bool:
 class _AudioSpool:
     """Keep a continuous turn, spilling PCM to disk instead of ending speech."""
     def __init__(self, memory_bytes):
-        self.file = tempfile.SpooledTemporaryFile(max_size=memory_bytes)
+        self.file = tempfile.SpooledTemporaryFile(max_size=memory_bytes)  # noqa: SIM115
         self.size = 0
 
     def __len__(self):
@@ -140,9 +140,15 @@ class _AudioSpool:
 
     def __bytes__(self):
         self.file.seek(0)
-        # Streaming STT receives the full turn. Oversized batch fallback must
-        # fail its existing size check, never transcribe a truncated request.
-        return self.file.read(MAX_AUDIO_BYTES + 1)
+        if self.size > MAX_AUDIO_BYTES:
+            raise DomainError(413, "Recording exceeds the batch transcription limit.")
+        return self.file.read(self.size)
+
+    def copy_to(self, destination):
+        """Copy between spools in bounded blocks, preserving every PCM byte."""
+        self.file.seek(0)
+        while block := self.file.read(64 * 1024):
+            destination.extend(block)
 
     def clear(self):
         self.file.seek(0)
@@ -151,6 +157,9 @@ class _AudioSpool:
 
     def close(self):
         self.file.close()
+
+    def __del__(self):
+        self.close()
 
 
 class UtteranceBuffer:
@@ -541,6 +550,17 @@ async def handle_voice_socket(
     dropped_frames = 0
     dropped_bytes = 0
     send_lock = asyncio.Lock()
+    # Preserve the earlier part if a pause was mistaken for the end of a turn.
+    # Retention is bounded to the batch-STT limit plus an oversize sentinel.
+    pending_pcm: _AudioSpool | None = None
+    pending_revision = None
+    batch_continuation = False
+
+    def turn_revision():
+        with Session(bind) as revision_db:
+            current = CallService(revision_db).get_call(session_id)
+            return (current.turn_count, current.state, current.current_proposal_id,
+                    current.customer_confirmed)
 
     async def send(event, *, gen=None):
         async with send_lock:
@@ -696,7 +716,7 @@ async def handle_voice_socket(
                     generation_done = True
                     playback_generation = None
                     if pending_start or recoverable:
-                        await listen()
+                        await listen(keep_buffer=bool(buffer._candidate_samples or buffer._saw_speech))
             except Exception as error:
                 audit(
                     "REALTIME_TASK_FAILED", {"phase": "output", "error_type": type(error).__name__}
@@ -742,10 +762,11 @@ async def handle_voice_socket(
             raise asyncio.CancelledError
         generation_done = True
         await send({"type": "agent_audio_end", **event}, gen=gen)
-        if pending_start and (not playback_tracking or playback_generation is None):
+        resume_capture = bool(buffer._candidate_samples or buffer._saw_speech)
+        if (pending_start or resume_capture) and (not playback_tracking or playback_generation is None):
             if not playback_tracking:
                 playback_generation = None
-            await listen()
+            await listen(keep_buffer=resume_capture)
 
     async def greet(gen, rate):
         started = perf_counter()
@@ -798,7 +819,7 @@ async def handle_voice_socket(
         )
 
     async def deliver(
-        gen, rate, *, pcm=None, capture=None, text=None, language=None, ended_at=None
+        gen, rate, *, pcm=None, capture=None, text=None, language=None, ended_at=None, batch=False
     ):
         nonlocal playback_generation
         with Session(bind) as turn_db:
@@ -811,6 +832,7 @@ async def handle_voice_socket(
                 min_transcript_confidence=min_transcript_confidence,
             )
             async def turn_sink(response):
+                nonlocal pending_pcm, pending_revision
                 if not await send(
                     {
                         "type": "turn",
@@ -831,13 +853,14 @@ async def handle_voice_socket(
                     gen=gen,
                 ):
                     raise asyncio.CancelledError
+                pending_pcm = pending_revision = None
                 if response.planner.operator_revision_id:
                     revision_generations[gen] = response.planner.operator_revision_id
 
             async def audio_sink(chunk):
                 await chunk_sink(chunk, gen, rate)
 
-            transcript = await stt.finish(capture) if pcm is not None else None
+            transcript = await stt.finish(capture) if pcm is not None and not batch else None
             if gen != generation or closed:
                 raise asyncio.CancelledError
             if text is not None or transcript is not None:
@@ -855,9 +878,11 @@ async def handle_voice_socket(
                     sample_rate=rate,
                 )
             else:
+                if len(pcm) + 44 > max_audio_bytes:
+                    raise DomainError(413, "This long recording could not be transcribed safely. Please repeat in shorter parts.")
                 response = await service.handle_audio(
                     session_id,
-                    pcm16_to_wav(pcm, config.sample_rate),
+                    pcm16_to_wav(bytes(pcm), config.sample_rate),
                     "utterance.wav",
                     "audio/wav",
                     turn_sink=turn_sink,
@@ -890,21 +915,25 @@ async def handle_voice_socket(
             )
 
     async def endpoint():
-        nonlocal listening
+        nonlocal listening, pending_pcm, pending_revision, batch_continuation
         listening = False
-        pcm, duration, capture = bytes(buffer.pcm), buffer.speech_ms, stt.capture
+        pcm, duration, capture = buffer.pcm, buffer.speech_ms, stt.capture
+        batch, batch_continuation = batch_continuation, False
+        pending_pcm, pending_revision = pcm, turn_revision()
         details = {
             "reason": buffer.end_reason or "PUSH_TO_TALK",
             "speech_ms": duration,
-            "buffered_ms": round(len(pcm) * 1000 / (config.sample_rate * 2)),
+            "buffered_ms": round(len(buffer.pcm) * 1000 / (config.sample_rate * 2)),
         }
         audit("VAD_UTTERANCE_ENDED", details)
+        # Transfer file ownership; do not materialize a long turn in memory.
+        buffer.pcm = _AudioSpool(config.max_utterance_ms * config.sample_rate * 2 // 1000)
         buffer.reset()
         ended_at = perf_counter()
         await send({"type": "speech_end", "duration_ms": duration})
 
         async def job(gen, rate):
-            await deliver(gen, rate, pcm=pcm, capture=capture, ended_at=ended_at)
+            await deliver(gen, rate, pcm=pcm, capture=capture, ended_at=ended_at, batch=batch)
 
         start_output(job, recover_audio=True)
 
@@ -935,8 +964,28 @@ async def handle_voice_socket(
                         await send({"type": "speech_start"})
                     continue
                 if output_task is not None and not output_task.done():
-                    dropped_frames += 1
-                    dropped_bytes += len(frame)
+                    # There is no speaker audio to echo yet. Detect resumed
+                    # speech instead of throwing away the customer's ending.
+                    if buffer.add(frame, calibrate=False):
+                        original = pending_pcm if pending_revision == turn_revision() else None
+                        await invalidate("CUSTOMER_CONTINUED" if original is not None else "NEW_CUSTOMER_TURN")
+                        stt.abort()
+                        listening = False
+                        await listen(keep_buffer=True)
+                        batch_continuation = original is not None
+                        if batch_continuation:
+                            resumed = buffer.pcm
+                            buffer.pcm = _AudioSpool(config.max_utterance_ms * config.sample_rate * 2 // 1000)
+                            original.copy_to(buffer.pcm)
+                            resumed.copy_to(buffer.pcm)
+                            resumed.close()
+                            # Replay the whole utterance once through batch STT;
+                            # never combine a stale final with a new stream.
+                            stt.abort()
+                        else:
+                            stt.offer(bytes(buffer.pcm))
+                        audit("CUSTOMER_SPEECH_RESUMED", {"continued_turn": batch_continuation})
+                        await send({"type": "speech_start"})
                     continue
                 if not listening:
                     continue
@@ -957,7 +1006,7 @@ async def handle_voice_socket(
                         },
                     )
                     await send({"type": "speech_start"})
-                elif buffer._saw_speech:
+                elif buffer._saw_speech and not batch_continuation:
                     stt.offer(frame[: len(buffer.pcm) - before])
                 if not calibration_recorded and not buffer.calibrating:
                     calibration_recorded = True
@@ -980,7 +1029,7 @@ async def handle_voice_socket(
                     listening_since = perf_counter()
                     no_speech_sent = False
                 if buffer.complete:
-                    if buffer.has_utterance:
+                    if buffer.has_utterance or (batch_continuation and buffer._saw_speech):
                         await endpoint()
                     else:
                         audit("VAD_SHORT_UTTERANCE", {"speech_ms": buffer.speech_ms})
@@ -994,6 +1043,7 @@ async def handle_voice_socket(
                             )
                         stt.abort()
                         buffer.reset()
+                        batch_continuation = False
                         stt.begin()
                 continue
             raw = message.get("text")
@@ -1052,7 +1102,7 @@ async def handle_voice_socket(
                         await listen()
             elif kind == "stop":
                 pending_start = False
-                if listening and buffer.has_utterance:
+                if listening and (buffer.has_utterance or (batch_continuation and buffer._saw_speech)):
                     await endpoint()
                 elif listening:
                     listening = False
@@ -1062,8 +1112,11 @@ async def handle_voice_socket(
                             {"speech_ms": buffer.speech_ms, "reason": "PUSH_TO_TALK_RELEASE"},
                         )
                     buffer.reset()
+                    batch_continuation = False
                     stt.abort()
             elif kind == "reset":
+                pending_pcm = pending_revision = None
+                batch_continuation = False
                 pending_start = False
                 listening = False
                 buffer.reset()
@@ -1110,4 +1163,6 @@ async def handle_voice_socket(
                 await asyncio.gather(*tasks, return_exceptions=True)
             await stt.close()
             buffer.pcm.close()
+            if pending_pcm is not None:
+                pending_pcm.close()
             record_drops()

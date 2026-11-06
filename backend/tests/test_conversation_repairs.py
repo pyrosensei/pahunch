@@ -79,7 +79,7 @@ def test_actual_code_is_still_redacted_before_courier_guidance(db):
     ("शर्मा जी हाउस नंबर 404 को दे दीजिए, OTP चाहिए तो मुझे कॉल कर दीजिए", "शर्मा जी"),
     ("Give the parcel to my neighbour Sharma at house 404; call me if he needs the OTP", "Sharma"),
 ])
-def test_neighbour_with_otp_still_goes_through_policy_validation(db, scripted_llm, text, name):
+def test_neighbour_with_otp_requires_courier_verification_and_confirmation(db, scripted_llm, text, name):
     proposal = valid_proposal()
     proposal["primary"]["action"] = "LEAVE_WITH_NEIGHBOR"
     proposal["primary"]["named_recipient"] = name
@@ -88,8 +88,9 @@ def test_neighbour_with_otp_still_goes_through_policy_validation(db, scripted_ll
     call = start_call(planner.calls)
     result = run(planner, call.id, text)
     assert len(llm.requests) == 1
-    assert result.turn.verdict and not result.turn.verdict.valid
-    assert result.planner.fallback_reason == "POLICY_REJECTED"
+    assert result.turn.verdict and result.turn.verdict.valid
+    assert result.state == "PENDING_CONFIRMATION"
+    assert result.planner.fallback_reason is None
     assert not result.turn.customer_confirmed
 
 
@@ -100,8 +101,9 @@ def test_order_and_delivery_date_question_uses_actual_creation_record(db):
     db.commit()
     result = run(planner, call.id, "मैंने अभी order किया, order और delivery date अलग होगी ना?")
     assert "02 November 17:30 IST" in result.agent_message
-    assert "5 नवंबर" in result.agent_message
-    assert "अलग हैं" in result.agent_message
+    assert "05 November" in result.agent_message
+    assert "alag hain" in result.agent_message
+    assert result.planner.response_language == "hi-en"
     assert result.planner.fallback_reason == "ORDER_DATE_QUESTION"
 
 
@@ -146,12 +148,10 @@ def test_translated_neighbour_address_still_explains_otp_policy_without_saving_n
     call = start_call(planner.calls)
     result = run(planner, call.id, "मेरे पड़ोसी शर्मा जी house number चार सौ चार में रहते हैं। उन्हें दे दीजिए। OTP चाहिए तो मुझे call कर दीजिए।")
     assert result.planner.error_code == "UNGROUNDED_PLAN_TEXT"
-    assert result.planner.fallback_reason == "POLICY_REJECTED"
+    assert result.planner.fallback_reason == "UNGROUNDED_PLAN_TEXT"
     assert result.planner.action == PlannerAction.RESPOND
-    assert "ओटीपी सत्यापन" in result.agent_message
-    assert "सीधे ग्राहक को सौंपना आवश्यक" in result.agent_message
     assert "404" not in result.agent_message
-    assert result.turn.verdict and not result.turn.verdict.valid
+    assert result.turn.verdict is None
     assert not planner.calls.get_call(call.id).current_proposal_id
     assert not result.turn.customer_confirmed
 

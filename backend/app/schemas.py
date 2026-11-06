@@ -72,6 +72,7 @@ class PlannerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PlannerAction
+    awaiting_continuation: bool = False
     message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
@@ -79,6 +80,8 @@ class PlannerDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_fields(self):
+        if self.awaiting_continuation and self.action != PlannerAction.ASK_CLARIFICATION:
+            raise ValueError("Only a clarification may wait for continued speech")
         if self.action == PlannerAction.PROPOSE_PLAN and self.proposal is None:
             raise ValueError("PROPOSE_PLAN requires a proposal")
         if self.action != PlannerAction.PROPOSE_PLAN and self.proposal is not None:
@@ -143,6 +146,7 @@ class AgentTurnRequest(BaseModel):
 
 
 class PlannerMeta(BaseModel):
+    awaiting_continuation: bool = False
     model: str
     action: PlannerAction | None = None
     confidence: float | None = None

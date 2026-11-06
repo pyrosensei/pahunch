@@ -95,23 +95,36 @@ def response_language(text: str) -> str:
 
 
 def conversation_language(text: str, previous: str = "hi-IN") -> str:
-    """Short acknowledgements preserve language; full turns provide evidence."""
-    words = re.findall(r"[a-z]+", text.casefold())
-    if re.search(r"(?:speak|reply|continue|talk).{0,12}(?:in )?english", text, re.I):
+    """Keep acknowledgements and brief Hindi replies in the established language."""
+    if re.fullmatch(r"\s*(?:please\s+)?(?:speak|reply|continue|talk)(?: to me)?(?: in)? english[.!?\s]*", text, re.IGNORECASE):
         return "en-IN"
-    if re.search(r"(?:hindi mein|हिंदी में)", text, re.I):
+    if re.fullmatch(r"\s*(?:please\s+)?(?:hindi mein (?:bolo|boliye|baat karo)|हिंदी में (?:बोलिए|बोलो|बात करें))[.!?।\s]*", text, re.IGNORECASE):
         return "hi-IN"
-    if len(words) <= 2 and not _HINDI.search(text):
+    normalized = " ".join(text.casefold().split()).strip(".!?। ")
+    acknowledgements = {
+        "yes", "yeah", "okay", "ok", "haan", "han", "ha", "ji", "theek hai",
+        "हाँ", "हां", "हा", "जी", "ठीक", "ठीक है", "नमस्ते", "namaste",
+    }
+    if normalized in acknowledgements:
         return previous
+    words = re.findall(r"[a-z]+", text.casefold())
     hindi_words = re.findall(r"[\u0900-\u097f]+", text)
+    if hindi_words and not words and len(hindi_words) <= 2:
+        return previous
     if hindi_words:
-        if len(words) >= 3 and len(hindi_words) >= 2:
-            return "hi-en"
-        if len(words) > len(hindi_words) * 3:
+        # One borrowed word must not change a whole conversation. Substantial
+        # evidence in both scripts represents mixed speech, not pure Hindi.
+        if len(hindi_words) == 1 and len(words) >= 3:
             return "en-IN"
+        if len(words) >= 3 and len(words) >= len(hindi_words) / 2:
+            return "hi-en"
         return "hi-IN"
     cues = sum(w in _HINGLISH_WORDS for w in words)
-    return "hi-en" if cues >= 2 else "en-IN"
+    if cues >= 2 and cues / max(len(words), 1) >= 0.15:
+        return "hi-en"
+    if cues and len(words) <= 3:
+        return previous
+    return "en-IN"
 
 
 def language_matches(text: str, language: str) -> bool:

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from time import perf_counter
 
 import pytest
@@ -13,6 +14,7 @@ from test_realtime import (
     ScriptedStream,
     StreamingSpeech,
     loud,
+    pcm_frame,
     proposal_decision,
     realtime_client,
     silence,
@@ -62,7 +64,7 @@ class Socket:
 
 
 @asynccontextmanager
-async def voice(llm, *, speech=None, streaming=None, config=FAST_CONFIG):
+async def voice(llm, *, speech=None, streaming=None, config=FAST_CONFIG, max_audio_bytes=10_000_000):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -83,6 +85,7 @@ async def voice(llm, *, speech=None, streaming=None, config=FAST_CONFIG):
                 speech or StreamingSpeech([b"\x01\x02"]),
                 config,
                 streaming=streaming,
+                max_audio_bytes=max_audio_bytes,
             )
         )
         await socket.event("ready")
@@ -101,11 +104,11 @@ async def voice(llm, *, speech=None, streaming=None, config=FAST_CONFIG):
 class HeldPlanner:
     model_name = "held-test-planner"
 
-    def __init__(self, scripted_llm):
+    def __init__(self, scripted_llm, outcomes=1):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.cancelled = asyncio.Event()
-        self.delegate = scripted_llm([proposal_decision()])
+        self.delegate = scripted_llm([proposal_decision() for _ in range(outcomes)])
 
     async def complete_json(self, **kwargs):
         self.started.set()
@@ -115,6 +118,16 @@ class HeldPlanner:
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+
+class RecordingSpeech(StreamingSpeech):
+    def __init__(self, chunks=None):
+        super().__init__([b"\x01\x02"] if chunks is None else chunks)
+        self.recordings = []
+
+    async def transcribe(self, audio, **kwargs):
+        self.recordings.append(audio)
+        return await super().transcribe(audio, **kwargs)
 
 
 def test_duplicate_socket_is_rejected_and_owner_can_reconnect(scripted_llm):
@@ -138,35 +151,99 @@ def test_duplicate_socket_is_rejected_and_owner_can_reconnect(scripted_llm):
         assert sum(e["event_type"] == "REALTIME_CONNECTED" for e in events) == 2
 
 
-def test_reader_handles_controls_and_drops_frames_during_planning(scripted_llm):
+def test_resumed_speech_cancels_unpersisted_planner_and_keeps_original_audio(scripted_llm):
     async def run():
         llm = HeldPlanner(scripted_llm)
-        async with voice(llm) as (ws, _, calls, session_id):
+        speech = RecordingSpeech()
+        async with voice(llm, speech=speech) as (ws, _, calls, session_id):
             ws.control("start")
             await ws.event("listening")
             ws.utterance()
             await asyncio.wait_for(llm.started.wait(), 1)
-            ws.utterance()
+            continued = b"".join([pcm_frame(4_000)] * 3 + [silence()] * 3)
+            for index in range(0, len(continued), len(loud())):
+                ws.audio(continued[index:index + len(loud())])
             started = perf_counter()
             ws.control("bogus")
             assert (await ws.event("error", timeout=0.3))["detail"] == "Unknown control message"
+            await asyncio.wait_for(llm.cancelled.wait(), 0.3)
             measured_ms = (perf_counter() - started) * 1000
             llm.release.set()
-            end = await ws.event("agent_audio_end")
-            ws.control("start")
-            await ws.event("listening")
-            ws.control("bogus")
-            await ws.event("error")
+            await ws.event("agent_audio_end")
             calls.db.expire_all()
             assert calls.get_call(session_id).turn_count == 1
-            payloads = [
-                json.loads(e.payload_json)
-                for e in calls.list_events(session_id)
-                if e.event_type == "REALTIME_FRAMES_DROPPED"
-            ]
-            assert sum(p["frames"] for p in payloads) == 6
+            assert len(speech.recordings) == 2
+            first = speech.recordings[0][44:]
+            assert speech.recordings[1][44:] == first + continued
+            assert not any(e.event_type == "REALTIME_FRAMES_DROPPED" for e in calls.list_events(session_id))
+            resumed = [json.loads(e.payload_json) for e in calls.list_events(session_id)
+                       if e.event_type == "CUSTOMER_SPEECH_RESUMED"]
+            assert resumed == [{"continued_turn": True}]
             print(f"synthetic blocked-planner control response: {measured_ms:.2f} ms")
-            print(f"mock-provider server first_audio_ms: {end['timings']['first_audio_ms']}")
+
+    asyncio.run(run())
+
+
+def test_short_continuation_preserves_valid_original_utterance(scripted_llm):
+    async def run():
+        llm = HeldPlanner(scripted_llm, outcomes=2)
+        speech = RecordingSpeech()
+        config = replace(FAST_CONFIG, min_speech_ms=300)
+        async with voice(llm, speech=speech, config=config) as (ws, _, calls, session_id):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            await asyncio.wait_for(llm.started.wait(), 1)
+            continued = b"".join([loud()] + [silence()] * 3)
+            for index in range(0, len(continued), len(loud())):
+                ws.audio(continued[index:index + len(loud())])
+            await asyncio.wait_for(llm.cancelled.wait(), 1)
+            llm.release.set()
+            await ws.event("agent_audio_end")
+            calls.db.expire_all()
+            assert calls.get_call(session_id).turn_count == 1
+            assert len(speech.recordings) == 2
+            first = speech.recordings[0][44:]
+            assert speech.recordings[1][44:] == first + continued
+            assert not any(
+                e.event_type == "VAD_SHORT_UTTERANCE"
+                for e in calls.list_events(session_id)
+            )
+
+    asyncio.run(run())
+
+
+def test_empty_tts_completion_resumes_sub_onset_speech_without_losing_pcm(scripted_llm):
+    async def run():
+        llm = HeldPlanner(scripted_llm, outcomes=2)
+        speech = RecordingSpeech(chunks=[])
+        config = replace(FAST_CONFIG, speech_start_ms=200)
+        async with voice(llm, speech=speech, config=config) as (ws, _, calls, session_id):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            await asyncio.wait_for(llm.started.wait(), 1)
+            onset = loud()
+            ws.audio(onset)
+            ws.control("bogus")
+            await ws.event("error")
+            llm.release.set()
+            end = await ws.event("agent_audio_end")
+            assert end["audio_streamed"] is False
+            assert end["audio_error"] == "TTS_UNAVAILABLE"
+            await ws.event("listening")
+            remainder = b"".join([loud()] * 2 + [silence()] * 3)
+            for index in range(0, len(remainder), len(loud())):
+                ws.audio(remainder[index:index + len(loud())])
+            await ws.event("agent_audio_end")
+            calls.db.expire_all()
+            assert calls.get_call(session_id).turn_count == 2
+            assert len(speech.recordings) == 2
+            assert speech.recordings[1][44:] == onset + remainder
+            assert not any(
+                e.event_type == "REALTIME_FRAMES_DROPPED"
+                for e in calls.list_events(session_id)
+            )
 
     asyncio.run(run())
 
@@ -609,4 +686,78 @@ def test_playback_observation_accepts_current_generation_once(scripted_llm):
                 AuditEvent.event_type == "BROWSER_PLAYBACK_UNDERRUN")).all()
             assert len(rows) == 1
             assert json.loads(rows[0].payload_json)["source"] == "browser_report"
+    asyncio.run(run())
+
+
+def test_streaming_turn_does_not_materialize_whole_audio(scripted_llm, monkeypatch):
+    from app.realtime import _AudioSpool
+    original = _AudioSpool.__bytes__
+
+    def guarded_bytes(spool):
+        assert len(spool) < 10_000, "Streaming endpoint must retain spool ownership"
+        return original(spool)
+
+    monkeypatch.setattr(_AudioSpool, "__bytes__", guarded_bytes)
+    async def run():
+        async with voice(scripted_llm([proposal_decision()]), streaming=ScriptedStream([StreamingTranscript("6 se 8 aa jaana")])) as (ws, _, calls, sid):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            await ws.event("turn")
+            await ws.event("agent_audio_end")
+            calls.db.expire_all()
+            assert calls.get_call(sid).turn_count == 1
+    asyncio.run(run())
+
+
+def test_oversized_batch_fallback_never_reaches_planner(scripted_llm):
+    async def run():
+        llm = scripted_llm([])
+        speech = RecordingSpeech()
+        async with voice(llm, speech=speech, max_audio_bytes=100) as (ws, _, calls, sid):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            error = await ws.event("error")
+            assert "long recording" in error["detail"]
+            assert not speech.recordings
+            assert not llm.requests
+            assert calls.get_call(sid).turn_count == 0
+    asyncio.run(run())
+
+
+def test_semantic_pause_waits_for_continuation_without_speaking(scripted_llm):
+    async def run():
+        original_text = "Please deliver to my neighbour at house number"
+        first = {"action": "ASK_CLARIFICATION", "message": "What is the house number?",
+                 "proposal": None, "escalation_reason": None, "confidence": 0.95,
+                 "awaiting_continuation": True}
+        second = {"action": "ASK_CLARIFICATION", "message": "Is Sharma available?",
+                  "proposal": None, "escalation_reason": None, "confidence": 0.95}
+        llm = scripted_llm([first, second])
+        stream = ScriptedStream([StreamingTranscript(original_text),
+                                 StreamingTranscript("403, Sharma lives there")])
+        async with voice(llm, streaming=stream) as (ws, _, calls, sid):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            async with asyncio.timeout(1):
+                while True:
+                    calls.db.expire_all()
+                    if calls.get_call(sid).turn_count == 1:
+                        break
+                    await asyncio.sleep(0.01)
+            assert not any(e["type"] in {"turn", "agent_audio", "agent_audio_chunk"} for e in ws.history)
+            ws.utterance()
+            turn = await ws.event("turn")
+            assert turn["transcript"] == "403, Sharma lives there"
+            await ws.event("agent_audio_end")
+            assert len(llm.requests) == 2
+            assert original_text in llm.requests[1]["user_prompt"]
+            calls.db.expire_all()
+            call = calls.get_call(sid)
+            assert call.turn_count == 2
+            assert not call.customer_confirmed
+            assert not call.current_proposal_id
+            assert len([e for e in ws.history if e["type"] == "turn"]) == 1
     asyncio.run(run())

@@ -538,7 +538,7 @@ def test_changed_window_is_normalized_to_reschedule(db, scripted_llm):
     record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
     stored = json.loads(record.proposal_json)
     assert stored["primary"]["action"] == "RESCHEDULE"
-    assert "reschedule" in result.agent_message
+    assert "Delivery ka naya time" in result.agent_message
     events = list(db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all())
     assert any(event.event_type == "PLAN_NORMALIZED" for event in events)
 
