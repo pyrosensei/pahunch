@@ -1,6 +1,18 @@
-export type PlanStep = { action: string; window_start?: string | null; window_end?: string | null; call_on_arrival?: boolean; delay_minutes?: number | null; max_retries?: number; named_recipient?: string | null; notes?: string | null };
+export type SourceQuote = { turn_id?: number | null; quote?: string | null };
+export type PlanStep = {
+  action: string; window_start?: string | null; window_end?: string | null;
+  call_on_arrival?: boolean; delay_minutes?: number | null; max_retries?: number;
+  named_recipient?: string | null; recipient_address?: string | null;
+  recipient_source?: SourceQuote | null; recipient_address_source?: SourceQuote | null;
+  notes?: string | null;
+};
 export type Proposal = { primary: PlanStep; fallback?: PlanStep | null; customer_statements?: string[]; notes?: string | null; confidence?: Record<string, number> };
 export type Policy = { valid: boolean; violations: { code: string; message?: string }[]; allowed_alternatives: string[] };
+export type PlannerTurnMeta = {
+  action?: string; response_language?: string; wording_source?: string; fallback_reason?: string;
+  review_needed?: boolean; missing_fields?: string[]; language_warning?: string | null;
+  error_code?: string | null; awaiting_continuation?: boolean;
+};
 export type OperatorSummary = {
   session_id: string; order_id: number; state: string; outcome: string | null; transport: string; dispatch_state: string | null; phone_consent: boolean;
   customer_requests: { turn_id: number; text: string; created_at: string }[];

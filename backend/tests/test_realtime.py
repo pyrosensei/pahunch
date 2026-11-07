@@ -484,7 +484,7 @@ def test_utterance_buffer_endpoints_on_silence():
     assert len(buffer.pcm) == 0
 
 
-def test_utterance_buffer_caps_on_max_duration():
+def test_utterance_buffer_memory_threshold_does_not_end_a_turn():
     config = RealtimeConfig(
         sample_rate=RATE,
         vad_threshold=2_000,
@@ -500,7 +500,10 @@ def test_utterance_buffer_caps_on_max_duration():
     buffer.add(silence())
     buffer.add(silence())
     buffer.add(silence())
-    assert buffer.complete
+    assert not buffer.complete
+    buffer.add(loud())
+    assert buffer.pcm.file._rolled
+    buffer.pcm.close()
 
 
 def test_utterance_buffer_ignores_below_min_speech():
@@ -806,7 +809,8 @@ def test_config_message_sets_the_tts_sample_rate(scripted_llm):
             introduction = ws.receive_json()
             assert introduction["type"] == "opening"
             assert "1042" in introduction["agent_message"]
-            assert "available" in introduction["agent_message"]
+            assert "उपलब्ध" in introduction["agent_message"]
+            assert introduction["planner"]["response_language"] == "hi-IN"
             opening = ws.receive_json()
             assert opening["type"] == "agent_audio_chunk"
             assert opening["sample_rate"] == 24_000

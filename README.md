@@ -4,12 +4,12 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · Groq GPT-OSS 20B planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Groq GPT-OSS 120B planner · FastAPI · SQLite
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![Groq](https://img.shields.io/badge/planner-Groq%20GPT--OSS%2020B-F55036.svg)](https://console.groq.com/docs/models)
+[![Groq](https://img.shields.io/badge/planner-Groq%20GPT--OSS%20120B-F55036.svg)](https://console.groq.com/docs/models)
 [![Tests](https://img.shields.io/badge/tests-382%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
@@ -547,7 +547,7 @@ GNANI_API_KEY=
 LLM_PROVIDER=groq
 GROQ_API_KEY=
 LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_MODEL=openai/gpt-oss-20b
+LLM_MODEL=openai/gpt-oss-120b
 LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
@@ -620,7 +620,7 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Groq** (`openai/gpt-oss-20b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
+| Planner | **Groq** (`openai/gpt-oss-120b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
 | Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Groq checks are reported separately |
 
@@ -647,8 +647,8 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Groq live generation works with the saved key.** All 8 focused synthetic voice scenarios passed across 14 turns, with 9 successful model requests and no repairs or provider/audio errors. Model-driven substantive replies began in 1.48-2.14 s from the server utterance endpoint, excluding endpoint detection and physical playback. The observed 8,000-token/minute quota limits rapid model turns; tests were paced outside measured turns. See [the current live review](GROQ_LIVE_REVIEW.md) for evidence and limitations. Earlier provider reports remain historical.
-- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. See the new review for measurements. The target remains sub-second time to first audio.
+- **Historical Groq validation:** earlier model/provider probes are not validation of the current GPT-OSS 120B configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
 - **Planner stalls are external.** The 12 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.
@@ -760,3 +760,31 @@ origin, carrier ETA or live route-capacity feed is connected. Those dates must c
 from fulfillment data when integrated. Existing unresolved synthetic checkout
 availability is widened on startup without changing its scheduled appointment or
 earliest stored date. Legacy seeded examples retain their recorded availability.
+
+### Conversation recovery
+
+The current planner is Groq GPT-OSS 120B. Short acknowledgements preserve the
+conversation language; substantial Hindi/English mixing selects Hinglish.
+The planner can mark an unfinished clarification with `awaiting_continuation`;
+voice output then waits up to two extra seconds, cancellable by resumed speech,
+without a second model request. Complete delivery actions cannot use this flag.
+Noise calibration and browser noise suppression help capture but do not guarantee
+speech/noise separation. Human microphone validation is still required.
+
+OTP neighbour delivery is permitted only for an eligible, named recipient with
+an arrival call. The courier must contact the customer and verify OTP directly
+before handoff. The assistant never collects or verifies the OTP. No contact or
+failed verification means no handoff. New delivery windows must fit recorded
+availability within 10:00–18:00 IST; legacy scheduled promises are preserved.
+
+### Source-backed conversation recovery
+
+Recipient names and house details can carry exact customer-source quotes and turn
+references. The backend inserts the verified original spelling into proposals and
+courier instructions. Saved proposal JSON from earlier versions remains readable.
+Typed request details retain understood preferences between turns, including a
+start time without an end. Within recorded availability, a five PM start is capped
+at the six PM closing boundary. Repeated clarification marks a recoverable review
+need instead of closing the session. Explicit human requests and the overall turn
+budget still apply. Ordinary Hindi/Hinglish variation is recorded as a language
+warning while explicit language requests remain authoritative.

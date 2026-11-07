@@ -32,8 +32,10 @@ def setup_availability(db):
 
 @pytest.mark.parametrize("start,end,valid", [
     ("05T15:00:00", "05T17:00:00", True),
-    ("05T08:00:00", "05T10:00:00", True),
+    ("05T08:00:00", "05T10:00:00", False),
+    ("05T10:00:00", "05T12:00:00", True),
     ("05T17:00:00", "05T18:00:00", True),
+    ("05T17:59:59.999999", "05T18:00:00.000001", False),
     ("06T15:00:00", "06T17:00:00", True),
     ("05T07:00:00", "05T09:00:00", False),
     ("05T17:00:00", "05T19:00:00", False),
@@ -74,7 +76,8 @@ def test_availability_questions_do_not_call_model_or_repeat_rejected_plan(db, qu
     call = start_call(CallService(db))
     response = run(PlannerService(db, NoModel()), call.id, question)
     assert response.planner.fallback_reason == "DELIVERY_AVAILABILITY"
-    assert "08:00" in response.agent_message and "18:00" in response.agent_message
+    assert "10:00" in response.agent_message and "18:00" in response.agent_message
+    assert "08:00" not in response.agent_message
     assert "05 November" in response.agent_message and "06 November" in response.agent_message
     assert not response.turn.customer_confirmed
 
@@ -86,6 +89,8 @@ def test_out_of_hours_request_offers_actual_dates_and_no_false_reschedule(db, sc
     response = run(PlannerService(db, llm), call.id, "Please deliver at 7 pm on the same day")
     assert not response.turn.verdict.valid
     assert "06 November" in response.agent_message and "18:00" in response.agent_message
+    assert "10:00" in response.agent_message
+    assert "05 November" not in response.agent_message
     assert not response.turn.customer_confirmed
 
 
@@ -97,6 +102,6 @@ def test_existing_synthetic_options_expand_idempotently_without_changing_promise
     expand_demo_availability(db)
     expand_demo_availability(db)
     slots = db.exec(select(DeliverySlot).where(DeliverySlot.order_id == order.id)).all()
-    assert all(s.start_at.astimezone(at("05T08:00:00").tzinfo).hour == 8 for s in slots)
-    assert all(s.end_at.astimezone(at("05T08:00:00").tzinfo).hour == 18 for s in slots)
+    assert all(s.start_at.astimezone(at("05T10:00:00").tzinfo).hour == 10 for s in slots)
+    assert all(s.end_at.astimezone(at("05T10:00:00").tzinfo).hour == 18 for s in slots)
     assert order.window_start == original

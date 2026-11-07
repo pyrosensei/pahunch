@@ -28,7 +28,7 @@ def test_opening_contains_the_actual_order_window_and_relevant_payment_rule(db):
     call = start_call(CallService(db), 1043)
     message, meta = outbound_opening(db, call.id, "en-IN")
     assert "SwiftCart" in message and "1043" in message
-    assert "05 Nov 12:00-15:00 IST" in message
+    assert "05 November 12:00-15:00 IST" in message
     assert "Payment is due to the courier" in message
     assert "Will you be available" in message
     assert "How can I help" not in message

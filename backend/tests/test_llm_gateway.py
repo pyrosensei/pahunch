@@ -13,13 +13,14 @@ from app.errors import DomainError
 from app.llm import (
     LLMGatewayError,
     LLMResponseError,
+    LLMStructuredOutputError,
     LLMTimeoutError,
     OpenAICompatibleClient,
     build_llm_client,
     make_strict_json_schema,
 )
 from app.models import Order
-from app.planner import PlannerService, _planner_schema
+from app.planner import PLANNER_OUTPUT_SHAPE, PlannerService, _planner_schema
 from app.schemas import AgentTurnRequest, PlannerDecision
 
 db = planner_database
@@ -158,6 +159,136 @@ def test_http_and_malformed_provider_errors_are_mapped():
         )
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "expected_type", "expected_category"),
+    [
+        (400, "json_validate_failed", LLMStructuredOutputError, "structured_output"),
+        (400, "invalid_request_error", LLMResponseError, "invalid_request"),
+        (401, "authentication_error", LLMResponseError, "access"),
+        (403, "permission_error", LLMResponseError, "access"),
+        (429, "rate_limit_exceeded", LLMResponseError, "rate_limit"),
+        (503, "service_unavailable", LLMResponseError, "provider"),
+    ],
+)
+def test_provider_http_failures_are_classified(status, code, expected_type, expected_category):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"code": code, "message": "synthetic failure"}})
+
+    client = make_client(handler)
+    with pytest.raises(expected_type) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    assert raised.value.status_code == status
+    assert raised.value.category == expected_category
+    if expected_type is not LLMStructuredOutputError:
+        assert not isinstance(raised.value, LLMStructuredOutputError)
+
+
+def test_json_validate_failed_detail_is_bounded_and_sanitized():
+    raw = (
+        "Generated JSON does not match the expected schema. See 'failed_generation' for details. "
+        "Error: jsonschema: '' does not validate with /required: missing properties: "
+        "'awaiting_continuation', 'request_details', 'missing_fields'. "
+        "Untrusted diagnostic: <script>alert('x')</script>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"code": "json_validate_failed", "message": raw}})
+
+    client = make_client(handler)
+    with pytest.raises(LLMStructuredOutputError) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    detail = raised.value.detail
+    assert detail == "missing required fields: awaiting_continuation, request_details, missing_fields"
+    assert "failed_generation" not in detail
+    assert "script" not in detail
+    assert len(detail) <= 300
+
+
+def test_large_json_validate_failed_body_keeps_the_repair_category():
+    payload = {
+        "error": {
+            "code": "json_validate_failed",
+            "message": (
+                "Error: jsonschema: '' does not validate with /required: missing properties: "
+                "'awaiting_continuation', 'request_details'. " + "diagnostic padding " * 300
+            ),
+            "failed_generation": "untrusted generation " * 300,
+        }
+    }
+    assert len(json.dumps(payload)) > 2_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=payload)
+
+    client = make_client(handler)
+    with pytest.raises(LLMStructuredOutputError) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    assert raised.value.category == "structured_output"
+    assert raised.value.detail == "missing required fields: awaiting_continuation, request_details"
+    assert "padding" not in raised.value.detail
+    assert "untrusted" not in raised.value.detail
+
+
+def test_prompt_examples_and_output_shape_match_provider_schema(db, scripted_llm):
+    planner = PlannerService(db, scripted_llm([]))
+    call = start_call(planner.calls)
+    order = planner._order(call.order_id)
+    slots = planner._slots(order.id)
+    schema = _planner_schema()
+    context = json.loads(planner._user_prompt(call, order, slots, AgentTurnRequest(text="Hello")))
+    required = set(schema["required"])
+    assert required == {
+        "action",
+        "awaiting_continuation",
+        "request_details",
+        "missing_fields",
+        "message",
+        "proposal",
+        "escalation_reason",
+        "confidence",
+    }
+    for field in required:
+        assert field in PLANNER_OUTPUT_SHAPE
+
+    proposal_schema = schema["$defs"]["PlanProposal"]["properties"]
+    step_schema = schema["$defs"]["PlanStep"]["properties"]
+    for example in context["decision_examples"]:
+        decision = example["decision"]
+        assert set(decision) == required
+        assert PlannerDecision.model_validate(decision)
+        proposal = decision.get("proposal")
+        if proposal is None:
+            continue
+        assert set(proposal) == set(proposal_schema)
+        for step in (proposal["primary"], proposal.get("fallback")):
+            if isinstance(step, dict):
+                assert set(step) == set(step_schema)
+                for field in ("window_start", "window_end"):
+                    if isinstance(step.get(field), str):
+                        assert step[field].endswith("+05:30")
+
+
 def test_strict_schema_requires_every_object_property():
     schema = make_strict_json_schema(PlannerDecision)
 
@@ -198,7 +329,7 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     def handler(request):
         payload = json.loads(request.content)
         assert str(request.url) == "https://api.groq.com/openai/v1/chat/completions"
-        assert payload["model"] == "openai/gpt-oss-20b"
+        assert payload["model"] == "openai/gpt-oss-120b"
         assert payload["reasoning_effort"] == "low"
         assert "chat_template_kwargs" not in payload
         assert payload["response_format"]["json_schema"]["schema"] == schema
@@ -214,7 +345,7 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     async def run():
         client = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1/",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -278,7 +409,7 @@ def test_removed_providers_are_rejected(provider):
 def test_groq_key_cannot_be_sent_to_another_provider(url):
     config = Settings(
         _env_file=None, llm_provider="groq", groq_api_key="test-groq-key",
-        llm_base_url=url, llm_model="openai/gpt-oss-20b",
+        llm_base_url=url, llm_model="openai/gpt-oss-120b",
     )
     with pytest.raises(ValueError, match="Groq base URL"):
         build_llm_client(config)
@@ -306,7 +437,7 @@ def test_groq_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
     async def run():
         llm = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:
@@ -341,7 +472,7 @@ def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
     async def run():
         llm = OpenAICompatibleClient(
             base_url="https://api.groq.com/openai/v1",
-            api_key="test-groq-key", model="openai/gpt-oss-20b",
+            api_key="test-groq-key", model="openai/gpt-oss-120b",
             transport=httpx.MockTransport(handler),
         )
         try:

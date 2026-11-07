@@ -290,6 +290,12 @@ class VoiceTurnService:
             planner=planner_response.planner,
             timings=VoiceTimings(stt_ms=stt_ms, planner_ms=planner_ms),
         )
+        if response.planner.awaiting_continuation:
+            # The same planner call judges sentence completeness. Give the
+            # customer space to finish; realtime cancellation stops this wait
+            # before any clarification text/audio is sent. The already stored
+            # customer turn remains context, never a committed delivery action.
+            await asyncio.sleep(2.0)
         if turn_sink is not None:
             await turn_sink(response)
 

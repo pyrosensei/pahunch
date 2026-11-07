@@ -94,6 +94,39 @@ def response_language(text: str) -> str:
     return "en-IN"
 
 
+def conversation_language(text: str, previous: str = "hi-IN") -> str:
+    """Keep acknowledgements and brief Hindi replies in the established language."""
+    if re.fullmatch(r"\s*(?:please\s+)?(?:speak|reply|continue|talk)(?: to me)?(?: in)? english[.!?\s]*", text, re.IGNORECASE):
+        return "en-IN"
+    if re.fullmatch(r"\s*(?:please\s+)?(?:hindi mein (?:bolo|boliye|baat karo)|हिंदी में (?:बोलिए|बोलो|बात करें))[.!?।\s]*", text, re.IGNORECASE):
+        return "hi-IN"
+    normalized = " ".join(text.casefold().split()).strip(".!?। ")
+    acknowledgements = {
+        "yes", "yeah", "okay", "ok", "haan", "han", "ha", "ji", "theek hai",
+        "हाँ", "हां", "हा", "जी", "ठीक", "ठीक है", "नमस्ते", "namaste",
+    }
+    if normalized in acknowledgements:
+        return previous
+    words = re.findall(r"[a-z]+", text.casefold())
+    hindi_words = re.findall(r"[\u0900-\u097f]+", text)
+    if hindi_words and not words and len(hindi_words) <= 2:
+        return previous
+    if hindi_words:
+        # One borrowed word must not change a whole conversation. Substantial
+        # evidence in both scripts represents mixed speech, not pure Hindi.
+        if len(hindi_words) == 1 and len(words) >= 3:
+            return "en-IN"
+        if len(words) >= 3 and len(words) >= len(hindi_words) / 2:
+            return "hi-en"
+        return "hi-IN"
+    cues = sum(w in _HINGLISH_WORDS for w in words)
+    if cues >= 2 and cues / max(len(words), 1) >= 0.15:
+        return "hi-en"
+    if cues and len(words) <= 3:
+        return previous
+    return "en-IN"
+
+
 def language_matches(text: str, language: str) -> bool:
     if language == "hi-IN":
         return bool(_HINDI.search(text))
@@ -238,13 +271,20 @@ FACT_TEMPLATES = {
 }
 
 
-def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False):
+def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False, source_text: str = "", clarification: bool = False, relax_language: bool = False):
     compact = " ".join(unicodedata.normalize("NFKC", message).split())
     if not compact:
         return "EMPTY_MESSAGE"
     if len(compact) > 280:
         return "MESSAGE_TOO_LONG"
-    if OTP_WORD.search(compact) or _UNSAFE.search(compact):
+    checked = compact
+    if clarification:
+        checked = re.sub(r"\{(?:order_window|recipient|recipient_address)\}", "", checked)
+    if source_text and not proposal:
+        numbers = re.findall(r"\d+", compact)
+        if numbers and all(n in re.findall(r"\d+", source_text) for n in numbers):
+            checked = re.sub(r"\d+", "", compact)
+    if OTP_WORD.search(compact) or _UNSAFE.search(checked):
         return "UNSAFE_WORDING"
     if proposal:
         if compact.count("{plan_summary}") != 1 or compact.count("{confirmation_question}") != 1:
@@ -257,9 +297,9 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
         if compact not in [f"{p} {PLAN_PLACEHOLDERS}".strip() for p in WRAPPER_PREFIXES[language]]:
             return "UNRECOGNIZED_WRAPPER"
     else:
-        if "{" in compact or "}" in compact:
+        if "{" in checked or "}" in checked:
             return "INVALID_PLACEHOLDERS"
-        if not language_matches(compact, language):
+        if not relax_language and not language_matches(compact, language):
             return "LANGUAGE_MISMATCH"
         if respond and _RESPONSE_ACTION.search(compact):
             return "UNSAFE_WORDING"

@@ -30,6 +30,23 @@ SLOT_ACTIONS = {
 }
 
 
+class CustomerEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    turn_id: int | None = None  # null refers to the current customer utterance
+    quote: str = Field(min_length=1, max_length=2_000)
+
+
+class RequestDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    time_source: CustomerEvidence | None = None
+    recipient_source: CustomerEvidence | None = None
+    recipient_address_source: CustomerEvidence | None = None
+    action: Literal["UNSPECIFIED", "HAND_TO_CUSTOMER", "LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY", "RESCHEDULE"] = "UNSPECIFIED"
+    call_on_arrival: bool = True
+
+
 class PlanStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -40,6 +57,9 @@ class PlanStep(BaseModel):
     delay_minutes: int | None = Field(default=None, ge=1, le=120)
     max_retries: int = Field(default=0, ge=0, le=2)
     named_recipient: str | None = Field(default=None, max_length=80)
+    recipient_address: str | None = Field(default=None, max_length=80)
+    recipient_source: CustomerEvidence | None = None
+    recipient_address_source: CustomerEvidence | None = None
     notes: str | None = Field(default=None, max_length=300)
 
     @model_validator(mode="after")
@@ -72,6 +92,9 @@ class PlannerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PlannerAction
+    awaiting_continuation: bool = False
+    request_details: RequestDetails | None = None
+    missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "other"]] = Field(default_factory=list, max_length=6)
     message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
@@ -79,6 +102,8 @@ class PlannerDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_fields(self):
+        if self.awaiting_continuation and self.action != PlannerAction.ASK_CLARIFICATION:
+            raise ValueError("Only a clarification may wait for continued speech")
         if self.action == PlannerAction.PROPOSE_PLAN and self.proposal is None:
             raise ValueError("PROPOSE_PLAN requires a proposal")
         if self.action != PlannerAction.PROPOSE_PLAN and self.proposal is not None:
@@ -143,6 +168,10 @@ class AgentTurnRequest(BaseModel):
 
 
 class PlannerMeta(BaseModel):
+    language_warning: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    review_needed: bool = False
+    awaiting_continuation: bool = False
     model: str
     action: PlannerAction | None = None
     confidence: float | None = None

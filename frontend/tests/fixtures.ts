@@ -35,6 +35,7 @@ export const planner = {
   model: 'mock-planner', action: 'RESPOND', confidence: 0.95, latency_ms: 20,
   prompt_tokens: 100, completion_tokens: 10, degraded: false, error_code: null,
   response_language: 'en-IN', wording_source: 'model', fallback_reason: null,
+  review_needed: false, missing_fields: [], language_warning: null, awaiting_continuation: false,
 };
 
 export async function mockApi(page: Page, options: {

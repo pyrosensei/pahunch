@@ -17,3 +17,7 @@ frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
 *.tsbuildinfo
+
+# Keep local review and instruction documents out of Git.
+*.[mM][dD]
+!/README.md

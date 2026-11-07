@@ -9,6 +9,7 @@ const staticDir = path.join(__dirname, '../static');
 function worklet() {
   let Player;
   const context = vm.createContext({
+    sampleRate: 16000,
     AudioWorkletProcessor: class {
       constructor() { this.port = { sent: [], postMessage(e) { this.sent.push(e); } }; }
     },
@@ -29,12 +30,14 @@ test('queue underrun cannot signal playback completion before generation end', (
   const { player, send, tick } = worklet();
   send({ type: 'begin', generation_id: 1 });
   send({ type: 'pcm', generation_id: 1, samples: new Float32Array([0.5]) });
-  assert.equal(tick()[0], 0.5);
+  assert.equal(tick()[0], 0);
   tick();
   assert.equal(player.port.sent.length, 0);
   send({ type: 'pcm', generation_id: 1, samples: new Float32Array([0.25]) });
   send({ type: 'end', generation_id: 1 });
-  assert.equal(tick()[0], 0.25);
+  const played = tick();
+  assert.equal(played[0], 0.5);
+  assert.equal(played[1], 0.25);
   tick();
   assert.equal(player.port.sent.length, 1);
   assert.equal(player.port.sent[0].type, 'drained');
@@ -310,4 +313,25 @@ test('expired scheduled call cannot open a voice socket after failed answer', as
   await app.startCall(1042);
   assert.equal(sockets.length, 0);
   assert.equal(app.state.connecting, false);
+});
+
+
+test('playback buffers jitter, reports starvation once and drains a short final tail', () => {
+  const { player, send, tick } = worklet();
+  send({ type: 'begin', generation_id: 1 });
+  send({ type: 'pcm', generation_id: 1, samples: new Float32Array(1600).fill(0.5) });
+  for (let i = 0; i < 6; i++) assert.equal(tick()[0], 0);
+  send({ type: 'pcm', generation_id: 1, samples: new Float32Array(1600).fill(0.5) });
+  assert.equal(tick()[0], 0.5);
+  for (let i = 0; i < 24; i++) tick();
+  assert.equal(player.port.sent.filter(e => e.type === 'underrun').length, 1);
+  for (let i = 0; i < 20; i++) tick();
+  assert.equal(player.port.sent.length, 1);
+  send({ type: 'pcm', generation_id: 1, samples: new Float32Array(100).fill(0.5) });
+  assert.equal(tick()[0], 0);
+  send({ type: 'end', generation_id: 1 });
+  const tail = tick();
+  assert.equal(tail[0], 0);
+  assert(tail[79] > 0.45);
+  assert.equal(player.port.sent.at(-1).type, 'drained');
 });

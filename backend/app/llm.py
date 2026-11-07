@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal, Protocol
@@ -10,9 +12,16 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.http_pool import HttpClientPool
 
+_PROVIDER_ERROR_TEXT_LIMIT = 2_000
+_MISSING_PROPERTIES = re.compile(r"missing properties:\s*(.+)", re.IGNORECASE)
+_FIELD_NAME = re.compile(r"[^A-Za-z0-9_]")
+
 
 class LLMGatewayError(Exception):
-    pass
+    def __init__(self, message, *, status_code=None, category="gateway"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.category = category
 
 
 class LLMTimeoutError(LLMGatewayError):
@@ -21,6 +30,14 @@ class LLMTimeoutError(LLMGatewayError):
 
 class LLMResponseError(LLMGatewayError):
     pass
+
+
+class LLMStructuredOutputError(LLMResponseError):
+    """The provider rejected generated JSON against the requested strict schema."""
+
+    def __init__(self, message: str, *, detail: str | None = None):
+        super().__init__(message, status_code=400, category="structured_output")
+        self.detail = detail or "generated JSON failed provider schema validation"
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,54 @@ def _strip_code_fence(text: str) -> str:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
     return "\n".join(lines).strip()
+
+
+def _structured_output_detail(message: object) -> str:
+    fallback = "generated JSON failed provider schema validation"
+    if not isinstance(message, str):
+        return fallback
+    match = _MISSING_PROPERTIES.search(message[:_PROVIDER_ERROR_TEXT_LIMIT])
+    if match is None:
+        return fallback
+    fields = []
+    for quoted in re.findall(r"'([^']+)'", match.group(1)):
+        field = _FIELD_NAME.sub("", quoted)
+        if field and field not in fields:
+            fields.append(field)
+    return f"missing required fields: {', '.join(fields[:10])}" if fields else fallback
+
+
+def _provider_http_error(status_code: int, text: str) -> LLMGatewayError:
+    data: object = None
+    try:
+        # Truncating first would turn a recoverable provider error into invalid JSON.
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    error = data.get("error") if isinstance(data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    message = error.get("message") if isinstance(error, dict) else error
+
+    if status_code == 400 and code == "json_validate_failed":
+        return LLMStructuredOutputError(
+            "LLM provider rejected generated structured output",
+            detail=_structured_output_detail(message),
+        )
+    if status_code in {401, 403}:
+        category = "access"
+    elif status_code == 429:
+        category = "rate_limit"
+    elif status_code == 400:
+        category = "invalid_request"
+    elif status_code >= 500:
+        category = "provider"
+    else:
+        category = "http"
+    return LLMResponseError(
+        f"LLM provider returned HTTP {status_code}",
+        status_code=status_code,
+        category=category,
+    )
 
 
 class OpenAICompatibleClient:
@@ -164,19 +229,19 @@ class OpenAICompatibleClient:
         except httpx.TimeoutException as error:
             raise LLMTimeoutError("LLM provider timed out") from error
         except httpx.HTTPError as error:
-            raise LLMGatewayError("LLM provider request failed") from error
+            raise LLMGatewayError("LLM provider request failed", category="transport") from error
 
         if response.status_code >= 400:
-            raise LLMResponseError(f"LLM provider returned HTTP {response.status_code}")
+            raise _provider_http_error(response.status_code, response.text)
 
         try:
             data = response.json()
             message = data["choices"][0]["message"]
             content = message["content"]
         except (ValueError, KeyError, IndexError, TypeError) as error:
-            raise LLMResponseError("LLM provider returned an unexpected response") from error
+            raise LLMResponseError("LLM provider returned an unexpected response", category="invalid_response") from error
         if not isinstance(content, str) or not content.strip():
-            raise LLMResponseError("LLM provider returned empty structured output")
+            raise LLMResponseError("LLM provider returned empty structured output", category="empty_output")
 
         usage = data.get("usage") if isinstance(data, dict) else None
         usage = usage if isinstance(usage, dict) else {}

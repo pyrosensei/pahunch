@@ -8,7 +8,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.calls import CallService
 from app.errors import DomainError
-from app.llm import LLMTimeoutError
+from app.llm import LLMCompletion, LLMStructuredOutputError, LLMTimeoutError
 from app.models import (
     AuditEvent,
     CallState,
@@ -341,7 +341,7 @@ def test_unsafe_clarification_message_is_replaced(db, scripted_llm):
     assert result.state == CallState.DISCOVERY.value
     assert "OTP" not in result.agent_message
     assert "done" not in result.agent_message.lower()
-    assert "scheduled time" in result.agent_message
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
     assert "samajh nahi aaya" not in result.agent_message
 
 
@@ -446,8 +446,118 @@ def test_failed_repair_degrades_safely(db, scripted_llm):
     assert result.planner.degraded is True
     assert result.planner.error_code == "LLM_INVALID_OUTPUT"
     assert result.turn.verdict is None
-    assert "scheduled time" in result.agent_message
+    assert result.planner.fallback_reason == "LLM_INVALID_OUTPUT"
     assert "samajh nahi aaya" not in result.agent_message
+
+
+def test_provider_structured_output_failure_is_repaired_once(db, scripted_llm):
+    llm = scripted_llm(
+        [
+            LLMStructuredOutputError(
+                "provider rejected output",
+                detail="missing required fields: awaiting_continuation",
+            ),
+            decision(
+                PlannerAction.PROPOSE_PLAN,
+                "{plan_summary} {confirmation_question}",
+                proposal=valid_proposal(),
+            ),
+        ]
+    )
+    planner = PlannerService(db, llm)
+    call = start_call(planner.calls)
+
+    result = run(planner, call.id, "6 se 8 baje direct de dena")
+
+    assert result.planner.degraded is False
+    assert result.planner.error_code is None
+    assert result.planner.action == PlannerAction.PROPOSE_PLAN
+    assert result.turn.verdict is not None and result.turn.verdict.valid
+    assert result.turn.turn_count == 1
+    assert len(llm.requests) == 2
+    assert "The provider rejected the generated JSON" in llm.requests[1]["user_prompt"]
+    events = [
+        json.loads(event.payload_json)
+        for event in db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all()
+        if event.event_type == "LLM_REPAIR"
+    ]
+    assert any(payload.get("detail") == "missing required fields: awaiting_continuation" for payload in events)
+    assert any(payload.get("detail") == "provider repair succeeded" for payload in events)
+    failures = [
+        json.loads(event.payload_json)
+        for event in db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all()
+        if event.event_type == "LLM_PROVIDER_FAILURE"
+    ]
+    assert not failures
+
+
+def test_provider_structured_output_repair_failure_degrades_without_third_request(db, scripted_llm):
+    llm = scripted_llm(
+        [
+            LLMStructuredOutputError("provider rejected output", detail="missing required fields: message"),
+            LLMStructuredOutputError("provider rejected repair", detail="missing required fields: action"),
+        ]
+    )
+    planner = PlannerService(db, llm)
+    call = start_call(planner.calls)
+
+    result = run(planner, call.id, "6 se 8 baje direct de dena")
+
+    assert len(llm.requests) == 2
+    assert result.planner.degraded is True
+    assert result.planner.error_code == "LLM_STRUCTURED_OUTPUT"
+    assert result.planner.wording_source == "template"
+    assert result.turn.verdict is None
+    assert not result.turn.customer_confirmed
+    assert planner.calls.get_call(call.id).current_proposal_id is None
+    failure = [
+        json.loads(event.payload_json)
+        for event in db.exec(
+            select(AuditEvent).where(
+                AuditEvent.session_id == call.id,
+                AuditEvent.event_type == "LLM_PROVIDER_FAILURE",
+            )
+        ).all()
+    ][-1]
+    assert failure["category"] == "structured_output"
+    assert failure["status_code"] == 400
+    assert failure["detail"] == "missing required fields: action"
+
+
+def test_cancellation_during_structured_output_repair_leaves_no_stale_turn(db):
+    class HeldRepair:
+        model_name = "held-structured-repair"
+
+        def __init__(self):
+            self.requests = 0
+            self.repair_entered = asyncio.Event()
+
+        async def complete_json(self, **kwargs):
+            self.requests += 1
+            if self.requests == 1:
+                raise LLMStructuredOutputError("provider rejected output", detail="missing required fields: action")
+            self.repair_entered.set()
+            await asyncio.Event().wait()
+            return LLMCompletion(text="{}", model=self.model_name, latency_ms=1)
+
+    async def run_async():
+        llm = HeldRepair()
+        planner = PlannerService(db, llm)
+        call = start_call(planner.calls)
+        task = asyncio.create_task(
+            planner.handle_turn(call.id, AgentTurnRequest(text="6 se 8 baje direct de dena"))
+        )
+        await asyncio.wait_for(llm.repair_entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        db.expire_all()
+        current = planner.calls.get_call(call.id)
+        assert llm.requests == 2
+        assert current.turn_count == 0
+        assert current.current_proposal_id is None
+
+    asyncio.run(run_async())
 
 
 def test_planner_schema_omits_unconsumed_descriptive_fields():
@@ -538,7 +648,7 @@ def test_changed_window_is_normalized_to_reschedule(db, scripted_llm):
     record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
     stored = json.loads(record.proposal_json)
     assert stored["primary"]["action"] == "RESCHEDULE"
-    assert "reschedule" in result.agent_message
+    assert "Delivery ka naya time" in result.agent_message
     events = list(db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all())
     assert any(event.event_type == "PLAN_NORMALIZED" for event in events)
 
@@ -664,3 +774,17 @@ def test_confirmation_after_plan_offer_still_confirms(db, scripted_llm):
     assert result.planner.model == "rules:explicit-confirmation"
     assert result.planner.error_code is None
     assert result.turn.customer_confirmed is True
+
+
+def test_audio_complaint_reaches_model_with_observations_and_natural_wording(db, scripted_llm):
+    calls = CallService(db)
+    call = start_call(calls)
+    calls._audit(call.id, "BROWSER_PLAYBACK_UNDERRUN", {"generation_id": 1, "source": "browser_report"})
+    db.commit()
+    llm = scripted_llm([decision(PlannerAction.RESPOND, "My playback seems to have paused. I am calling about your delivery.")])
+    result = run(PlannerService(db, llm), call.id, "I cannot hear your voice")
+    assert result.planner.wording_source == "model"
+    assert result.agent_message == "My playback seems to have paused. I am calling about your delivery."
+    context = json.loads(llm.requests[0]["user_prompt"])
+    assert context["customer_utterance"] == "I cannot hear your voice"
+    assert context["communication_observations"]["earlier_events"][-1]["event"] == "BROWSER_PLAYBACK_UNDERRUN"

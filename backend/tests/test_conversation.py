@@ -6,7 +6,7 @@ from test_planner import db as planner_database
 from test_planner import run, start_call, valid_proposal
 
 from app.calls import MAX_CLARIFICATIONS, MAX_TURNS
-from app.language import phrase
+from app.language import conversation_language, phrase
 from app.llm import LLMTimeoutError
 from app.models import PlanProposalRecord, Turn
 from app.planner import PlannerService
@@ -30,7 +30,7 @@ def reply(action, message, proposal=None, confidence=0.95):
     [
         ("Hello", "greeting", "en-IN"),
         ("नमस्ते", "greeting", "hi-IN"),
-        ("Namaste", "greeting", "hi-en"),
+        ("Namaste", "greeting", "hi-IN"),
         ("Can you hear me?", "heard", "en-IN"),
     ],
 )
@@ -44,6 +44,29 @@ def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
     assert result.planner.wording_source == "template"
     assert result.planner.fallback_reason == "UNSAFE_WORDING"
     assert result.turn.verdict is None
+
+
+@pytest.mark.parametrize(
+    "text,previous,expected",
+    [
+        ("Hello", "hi-IN", "en-IN"),
+        ("Hello", "en-IN", "en-IN"),
+        ("yes", "hi-IN", "hi-IN"),
+        ("I would like to receive the parcel tomorrow ji", "en-IN", "en-IN"),
+        ("I can receive the parcel tomorrow जी", "en-IN", "en-IN"),
+        ("मैं available नहीं हूं please deliver tomorrow evening", "hi-IN", "hi-en"),
+        ("Haan mujhe kal parcel de dena", "en-IN", "hi-en"),
+        ("हाँ", "en-IN", "en-IN"),
+        ("okay", "en-IN", "en-IN"),
+        ("ठीक है", "en-IN", "en-IN"),
+        ("Cancel delivery", "hi-IN", "en-IN"),
+        ("Please tell me the delivery details", "hi-IN", "en-IN"),
+        ("मुझे डिलीवरी का समय बताइए", "en-IN", "hi-IN"),
+        ("मैंने अभी order किया, order और delivery date अलग होगी ना?", "hi-IN", "hi-en"),
+    ],
+)
+def test_conversation_language_uses_context_without_short_turn_flip(text, previous, expected):
+    assert conversation_language(text, previous) == expected
 
 
 def test_action_examples_use_current_order_facts_and_provider_output_shape(db, scripted_llm):
@@ -65,7 +88,7 @@ def test_action_examples_use_current_order_facts_and_provider_output_shape(db, s
             assert set(item["decision"]["proposal"]) == {"primary", "fallback"}
             assert "notes" not in item["decision"]["proposal"]["primary"]
             assert decision.message in context["proposal_wording_templates"]
-    assert actions == ["PROPOSE_PLAN", "PROPOSE_PLAN", "RESPOND", "RESPOND"]
+    assert actions == ["PROPOSE_PLAN", "PROPOSE_PLAN", "RESPOND"]
 
 
 @pytest.mark.parametrize("text", ["What is my delivery window?", "डिलीवरी कब आएगी?", "Delivery kab hai?"])
@@ -282,7 +305,7 @@ def test_rejected_plan_cannot_be_reoffered_unchanged(db, scripted_llm):
     assert any(e.event_type == "PLAN_REJECTED" for e in planner.calls.list_events(call.id))
 
 
-def test_clarification_limit_exits_with_terminal_wording(db, scripted_llm):
+def test_clarification_limit_keeps_session_recoverable(db, scripted_llm):
     planner = PlannerService(
         db,
         scripted_llm(
@@ -293,10 +316,9 @@ def test_clarification_limit_exits_with_terminal_wording(db, scripted_llm):
     call = start_call(planner.calls)
     for _ in range(MAX_CLARIFICATIONS + 1):
         result = run(planner, call.id, "I am unsure")
-    assert result.state == "ESCALATED"
-    assert result.planner.wording_source == "template"
-    assert result.planner.fallback_reason == "ESCALATED"
-    assert "human" in result.agent_message.lower()
+    assert result.state == "DISCOVERY"
+    assert result.planner.review_needed
+    assert "human" not in result.agent_message.lower()
 
 
 def test_turn_limit_does_not_speak_another_plan_offer(db, scripted_llm):
@@ -433,7 +455,12 @@ def test_unknown_named_recipient_is_not_persisted(db, scripted_llm):
 
 def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scripted_llm):
     proposal = valid_proposal()
-    proposal["primary"].update(action="LEAVE_WITH_NEIGHBOR", named_recipient="Sharma ji")
+    proposal["primary"].update(
+        action="LEAVE_WITH_NEIGHBOR",
+        named_recipient="Sharma ji",
+        window_start="2026-11-05T14:00:00+05:30",
+        window_end="2026-11-05T16:00:00+05:30",
+    )
     planner = PlannerService(
         db,
         scripted_llm(
@@ -445,7 +472,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
     assert result.turn.verdict.valid
     assert result.planner.wording_source == "model"
     assert "Sharma ji" in result.agent_message
-    assert "18:00-20:00" in result.agent_message
+    assert "14:00-16:00" in result.agent_message
 
 
 def test_recipient_text_cannot_insert_an_otp_request_into_server_wording(db, scripted_llm):
@@ -460,3 +487,23 @@ def test_recipient_text_cannot_insert_an_otp_request_into_server_wording(db, scr
     assert result.planner.wording_source == "template"
     assert "Your OTP please" not in result.agent_message
     assert db.exec(select(PlanProposalRecord)).first() is None
+
+
+def test_continuation_flag_cannot_be_used_to_delay_an_action():
+    from pydantic import ValidationError
+    value = reply("PROPOSE_PLAN", "{plan_summary} {confirmation_question}", valid_proposal())
+    value["awaiting_continuation"] = True
+    with pytest.raises(ValidationError, match="Only a clarification"):
+        PlannerDecision.model_validate(value)
+
+
+def test_unfinished_customer_detail_is_marked_without_saving_a_plan(db, scripted_llm):
+    value = reply("ASK_CLARIFICATION", "What is your neighbour's complete house number?")
+    value["awaiting_continuation"] = True
+    planner = PlannerService(db, scripted_llm([value]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "My neighbour lives at house number four zero")
+    assert result.planner.awaiting_continuation
+    assert result.planner.wording_source == "model"
+    assert not result.turn.customer_confirmed
+    assert planner.calls.get_call(call.id).current_proposal_id is None

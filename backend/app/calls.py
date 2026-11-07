@@ -348,7 +348,7 @@ class CallService:
 
     @_call_mutation
     def submit_turn(
-        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False
+        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False, clarification_key: str = "other"
     ) -> TurnResult:
         call = self.get_call(session_id)
         if call.state in TERMINAL_STATES:
@@ -388,10 +388,16 @@ class CallService:
             self._escalate(call, request.escalation_reason)
         else:
             if clarification:
+                previous = self.db.exec(select(AuditEvent).where(
+                    AuditEvent.session_id == call.id,
+                    AuditEvent.event_type == "CLARIFICATION_REQUESTED",
+                ).order_by(AuditEvent.id.desc())).first()
+                if previous and json.loads(previous.payload_json).get("key", "other") != clarification_key:
+                    call.clarification_count = 0
                 call.clarification_count += 1
-                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count})
+                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count, "key": clarification_key})
                 if call.clarification_count > MAX_CLARIFICATIONS:
-                    self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
+                    self._audit(call.id, "CLARIFICATION_REVIEW_NEEDED", {"count": call.clarification_count, "key": clarification_key})
             if request.proposal is not None:
                 require_tool(call.state, ToolName.PROPOSE_PLAN)
                 order = self._order(call.order_id)
@@ -401,11 +407,18 @@ class CallService:
                     ).all()
                 )
                 verdict = validate_plan(request.proposal, order, slots)
+                source_ids = {turn.id}
+                for step in (request.proposal.primary, request.proposal.fallback):
+                    if step is None:
+                        continue
+                    for evidence in (step.recipient_source, step.recipient_address_source):
+                        if evidence is not None and evidence.turn_id is not None:
+                            source_ids.add(evidence.turn_id)
                 proposal_record = PlanProposalRecord(
                     id=uuid4().hex,
                     session_id=call.id,
                     proposal_json=request.proposal.model_dump_json(),
-                    source_turn_ids_json=json.dumps([turn.id]),
+                    source_turn_ids_json=json.dumps(sorted(source_ids)),
                     created_at=self.clock(),
                 )
                 self.db.add(proposal_record)
@@ -433,13 +446,14 @@ class CallService:
                 )
 
                 if verdict.valid:
+                    call.clarification_count = 0
                     if call.state != CallState.PENDING_CONFIRMATION:
                         self._transition(call, CallState.PENDING_CONFIRMATION)
                 else:
                     call.clarification_count += 1
                     if call.clarification_count > MAX_CLARIFICATIONS:
-                        self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
-                    elif call.state != CallState.NEGOTIATION:
+                        self._audit(call.id, "CLARIFICATION_REVIEW_NEEDED", {"count": call.clarification_count})
+                    if call.state != CallState.NEGOTIATION:
                         self._transition(call, CallState.NEGOTIATION)
 
             if request.confirmation:
@@ -548,7 +562,7 @@ class CallService:
         instructions = {
             PlanAction.HAND_TO_CUSTOMER: "Direct handoff to customer",
             PlanAction.LEAVE_WITH_SECURITY: "Leave with building security",
-            PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {primary.named_recipient}",
+            PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {primary.named_recipient}" + (f", {primary.recipient_address}" if primary.recipient_address else ""),
             PlanAction.RESCHEDULE: "Delivery rescheduled to the confirmed window",
             PlanAction.RETRY_AFTER_DELAY: "Retry after the confirmed delay",
             PlanAction.ESCALATE_TO_HUMAN: "Human review required",
@@ -557,7 +571,7 @@ class CallService:
         if primary.call_on_arrival:
             lines.append("Call customer on arrival")
         if order.requires_otp:
-            lines.append("Collect OTP; do not leave with security or a neighbour")
+            lines.append("Courier must verify OTP directly with the customer before handoff, including to an authorized named neighbour. If customer cannot be reached or verification fails, do not hand over; arrange the next available delivery. Never collect OTP through the AI assistant.")
         if order.payment_mode == PaymentMode.COD:
             lines.append("Collect cash on delivery")
         if proposal.fallback is not None:
@@ -568,7 +582,16 @@ class CallService:
                     f"maximum {fallback.max_retries} retry"
                 )
             else:
-                lines.append(f"Fallback: {fallback.action.value}")
+                fallback_instruction = {
+                    PlanAction.HAND_TO_CUSTOMER: "Direct handoff to customer",
+                    PlanAction.LEAVE_WITH_SECURITY: "Leave with building security",
+                    PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {fallback.named_recipient}" + (f", {fallback.recipient_address}" if fallback.recipient_address else ""),
+                    PlanAction.RESCHEDULE: "Deliver in the confirmed fallback window",
+                    PlanAction.ESCALATE_TO_HUMAN: "Human review required",
+                }[fallback.action]
+                lines.append(f"Fallback: {fallback_instruction}")
+                if fallback.call_on_arrival:
+                    lines.append("Fallback: call customer on arrival")
         return CourierCard(
             order_id=order.id,
             action=primary.action,
