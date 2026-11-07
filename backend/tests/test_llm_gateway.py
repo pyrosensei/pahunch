@@ -11,6 +11,7 @@ from test_planner import start_call, valid_proposal
 from app.config import Settings
 from app.errors import DomainError
 from app.llm import (
+    GeminiClient,
     LLMGatewayError,
     LLMResponseError,
     LLMStructuredOutputError,
@@ -358,22 +359,24 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     asyncio.run(run())
 
 
-def test_builder_uses_only_groq_credentials():
+def test_builder_uses_only_google_credentials():
     config = Settings(
-        _env_file=None, groq_api_key="test-groq-key", llm_api_key="test-old-key",
-        gemini_api_key="test-old-key",
+        _env_file=None, gemini_api_key="test-google-key", llm_api_key="test-old-key",
+        groq_api_key="test-old-key",
     )
     client = build_llm_client(config)
     assert client is not None
-    assert "test-groq-key" not in repr(config)
+    assert isinstance(client, GeminiClient)
+    assert "test-google-key" not in repr(config)
 
     def handler(request):
-        assert request.headers["authorization"] == "Bearer test-groq-key"
+        assert request.headers["x-goog-api-key"] == "test-google-key"
         payload = json.loads(request.content)
-        assert payload["reasoning_effort"] == "low"
-        assert payload["include_reasoning"] is False
-        assert "chat_template_kwargs" not in payload
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+        assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+        assert "reasoning_effort" not in payload
+        return httpx.Response(200, json={"candidates": [{
+            "finishReason": "STOP", "content": {"parts": [{"text": "{}"}]},
+        }]})
 
     client._pool._transport = httpx.MockTransport(handler)
 
@@ -386,15 +389,15 @@ def test_builder_uses_only_groq_credentials():
     asyncio.run(run())
 
 
-def test_missing_groq_key_does_not_fall_back_to_removed_credentials():
+def test_missing_google_key_does_not_fall_back_to_removed_credentials():
     config = Settings(
-        _env_file=None, groq_api_key="", llm_api_key="test-old-key",
-        gemini_api_key="test-old-key", nvidia_api_key="test-old-key",
+        _env_file=None, gemini_api_key="", llm_api_key="test-old-key",
+        groq_api_key="test-old-key", nvidia_api_key="test-old-key",
     )
     assert build_llm_client(config) is None
 
 
-@pytest.mark.parametrize("provider", ["nim", "gemini"])
+@pytest.mark.parametrize("provider", ["nim", "groq"])
 def test_removed_providers_are_rejected(provider):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, llm_provider=provider)
@@ -402,16 +405,16 @@ def test_removed_providers_are_rejected(provider):
 
 @pytest.mark.parametrize("url", [
     "https://integrate.api.nvidia.com/v1",
-    "https://generativelanguage.googleapis.com/v1beta/openai",
-    "http://api.groq.com/openai/v1",
-    "https://api.groq.com.example/openai/v1",
+    "https://api.groq.com/openai/v1",
+    "http://generativelanguage.googleapis.com/v1beta",
+    "https://generativelanguage.googleapis.com.example/v1beta",
 ])
-def test_groq_key_cannot_be_sent_to_another_provider(url):
+def test_google_key_cannot_be_sent_to_another_provider(url):
     config = Settings(
-        _env_file=None, llm_provider="groq", groq_api_key="test-groq-key",
-        llm_base_url=url, llm_model="openai/gpt-oss-120b",
+        _env_file=None, llm_provider="gemini", gemini_api_key="test-google-key",
+        llm_base_url=url, llm_model="gemini-3.1-flash-lite",
     )
-    with pytest.raises(ValueError, match="Groq base URL"):
+    with pytest.raises(ValueError, match="Gemini base URL"):
         build_llm_client(config)
 
 
@@ -479,7 +482,7 @@ def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
             planner = PlannerService(db, llm)
             call = start_call(planner.calls, 1043)
             result = await planner.handle_turn(call.id, AgentTurnRequest(text="Please hand it to me"))
-            assert result.planner.error_code == "LLM_UNAVAILABLE"
+            assert result.planner.error_code == ("LLM_RATE_LIMIT" if status == 429 else "LLM_UNAVAILABLE")
             assert result.planner.wording_source == "template"
             assert not result.turn.customer_confirmed
             assert planner.calls.get_call(call.id).current_proposal_id is None

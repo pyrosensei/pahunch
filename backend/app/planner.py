@@ -1656,15 +1656,17 @@ class PlannerService:
             self.calls._audit(session_id, "LLM_PROVIDER_FAILURE", {"category": error.category, "status_code": error.status_code, "error_type": type(error).__name__})
             with ADMISSION_LOCK:
                 self._check_turn_context(session_id, context)
+                error_code = "LLM_RATE_LIMIT" if error.category == "rate_limit" else "LLM_UNAVAILABLE"
+                message = phrase("rate_limit") if error.category == "rate_limit" else SAFE_UNAVAILABLE_MESSAGE
                 return self._degraded_turn(
                     session_id,
                     request,
-                    error_code="LLM_UNAVAILABLE",
-                    message=SAFE_UNAVAILABLE_MESSAGE,
+                    error_code=error_code,
+                    message=message,
                     meta=PlannerMeta(
                         model=self.llm.model_name,
                         degraded=True,
-                        error_code="LLM_UNAVAILABLE",
+                        error_code=error_code,
                     ),
                 )
 

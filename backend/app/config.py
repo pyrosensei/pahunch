@@ -18,13 +18,14 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = "Shivani"
     gnani_tts_language: str = "hi-en"
     gnani_timeout_seconds: float = 30.0
-    llm_provider: Literal["groq"] = "groq"
-    groq_api_key: str = Field(default="", repr=False)
-    llm_base_url: str = "https://api.groq.com/openai/v1"
-    llm_model: str = "openai/gpt-oss-120b"
+    llm_provider: Literal["gemini"] = "gemini"
+    gemini_api_key: str = Field(default="", repr=False)
+    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    llm_model: str = "gemini-3.1-flash-lite"
     llm_timeout_seconds: float = 12.0
     llm_max_tokens: int = 1024
-    llm_temperature: float = 0.1
+    llm_temperature: float = 1.0
+    llm_thinking_level: Literal["minimal", "low", "medium", "high"] = "minimal"
     llm_structured_mode: Literal["json_schema", "json_object"] = "json_schema"
     planner_min_confidence: float = 0.65
     planner_min_transcript_confidence: float = 0.55

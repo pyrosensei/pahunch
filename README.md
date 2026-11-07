@@ -4,12 +4,12 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · Groq GPT-OSS 120B planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Google Gemini 3.1 Flash-Lite planner · FastAPI · SQLite
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![Groq](https://img.shields.io/badge/planner-Groq%20GPT--OSS%20120B-F55036.svg)](https://console.groq.com/docs/models)
+[![Gemini](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-4285F4.svg)](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
 [![Tests](https://img.shields.io/badge/tests-382%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Groq)          │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (Gemini)          │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (Groq, JSON Schema)        │  │
+       │                          │  │ Planner (Gemini, JSON Schema)        │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -470,8 +470,7 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
 **Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
-describe Groq performance. Current configuration checks are recorded separately in
-[the Groq configuration review](GROQ_REVIEW.md).
+describe the current Gemini configuration. Current provider and microphone acceptance remain pending.
 
 | Metric | Value |
 |---|---|
@@ -531,7 +530,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and a Groq API key
+- A Gnani API key (Prisma + Timbre) and a Google Gemini API key
 
 ### 1. Configure
 
@@ -544,23 +543,28 @@ Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
 GNANI_API_KEY=
-LLM_PROVIDER=groq
-GROQ_API_KEY=
-LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_MODEL=openai/gpt-oss-120b
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+LLM_MODEL=gemini-3.1-flash-lite
+LLM_THINKING_LEVEL=minimal
+LLM_TEMPERATURE=1.0
 LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
 
-The planner uses Groq's documented low reasoning effort and strict JSON Schema
-output. Reasoning text is excluded from responses. The completion budget includes
-reasoning tokens; it is a cap, not a requested response length. The backend still
-validates output, policy, wording and explicit confirmation.
+The planner uses Google's native `generateContent` endpoint with JSON Schema
+output and minimal thinking. The output-token budget includes thinking tokens.
+The backend validates the response, delivery policy, wording and explicit
+confirmation before saving a delivery commitment.
 
-Only `GROQ_API_KEY` is read for planning. Gemini and NVIDIA configuration and
-credential fallbacks have been removed. A missing Groq key leaves the planner
-unconfigured. Only the official Groq HTTPS endpoint is accepted. Gnani continues
-to handle speech recognition and synthesis.
+Set `GEMINI_API_KEY` in `backend/.env`. The connection uses the official Google
+HTTPS endpoint and authenticates with a header. A missing key leaves the planner
+unconfigured. Gnani handles speech recognition and synthesis.
+
+Check the active Gemini project's token/minute, request/minute and daily quotas
+in Google AI Studio before a live demo. HTTP 429 is exposed as `LLM_RATE_LIMIT`.
+A provider failure preserves the delivery state and returns a service message.
 
 `.env` is gitignored. Keys are never committed and never printed.
 
@@ -620,9 +624,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Groq** (`openai/gpt-oss-120b`) | Strict JSON Schema output, low reasoning effort, no credential fallback |
+| Planner | **Google Gemini** (`gemini-3.1-flash-lite`) | Native JSON Schema output, minimal thinking, server-side validation |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Groq checks are reported separately |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Gemini live acceptance is pending |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -647,7 +651,7 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Historical Groq validation:** earlier model/provider probes are not validation of the current GPT-OSS 120B configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Historical Groq validation:** earlier model/provider probes are not validation of the current Gemini configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
 - **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
@@ -763,7 +767,7 @@ earliest stored date. Legacy seeded examples retain their recorded availability.
 
 ### Conversation recovery
 
-The current planner is Groq GPT-OSS 120B. Short acknowledgements preserve the
+The current planner is Google Gemini 3.1 Flash-Lite. Short acknowledgements preserve the
 conversation language; substantial Hindi/English mixing selects Hinglish.
 The planner can mark an unfinished clarification with `awaiting_continuation`;
 voice output then waits up to two extra seconds, cancellable by resumed speech,

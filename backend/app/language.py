@@ -189,7 +189,8 @@ def redact_payload(value):
 MESSAGES = {
     "hi-en": {
         "unclear": "Aap scheduled time par parcel lenge, ya delivery ka doosra time chahiye?",
-        "unavailable": "Delivery plan ki jaanch abhi available nahi hai. Abhi koi badlav final nahi hua; aap apna preferred time bata sakte hain.",
+        "unavailable": "Mujhe abhi jawab taiyar karne mein technical dikkat aa rahi hai. Kripya thodi der baad dobara koshish kijiye.",
+        "rate_limit": "Jawab taiyar karne wali service ki usage limit abhi poori ho gayi hai. Kripya thodi der baad dobara koshish kijiye.",
         "confirmation_required": "Confirm karne ke liye haan ya theek hai boliye. Phir main isi plan ko aage badha sakti hoon.",
         "confirmation_accepted": "Theek hai, main is plan ko final karne ke liye aage badha rahi hoon.",
         "confirmation_question": "Kya main is plan ko aage badhaun?",
@@ -204,7 +205,8 @@ MESSAGES = {
     },
     "en-IN": {
         "unclear": "Will you receive the parcel at the scheduled time, or would you prefer another delivery time?",
-        "unavailable": "The delivery plan check is temporarily unavailable. No change has been finalized; please tell me your preferred time.",
+        "unavailable": "I'm having a technical problem preparing my reply. Please try again in a little while.",
+        "rate_limit": "The service that prepares my replies has reached its usage limit. Please try again later.",
         "confirmation_required": "Please explicitly say yes to this plan before I take it forward.",
         "confirmation_accepted": "Thank you, I will submit this plan for the final check.",
         "confirmation_question": "May I take this plan forward?",
@@ -219,7 +221,8 @@ MESSAGES = {
     },
     "hi-IN": {
         "unclear": "आप तय समय पर पार्सल लेंगे, या डिलीवरी का दूसरा समय चाहिए?",
-        "unavailable": "डिलीवरी योजना की जाँच अभी उपलब्ध नहीं है। अभी कोई बदलाव अंतिम नहीं हुआ; आप अपना पसंदीदा समय बता सकते हैं।",
+        "unavailable": "मुझे अभी जवाब तैयार करने में तकनीकी दिक्कत आ रही है। कृपया थोड़ी देर बाद दोबारा कोशिश कीजिए।",
+        "rate_limit": "जवाब तैयार करने वाली सेवा की उपयोग सीमा अभी पूरी हो गई है। कृपया थोड़ी देर बाद दोबारा कोशिश कीजिए।",
         "confirmation_required": "इस योजना को आगे बढ़ाने से पहले कृपया स्पष्ट रूप से हाँ कहिए।",
         "confirmation_accepted": "धन्यवाद, अब इस योजना को अंतिम जाँच के लिए आगे बढ़ा रही हूँ।",
         "confirmation_question": "क्या मैं इस योजना को आगे बढ़ाऊँ?",

@@ -258,16 +258,138 @@ class OpenAICompatibleClient:
         await self._pool.aclose()
 
 
-def build_llm_client(settings: Settings) -> OpenAICompatibleClient | None:
-    api_key = settings.groq_api_key
+class GeminiClient:
+    """Native Gemini JSON generation using the existing keep-alive HTTP pool."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: float = 12.0,
+        max_tokens: int = 1024,
+        temperature: float = 1.0,
+        thinking_level: Literal["minimal", "low", "medium", "high"] = "minimal",
+        structured_mode: Literal["json_schema", "json_object"] = "json_schema",
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self._base_url = base_url.rstrip("/")
+        if self._base_url != "https://generativelanguage.googleapis.com/v1beta":
+            raise ValueError("Gemini base URL must use the official Google HTTPS endpoint.")
+        if re.fullmatch(r"gemini-[A-Za-z0-9._-]+", model) is None:
+            raise ValueError("Gemini model must be a model code such as gemini-3.1-flash-lite.")
+        self._api_key = api_key
+        self._model = model
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._thinking_level = thinking_level
+        self._structured_mode = structured_mode
+        self._pool = HttpClientPool(timeout=timeout_seconds, transport=transport)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_name: str,
+        schema: dict,
+    ) -> LLMCompletion:
+        started = perf_counter()
+        generation_config = {
+            "temperature": self._temperature,
+            "maxOutputTokens": self._max_tokens,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": self._thinking_level},
+        }
+        if self._structured_mode == "json_schema":
+            # responseJsonSchema supports $defs/$ref. responseSchema uses a
+            # different schema dialect and cannot carry this planner schema.
+            generation_config["responseJsonSchema"] = schema
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": generation_config,
+        }
+        try:
+            response = await self._pool.get().post(
+                f"{self._base_url}/models/{self._model}:generateContent",
+                headers={"x-goog-api-key": self._api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
+        except httpx.TimeoutException as error:
+            raise LLMTimeoutError("LLM provider timed out") from error
+        except httpx.HTTPError as error:
+            raise LLMGatewayError("LLM provider request failed", category="transport") from error
+
+        if response.status_code >= 400:
+            raise _provider_http_error(response.status_code, response.text)
+
+        try:
+            data = response.json()
+            feedback = data.get("promptFeedback")
+            if isinstance(feedback, dict) and feedback.get("blockReason"):
+                raise LLMResponseError("Gemini blocked the prompt", category="blocked_output")
+            candidate = data["candidates"][0]
+            finish_reason = candidate.get("finishReason")
+            if finish_reason == "MAX_TOKENS":
+                raise LLMResponseError(
+                    "Gemini output exceeded its token budget", category="truncated_output"
+                )
+            if finish_reason != "STOP":
+                raise LLMResponseError("Gemini did not complete its response", category="blocked_output")
+            parts = candidate["content"]["parts"]
+            if not isinstance(parts, list):
+                raise TypeError("Expected response parts")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as error:
+            raise LLMResponseError(
+                "Gemini returned an unexpected response", category="invalid_response"
+            ) from error
+
+        content = "".join(
+            part["text"] for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            and not part.get("thought", False)
+        )
+        if not content.strip():
+            raise LLMResponseError("Gemini returned empty structured output", category="empty_output")
+
+        usage = data.get("usageMetadata")
+        usage = usage if isinstance(usage, dict) else {}
+        output_tokens = _optional_int(usage.get("candidatesTokenCount"))
+        thought_tokens = _optional_int(usage.get("thoughtsTokenCount"))
+        completion_tokens = (
+            (output_tokens or 0) + (thought_tokens or 0)
+            if output_tokens is not None or thought_tokens is not None else None
+        )
+        model = data.get("modelVersion")
+        return LLMCompletion(
+            text=_strip_code_fence(content),
+            model=model if isinstance(model, str) and model else self._model,
+            latency_ms=round((perf_counter() - started) * 1_000),
+            prompt_tokens=_optional_int(usage.get("promptTokenCount")),
+            completion_tokens=completion_tokens,
+        )
+
+    async def aclose(self) -> None:
+        await self._pool.aclose()
+
+
+def build_llm_client(settings: Settings) -> GeminiClient | None:
+    api_key = settings.gemini_api_key.strip()
     if not (api_key and settings.llm_base_url and settings.llm_model):
         return None
-    return OpenAICompatibleClient(
+    return GeminiClient(
         base_url=settings.llm_base_url,
         api_key=api_key,
         model=settings.llm_model,
         timeout_seconds=settings.llm_timeout_seconds,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
+        thinking_level=settings.llm_thinking_level,
         structured_mode=settings.llm_structured_mode,
     )
