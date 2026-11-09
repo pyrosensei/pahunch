@@ -174,7 +174,10 @@ distinguishes no frames, no speech, excessive background noise and stopped captu
 the hint/audit is emitted once per listening episode, and does not create a
 customer turn. Thresholds and timings are configurable with the `REALTIME_*`
 settings in `.env.example`; `REALTIME_ADAPTIVE_VAD=false` selects the explicit
-fixed-threshold mode using `REALTIME_VAD_THRESHOLD`. Existing `.env` files need
+fixed-threshold mode using `REALTIME_VAD_THRESHOLD`. While a reply is being
+prepared, `REALTIME_BARGE_IN_MS` at the fixed threshold confirms a strong
+interruption, and quieter speech is confirmed over `REALTIME_PROCESSING_CONFIRM_MS`
+so a short noise burst does not cancel the turn. Existing `.env` files need
 no new entries to use the defaults.
 
 Offline check, from `backend` in PowerShell:
@@ -502,7 +505,7 @@ checks do not replace or rerun the historical 21-case matrix above.
 
 These are the real engineering problems from building this, not a retrospective of easy parts.
 
-**1. The provider stalls, and a stall is not a bug in your code.** The same planner prompt measured 0.7 s to 6.9 s across runs, and intermittently exceeded any sane deadline. We bounded it at 12 s, made the failure mode a *safe spoken fallback* instead of silence, and made the evaluation report count degraded turns explicitly (`Degraded planner turns: 3 (LLM_TIMEOUT: 3)`) rather than letting a provider hiccup masquerade as a logic defect.
+**1. The provider stalls, and a stall is not a bug in your code.** The same planner prompt measured 0.7 s to 6.9 s across runs, and intermittently exceeded any sane deadline. We bounded it (12 s during the matrix run below, 30 s now that Gemini Flash-Lite was measured up to 9.4 s), made the failure mode a *safe spoken fallback* instead of silence, and made the evaluation report count degraded turns explicitly (`Degraded planner turns: 3 (LLM_TIMEOUT: 3)`) rather than letting a provider hiccup masquerade as a logic defect.
 
 **2. Devanagari nukta is not one codepoint.** Prisma returned `ढ़` as the precomposed `U+095D`, while our confirmation whitelist was written for `ढ` + `U+093C`. The live transcript was correct; our normalisation was not, so a legitimate "हाँ ठीक है आगे बढ़ाइए" was rejected as a non-confirmation. Fix: fold precomposed nukta to decomposed form *before* token mapping.
 
