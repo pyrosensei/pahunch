@@ -22,9 +22,9 @@ The adapter sends `reasoning_effort=low`, `include_reasoning=false`, and
 does not request a long answer. Strict JSON Schema remains enabled. No second
 model, SDK installation, or additional normal-turn request was introduced.
 
-The real ignored `backend/.env` has the connection values and an empty
-`GROQ_API_KEY` field ready for the user. Any existing Groq key is preserved on
-setup. Gemini, Google, NVIDIA/NIM, generic old planner credentials, and the
+The real ignored `backend/.env` has the connection values and the user's saved
+`GROQ_API_KEY`. The key was verified through a successful live planner request.
+Gemini, Google, NVIDIA/NIM, generic old planner credentials, and the
 old thinking flag were removed from that file. Gnani and Twilio settings were
 preserved. No credential value was printed or committed.
 
@@ -55,10 +55,20 @@ Groq response quality or latency.
 - Actual environment check: new field exists, old fields absent, existing speech
   and telephony credentials retained; only boolean results were displayed.
 
-Live generation was skipped because the user has not yet saved the Groq key.
-Successful acceptance of the complete planner schema, English/Hindi/Hinglish
-quality, planner latency and first substantive audio latency remain unmeasured
-for Groq. No handset call or Twilio request was made.
+Live generation now succeeds with the saved Groq key and complete planner
+schema. All **8 focused synthetic voice scenarios passed across 14 turns**.
+The 9 model requests returned HTTP 200 without repairs; model request times
+were 661-917 ms (median 824 ms). Model-driven turns reached first substantive
+audio in 1,479-2,144 ms (median 1,654 ms) from the server utterance endpoint.
+These measurements exclude silence detection and physical playback. There
+were no provider or audio errors in this small paced run.
+
+The observed account limit is 8,000 tokens/minute and 1,000 requests/day, with
+roughly 3,500 input tokens per model turn. Tests were deliberately paced outside
+the measured turn to avoid exceeding that quota; this does not establish
+rapid-conversation or concurrent-call capacity. Current local regression results,
+language findings and exact limits are recorded in
+[GROQ_LIVE_REVIEW.md](GROQ_LIVE_REVIEW.md). No real handset call was made.
 
 ## Provider documentation
 
