@@ -49,6 +49,7 @@ class RealtimeConfig:
     calibration_ms: int = 300
     speech_start_ms: int = 100
     barge_in_ms: int = 160
+    processing_confirm_ms: int = 400
     pre_roll_ms: int = 200
     no_speech_ms: int = 5_000
 
@@ -62,6 +63,7 @@ class RealtimeConfig:
                 self.calibration_ms,
                 self.speech_start_ms,
                 self.barge_in_ms,
+                self.processing_confirm_ms,
                 self.no_speech_ms,
                 self.silence_ms,
                 self.quiet_ms,
@@ -70,8 +72,10 @@ class RealtimeConfig:
             <= 0
         ):
             raise ValueError("Audio rates, thresholds and timing must be positive")
+        if self.processing_confirm_ms < self.barge_in_ms:
+            raise ValueError("Processing confirmation must not be shorter than barge-in onset")
         if self.pre_roll_ms < 0 or self.max_utterance_ms < self.pre_roll_ms + max(
-            self.speech_start_ms, self.barge_in_ms
+            self.speech_start_ms, self.barge_in_ms, self.processing_confirm_ms
         ):
             raise ValueError("Utterance cap must hold pre-roll and speech onset")
 
@@ -91,6 +95,7 @@ def build_realtime_config(settings) -> RealtimeConfig:
         calibration_ms=settings.realtime_calibration_ms,
         speech_start_ms=settings.realtime_speech_start_ms,
         barge_in_ms=settings.realtime_barge_in_ms,
+        processing_confirm_ms=settings.realtime_processing_confirm_ms,
         pre_roll_ms=settings.realtime_pre_roll_ms,
         no_speech_ms=settings.realtime_no_speech_ms,
     )
@@ -227,7 +232,15 @@ class UtteranceBuffer:
                 self.noise_floor = level
                 break
 
-    def add(self, frame: bytes, *, calibrate: bool = True, start_ms: int | None = None, minimum_threshold: float = 0) -> bool:
+    def add(
+        self,
+        frame: bytes,
+        *,
+        calibrate: bool = True,
+        start_ms: int | None = None,
+        minimum_threshold: float = 0,
+        quiet_start_ms: int | None = None,
+    ) -> bool:
         usable = frame[: len(frame) - len(frame) % 2]
         samples = len(usable) // 2
         self.rejected_ms = 0
@@ -236,7 +249,9 @@ class UtteranceBuffer:
         self.rms = frame_rms(usable)
         if not self._saw_speech:
             limit_ms = self._config.pre_roll_ms + max(
-                self._config.speech_start_ms, self._config.barge_in_ms
+                self._config.speech_start_ms,
+                self._config.barge_in_ms,
+                quiet_start_ms or 0,
             )
             self._lead.extend(usable)
             del self._lead[
@@ -246,22 +261,45 @@ class UtteranceBuffer:
                 self._observe_noise(samples)
                 return False
             onset_threshold = max(self.threshold, minimum_threshold)
-            if self.rms < onset_threshold or self.noise_limited:
-                self.rejected_ms = round(self._candidate_samples * 1000 / self._config.sample_rate)
+            strong = self.rms >= onset_threshold and not self.noise_limited
+            quiet = (
+                not strong
+                and quiet_start_ms is not None
+                and self.rms >= self.threshold
+                and not self.noise_limited
+            )
+            if not strong and not quiet:
+                self.rejected_ms = round(
+                    max(self._candidate_samples, self._quiet_candidate_samples)
+                    * 1000
+                    / self._config.sample_rate
+                )
                 self._candidate_samples = 0
+                self._quiet_candidate_samples = 0
                 if calibrate:
                     self._observe_noise(samples)
                 return False
-            self._candidate_samples += samples
-            required = self._config.speech_start_ms if start_ms is None else start_ms
-            if self._candidate_samples * 1000 < required * self._config.sample_rate:
+            if strong:
+                self._candidate_samples += samples
+                self._quiet_candidate_samples += samples
+                required = self._config.speech_start_ms if start_ms is None else start_ms
+                trigger_samples = self._candidate_samples
+                trigger_threshold = onset_threshold
+            else:
+                self._candidate_samples = 0
+                self._quiet_candidate_samples += samples
+                required = quiet_start_ms
+                trigger_samples = self._quiet_candidate_samples
+                trigger_threshold = self.threshold
+            if trigger_samples * 1000 < required * self._config.sample_rate:
                 return False
             self._saw_speech = True
-            self._speech_threshold = onset_threshold
-            self._speech_samples = self._candidate_samples
+            self.onset_mode = "strong" if strong else "quiet"
+            self._speech_threshold = trigger_threshold
+            self._speech_samples = trigger_samples
             keep = (
                 self._config.pre_roll_ms * self._config.sample_rate // 1000
-                + self._candidate_samples
+                + trigger_samples
             )
             self.pcm.extend(self._lead[-keep * 2 :])
             self._lead.clear()
@@ -301,6 +339,8 @@ class UtteranceBuffer:
         self.rms = 0.0
         self._speech_samples = self._silence_samples = self._quiet_samples = 0
         self._candidate_samples = 0
+        self._quiet_candidate_samples = 0
+        self.onset_mode: str | None = None
         self.rejected_ms = 0
         self._saw_speech = False
 
@@ -549,6 +589,7 @@ async def handle_voice_socket(
     tts_sample_rate = config.sample_rate
     dropped_frames = 0
     dropped_bytes = 0
+    last_processing_reject_at = 0.0
     send_lock = asyncio.Lock()
     # Preserve the earlier part if a pause was mistaken for the end of a turn.
     # Retention is bounded to the batch-STT limit plus an oversize sentinel.
@@ -656,7 +697,7 @@ async def handle_voice_socket(
             )
             raise
 
-    async def invalidate(reason, *, notify=True):
+    async def invalidate(reason, *, notify=True, details=None):
         nonlocal generation, playback_generation, generation_done, output_task
         old_generation = playback_generation if playback_generation is not None else generation
         revision_generations.pop(old_generation, None)
@@ -671,13 +712,13 @@ async def handle_voice_socket(
                 output_task.cancel()
             output_task = None
         if active:
-            audit(
-                "REALTIME_OUTPUT_CANCELLED",
-                {
-                    "generation_id": old_generation,
-                    "reason": reason,
-                },
-            )
+            payload = {
+                "generation_id": old_generation,
+                "reason": reason,
+            }
+            if details:
+                payload.update(details)
+            audit("REALTIME_OUTPUT_CANCELLED", payload)
             if notify:
                 await send({"type": "stop_speaking", "generation_id": old_generation})
 
@@ -695,7 +736,15 @@ async def handle_voice_socket(
             nonlocal generation_done, playback_generation
             try:
                 if previous:
-                    await asyncio.gather(*previous, return_exceptions=True)
+                    _, pending = await asyncio.wait(previous, timeout=2.0)
+                    if pending:
+                        audit(
+                            "REALTIME_OUTPUT_CLEANUP_TIMEOUT",
+                            {"pending": len(pending)},
+                        )
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
                 if gen != generation or closed:
                     return
                 await job(gen, rate)
@@ -711,7 +760,7 @@ async def handle_voice_socket(
                     audit("STT_RECOVERY", {"status_code": error.status_code, "generation_id": gen})
                     await send({"type": "no_speech", "reason": "RECOGNITION_EMPTY" if error.status_code == 422 else "RECOGNITION_UNAVAILABLE", "recoverable": True}, gen=gen)
                 else:
-                    await send({"type": "error", "detail": error.detail}, gen=gen)
+                    await send({"type": "error", "detail": error.detail, "turn_failed": True}, gen=gen)
                 if gen == generation and not closed:
                     generation_done = True
                     playback_generation = None
@@ -725,7 +774,12 @@ async def handle_voice_socket(
                     generation_done = True
                     playback_generation = None
                 await send(
-                    {"type": "error", "detail": "Voice turn failed; reset or reconnect."}, gen=gen
+                    {
+                        "type": "error",
+                        "detail": "Voice turn failed; reset or reconnect.",
+                        "turn_failed": True,
+                    },
+                    gen=gen,
                 )
                 raise
             finally:
@@ -966,9 +1020,23 @@ async def handle_voice_socket(
                 if output_task is not None and not output_task.done():
                     # There is no speaker audio to echo yet. Detect resumed
                     # speech instead of throwing away the customer's ending.
-                    if buffer.add(frame, calibrate=False):
+                    if buffer.add(
+                        frame,
+                        calibrate=False,
+                        start_ms=config.barge_in_ms,
+                        minimum_threshold=config.vad_threshold,
+                        quiet_start_ms=config.processing_confirm_ms,
+                    ):
                         original = pending_pcm if pending_revision == turn_revision() else None
-                        await invalidate("CUSTOMER_CONTINUED" if original is not None else "NEW_CUSTOMER_TURN")
+                        await invalidate(
+                            "CUSTOMER_CONTINUED" if original is not None else "NEW_CUSTOMER_TURN",
+                            details={
+                                "rms": round(buffer.rms),
+                                "sustained_ms": buffer.speech_ms,
+                                "threshold": round(buffer._speech_threshold),
+                                "onset": buffer.onset_mode,
+                            },
+                        )
                         stt.abort()
                         listening = False
                         await listen(keep_buffer=True)
@@ -986,6 +1054,16 @@ async def handle_voice_socket(
                             stt.offer(bytes(buffer.pcm))
                         audit("CUSTOMER_SPEECH_RESUMED", {"continued_turn": batch_continuation})
                         await send({"type": "speech_start"})
+                    elif buffer.rejected_ms and perf_counter() - last_processing_reject_at >= 1.0:
+                        last_processing_reject_at = perf_counter()
+                        audit(
+                            "PROCESSING_ONSET_REJECTED",
+                            {
+                                "rms": round(buffer.rms),
+                                "speech_ms": buffer.rejected_ms,
+                                "threshold": round(buffer.threshold),
+                            },
+                        )
                     continue
                 if not listening:
                     continue
