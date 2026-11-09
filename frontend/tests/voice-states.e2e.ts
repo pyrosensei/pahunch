@@ -1,5 +1,13 @@
 import { test, expect } from '@playwright/test';
+import type { Page } from '@playwright/test';
 import { mockApi, mockAudio, order, session, planner } from './fixtures';
+
+async function openKeyboardFallback(page: Page) {
+  const details = page.locator('details.voice-keyboard-fallback');
+  if (!(await details.evaluate(node => node.hasAttribute('open')))) {
+    await details.locator('summary').click();
+  }
+}
 
 test('policy rejection, changed confirmation, degraded audio and a failed commit stay reviewable', async ({ page }, testInfo) => {
   await mockApi(page);
@@ -34,7 +42,7 @@ test('policy rejection, changed confirmation, degraded audio and a failed commit
   });
   await page.goto(`/voice?order_id=${order.id}`);
   await page.getByRole('button', { name: 'Connect conversation' }).click();
-  const send = async (text: string) => { await page.getByRole('textbox', { name: 'Your reply' }).fill(text); await page.getByRole('button', { name: 'Send message' }).click(); await expect(page.getByRole('log')).toContainText(text); };
+  const send = async (text: string) => { await openKeyboardFallback(page); await page.getByRole('textbox', { name: 'Your reply' }).fill(text); await page.getByRole('button', { name: 'Send message' }).click(); await expect(page.getByRole('log')).toContainText(text); };
   const save = page.getByRole('button', { name: 'Save delivery plan' });
   await send('Leave with security');
   await expect(page.locator('.voice-verdict')).toContainText('cod requires direct handoff');
@@ -75,6 +83,7 @@ for (const variant of [{ transport: 'twilio' as const, state: 'DISCOVERY' }, { t
     await page.goto(`/voice?session_id=${session.id}&order_id=${order.id}`);
     await page.getByRole('button', { name: 'Connect conversation' }).click();
     await expect(page.getByRole('alert')).toBeVisible();
+    await openKeyboardFallback(page);
     await expect(page.getByRole('textbox', { name: 'Your reply' })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Start microphone' })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Save delivery plan' })).toBeDisabled();

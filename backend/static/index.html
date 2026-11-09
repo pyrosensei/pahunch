@@ -349,6 +349,9 @@ async function connectSocket(sessionId) {
           `tts ${fmtMs(event.timings?.tts_ms)} · total ${fmtMs(event.timings?.total_ms)}` +
           `${event.ack_played ? " · ack" : ""}` +
           `${event.audio_error ? ` [TTS ${event.audio_error}]` : ""}`);
+        if (event.audio_error) {
+          $("mic-status").textContent = "Reply shown as text — audio unavailable";
+        }
         if (state.outputKind === "blob") {
           if (state.blobDone) finishPlayback(event.generation_id, ws);
         } else if (state.player) {
@@ -364,6 +367,10 @@ async function connectSocket(sessionId) {
         }
         break;
       case "error":
+        if (event.turn_failed) {
+          state.streaming = false;
+          $("mic-status").textContent = "Turn failed — check the log";
+        }
         log("error", event.detail);
         break;
     }

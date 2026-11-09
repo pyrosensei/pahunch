@@ -34,6 +34,13 @@ async function mockConversation(page: Page) {
   return { sent, connections: () => connected, closed: () => closed };
 }
 
+async function openKeyboardFallback(page: Page) {
+  const details = page.locator('details.voice-keyboard-fallback');
+  if (!(await details.evaluate(node => node.hasAttribute('open')))) {
+    await details.locator('summary').click();
+  }
+}
+
 test('landing works without WebGL, respects reduced motion, and exposes keyboard navigation', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.addInitScript(() => {
@@ -44,7 +51,7 @@ test('landing works without WebGL, respects reduced motion, and exposes keyboard
     } as typeof original;
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('Your delivery.');
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('A delivery conversation.');
   await expect(page.getByRole('link', { name: 'Try a delivery' }).first()).toBeVisible();
   await expect(page.locator('canvas')).toHaveCount(0);
   await expect(page.getByLabel('Parcel illustration')).toBeVisible();
@@ -89,6 +96,7 @@ test('voice connects only on request and saves a plan only after backend confirm
     tts_sample_rate: 16000, playback_tracking: true, audio_feedback: true,
   });
   await expect(page.locator('canvas')).toHaveCount(0);
+  await openKeyboardFallback(page);
   await page.getByRole('textbox', { name: 'Your reply' }).fill('Please hand the parcel directly to me.');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect(page.getByRole('log')).toContainText('May I take this plan forward?');
@@ -180,7 +188,7 @@ test('dashboard escapes transcript markup and preserves data with a stale warnin
   await expect(transcript).toContainText(options.transcript);
   await expect(transcript.locator('img')).toHaveCount(0);
   await transcript.getByText('Response details').click();
-  await expect(transcript).toContainText('Wording: model');
+  await expect(transcript).toContainText('Wording: Model');
   options.failure = true;
   await page.getByRole('button', { name: /^Updated / }).click();
   await expect(page.getByRole('alert')).toContainText(/stale/i);
@@ -202,6 +210,7 @@ test('denied microphone keeps typed replies available and never displays unredac
   await page.getByRole('button', { name: 'Connect conversation' }).click();
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect(page.getByRole('alert')).toContainText(/microphone access is unavailable/i);
+  await openKeyboardFallback(page);
   await page.getByRole('textbox', { name: 'Your reply' }).fill('My OTP is 123456');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect(page.getByRole('textbox', { name: 'Your reply' })).toHaveValue('');

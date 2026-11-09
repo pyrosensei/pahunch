@@ -392,6 +392,7 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .editorial-platform h2 { color: #f6f4eb; }
 #root .editorial-platform .platform-copy > p { color: #d1dfd4; }
 #root .editorial-platform .eyebrow, #root .editorial-platform .text-link { color: #edd5b1; }
+#root .editorial-platform .serif-word { color: #edd5b1; }
 #root .dispatch-preview { border-radius:12px; overflow:hidden; background: #fff; color: var(--ink); box-shadow: 0 12px 40px #0002; }
 #root .dispatch-header h1 { font-size:36px; font-weight:700; font-weight: 700; letter-spacing: -.045em; }
 #root .dispatch-ledger { padding:16px 20px; border:0; border-radius:18px; background:#e6f1e5; gap:16px; background: #193b32; color: #f6f4eb; border: 0; border-radius: 10px; padding: 20px 24px; }
