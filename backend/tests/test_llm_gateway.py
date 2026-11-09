@@ -397,10 +397,29 @@ def test_missing_google_key_does_not_fall_back_to_removed_credentials():
     assert build_llm_client(config) is None
 
 
-@pytest.mark.parametrize("provider", ["nim", "groq"])
+@pytest.mark.parametrize("provider", ["nim", "vertex", "local"])
 def test_removed_providers_are_rejected(provider):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, llm_provider=provider)
+
+
+@pytest.mark.parametrize("provider", ["groq", "openrouter", "ollama"])
+def test_supported_free_providers_are_accepted(provider):
+    assert Settings(_env_file=None, llm_provider=provider).llm_provider == provider
+
+
+def test_each_provider_uses_only_its_own_key():
+    groq = Settings(_env_file=None, llm_provider="groq", groq_api_key="groq-key",
+                    gemini_api_key="google-key")
+    client = build_llm_client(groq)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._api_key == "groq-key"
+    assert Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key").llm_provider == "groq"
+
+
+def test_provider_without_its_own_key_disables_the_planner():
+    config = Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key")
+    assert build_llm_client(config) is None
 
 
 @pytest.mark.parametrize("url", [

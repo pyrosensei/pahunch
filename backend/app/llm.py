@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Literal, Protocol
+from typing import ClassVar, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel
@@ -13,7 +13,11 @@ from app.config import Settings
 from app.http_pool import HttpClientPool
 
 _PROVIDER_ERROR_TEXT_LIMIT = 2_000
-_MISSING_PROPERTIES = re.compile(r"missing properties:\s*(.+)", re.IGNORECASE)
+_MISSING_PROPERTIES = re.compile(r"missing properties:\s*((?:'[^']+'\s*,?\s*)+)", re.IGNORECASE)
+_UNQUOTED_MISSING_PROPERTIES = re.compile(
+    r"missing properties:\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)",
+    re.IGNORECASE,
+)
 _FIELD_NAME = re.compile(r"[^A-Za-z0-9_]")
 
 
@@ -83,6 +87,35 @@ def make_strict_json_schema(model: type[BaseModel]) -> dict:
     return schema
 
 
+def inline_schema_refs(schema: dict) -> dict:
+    """Resolve $ref pointers so providers without $defs support accept the schema."""
+
+    definitions = schema.get("$defs", {})
+
+    def resolve(node: object, seen: frozenset[str] = frozenset()) -> object:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref.split("/")[-1]
+                target = definitions.get(name)
+                if isinstance(target, dict) and name not in seen:
+                    resolved = resolve(target, seen | {name})
+                    extra = {key: value for key, value in node.items() if key != "$ref"}
+                    if isinstance(resolved, dict):
+                        return {**resolved, **extra}
+                return {}
+            return {
+                key: resolve(value, seen)
+                for key, value in node.items()
+                if key != "$defs"
+            }
+        if isinstance(node, list):
+            return [resolve(value, seen) for value in node]
+        return node
+
+    return resolve(schema)
+
+
 def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
 
@@ -102,14 +135,19 @@ def _structured_output_detail(message: object) -> str:
     fallback = "generated JSON failed provider schema validation"
     if not isinstance(message, str):
         return fallback
-    match = _MISSING_PROPERTIES.search(message[:_PROVIDER_ERROR_TEXT_LIMIT])
-    if match is None:
-        return fallback
-    fields = []
-    for quoted in re.findall(r"'([^']+)'", match.group(1)):
-        field = _FIELD_NAME.sub("", quoted)
+    text = message[:_PROVIDER_ERROR_TEXT_LIMIT]
+    fields: list[str] = []
+    quoted = _MISSING_PROPERTIES.search(text)
+    for name in re.findall(r"'([^']+)'", quoted.group(1)) if quoted else []:
+        field = _FIELD_NAME.sub("", name)
         if field and field not in fields:
             fields.append(field)
+    if not fields:
+        unquoted = _UNQUOTED_MISSING_PROPERTIES.search(text)
+        for name in unquoted.group(1).split(",") if unquoted else []:
+            field = _FIELD_NAME.sub("", name.strip())
+            if field and field not in fields:
+                fields.append(field)
     return f"missing required fields: {', '.join(fields[:10])}" if fields else fallback
 
 
@@ -147,6 +185,17 @@ def _provider_http_error(status_code: int, text: str) -> LLMGatewayError:
 
 
 class OpenAICompatibleClient:
+    """OpenAI-compatible JSON generation for Groq, OpenRouter and local Ollama."""
+
+    ALLOWED_BASE_URLS: ClassVar[frozenset[str]] = frozenset({
+        "https://api.groq.com/openai/v1",
+        "https://api.groq.com/openai/v1/chat/completions",
+        "https://openrouter.ai/api/v1",
+        "https://ollama.com/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://localhost:11434/v1",
+    })
+
     def __init__(
         self,
         *,
@@ -157,16 +206,17 @@ class OpenAICompatibleClient:
         max_tokens: int = 1024,
         temperature: float = 0.1,
         structured_mode: Literal["json_schema", "json_object"] = "json_schema",
+        provider: str = "groq",
+        inline_refs: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base_url = base_url.rstrip("/")
-        if self._base_url not in {
-            "https://api.groq.com/openai/v1",
-            "https://api.groq.com/openai/v1/chat/completions",
-        }:
-            raise ValueError("Groq base URL must use the official Groq HTTPS endpoint.")
+        if self._base_url not in self.ALLOWED_BASE_URLS:
+            raise ValueError("Provider base URL must be an approved provider or a local Ollama endpoint.")
         self._api_key = api_key
         self._model = model
+        self._provider = provider
+        self._inline_refs = inline_refs
         self._timeout_seconds = timeout_seconds
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -205,6 +255,8 @@ class OpenAICompatibleClient:
         schema: dict,
     ) -> LLMCompletion:
         started = perf_counter()
+        if self._inline_refs:
+            schema = inline_schema_refs(schema)
         payload = {
             "model": self._model,
             "messages": [
@@ -212,18 +264,22 @@ class OpenAICompatibleClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self._temperature,
-            "max_completion_tokens": self._max_tokens,
-            "reasoning_effort": "low",
-            "include_reasoning": False,
             "response_format": self._response_format(schema_name, schema),
         }
+        if self._provider in {"groq", "ollama"}:
+            # Reasoning controls exist on these endpoints; the others reject them.
+            payload["max_completion_tokens"] = self._max_tokens
+            payload["reasoning_effort"] = "low"
+            payload["include_reasoning"] = False
+        else:
+            payload["max_tokens"] = self._max_tokens
         try:
+            headers = {"Content-Type": "application/json"}
+            if self._api_key:
+                headers["Authorization"] = f"Bearer {self._api_key}"
             response = await self._pool.get().post(
                 self.chat_completions_url,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=payload,
             )
         except httpx.TimeoutException as error:
@@ -379,17 +435,52 @@ class GeminiClient:
         await self._pool.aclose()
 
 
-def build_llm_client(settings: Settings) -> GeminiClient | None:
-    api_key = settings.gemini_api_key.strip()
-    if not (api_key and settings.llm_base_url and settings.llm_model):
+PROVIDER_DEFAULTS: ClassVar[dict[str, tuple[str, str]]] = {
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-3.1-flash-lite"),
+    "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+    "openrouter": ("https://openrouter.ai/api/v1", "google/gemma-3-27b-it:free"),
+    "ollama": ("https://ollama.com/v1", "gpt-oss:120b"),
+}
+# Ollama's structured output has no $defs support, so its schema is inlined.
+_INLINE_REF_PROVIDERS = {"ollama"}
+
+
+def build_llm_client(settings: Settings) -> GeminiClient | OpenAICompatibleClient | None:
+    provider = settings.llm_provider
+    default_base, default_model = PROVIDER_DEFAULTS.get(
+        provider, PROVIDER_DEFAULTS["gemini"]
+    )
+    base_url = (settings.llm_base_url or default_base).rstrip("/")
+    model = settings.llm_model or default_model
+    if provider == "gemini":
+        api_key = settings.gemini_api_key.strip()
+        if not (api_key and base_url and model):
+            return None
+        return GeminiClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=settings.llm_timeout_seconds,
+            max_tokens=settings.llm_max_tokens,
+            temperature=settings.llm_temperature,
+            thinking_level=settings.llm_thinking_level,
+            structured_mode=settings.llm_structured_mode,
+        )
+    api_key = {
+        "groq": settings.groq_api_key,
+        "openrouter": settings.openrouter_api_key,
+        "ollama": settings.ollama_api_key,
+    }.get(provider, "").strip()
+    if not api_key:
         return None
-    return GeminiClient(
-        base_url=settings.llm_base_url,
+    return OpenAICompatibleClient(
+        base_url=base_url,
         api_key=api_key,
-        model=settings.llm_model,
+        model=model,
         timeout_seconds=settings.llm_timeout_seconds,
         max_tokens=settings.llm_max_tokens,
         temperature=settings.llm_temperature,
-        thinking_level=settings.llm_thinking_level,
         structured_mode=settings.llm_structured_mode,
+        provider=provider,
+        inline_refs=provider in _INLINE_REF_PROVIDERS,
     )

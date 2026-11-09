@@ -18,14 +18,17 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = "Shivani"
     gnani_tts_language: str = "hi-en"
     gnani_timeout_seconds: float = 30.0
-    llm_provider: Literal["gemini"] = "gemini"
+    llm_provider: Literal["gemini", "groq", "openrouter", "ollama"] = "gemini"
     gemini_api_key: str = Field(default="", repr=False)
-    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
-    llm_model: str = "gemini-3.1-flash-lite"
-    llm_timeout_seconds: float = 12.0
+    groq_api_key: str = Field(default="", repr=False)
+    openrouter_api_key: str = Field(default="", repr=False)
+    ollama_api_key: str = Field(default="", repr=False)
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_timeout_seconds: float = 30.0
     llm_max_tokens: int = 1024
     llm_temperature: float = 1.0
-    llm_thinking_level: Literal["minimal", "low", "medium", "high"] = "minimal"
+    llm_thinking_level: Literal["none", "minimal", "low", "medium", "high"] = "minimal"
     llm_structured_mode: Literal["json_schema", "json_object"] = "json_schema"
     planner_min_confidence: float = 0.65
     planner_min_transcript_confidence: float = 0.55
@@ -42,6 +45,7 @@ class Settings(BaseSettings):
     realtime_calibration_ms: int = 300
     realtime_speech_start_ms: int = 100
     realtime_barge_in_ms: int = 160
+    realtime_processing_confirm_ms: int = 400
     realtime_pre_roll_ms: int = 200
     realtime_no_speech_ms: int = 5_000
     streaming_stt_enabled: bool = True
