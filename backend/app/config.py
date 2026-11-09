@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     gnani_tts_voice: str = "Shivani"
     gnani_tts_language: str = "hi-en"
     gnani_timeout_seconds: float = 30.0
-    llm_provider: Literal["gemini", "groq", "openrouter", "ollama"] = "gemini"
+    llm_provider: Literal["ollama", "groq", "openrouter", "gemini"] = "ollama"
     gemini_api_key: str = Field(default="", repr=False)
     groq_api_key: str = Field(default="", repr=False)
     openrouter_api_key: str = Field(default="", repr=False)

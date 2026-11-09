@@ -361,8 +361,8 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
 
 def test_builder_uses_only_google_credentials():
     config = Settings(
-        _env_file=None, gemini_api_key="test-google-key", llm_api_key="test-old-key",
-        groq_api_key="test-old-key",
+        _env_file=None, llm_provider="gemini", gemini_api_key="test-google-key",
+        llm_api_key="test-old-key", groq_api_key="test-old-key",
     )
     client = build_llm_client(config)
     assert client is not None
@@ -415,6 +415,17 @@ def test_each_provider_uses_only_its_own_key():
     assert isinstance(client, OpenAICompatibleClient)
     assert client._api_key == "groq-key"
     assert Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key").llm_provider == "groq"
+
+
+def test_default_provider_is_ollama_cloud_with_its_own_defaults():
+    config = Settings(_env_file=None, ollama_api_key="ollama-key", gemini_api_key="google-key")
+    assert config.llm_provider == "ollama"
+    client = build_llm_client(config)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._base_url == "https://ollama.com/v1"
+    assert client._model == "gpt-oss:120b"
+    assert client._api_key == "ollama-key"
+    assert client._inline_refs
 
 
 def test_provider_without_its_own_key_disables_the_planner():

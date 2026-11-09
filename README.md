@@ -4,13 +4,13 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · Google Gemini 3.1 Flash-Lite planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Ollama Cloud gpt-oss:120b planner · FastAPI · SQLite
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![Gemini](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-4285F4.svg)](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
-[![Tests](https://img.shields.io/badge/tests-382%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Ollama](https://img.shields.io/badge/planner-Ollama%20Cloud%20gpt--oss%3A120b-000000.svg)](https://ollama.com/library/gpt-oss)
+[![Tests](https://img.shields.io/badge/tests-657%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Gemini)          │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (Ollama)          │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (Gemini, JSON Schema)        │  │
+       │                          │  │ Planner (Ollama, JSON Schema)        │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -462,7 +462,7 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **382 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **657 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
@@ -473,7 +473,7 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
 **Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
-describe the current Gemini configuration. Current provider and microphone acceptance remain pending.
+describe the current Ollama Cloud configuration. Current provider and microphone acceptance remain pending.
 
 | Metric | Value |
 |---|---|
@@ -505,7 +505,7 @@ checks do not replace or rerun the historical 21-case matrix above.
 
 These are the real engineering problems from building this, not a retrospective of easy parts.
 
-**1. The provider stalls, and a stall is not a bug in your code.** The same planner prompt measured 0.7 s to 6.9 s across runs, and intermittently exceeded any sane deadline. We bounded it (12 s during the matrix run below, 30 s now that Gemini Flash-Lite was measured up to 9.4 s), made the failure mode a *safe spoken fallback* instead of silence, and made the evaluation report count degraded turns explicitly (`Degraded planner turns: 3 (LLM_TIMEOUT: 3)`) rather than letting a provider hiccup masquerade as a logic defect.
+**1. The provider stalls, and a stall is not a bug in your code.** The same planner prompt measured 0.7 s to 6.9 s across runs, and intermittently exceeded any sane deadline. We bounded it (12 s during the matrix run below, 30 s after earlier hosted providers were measured up to 9.4 s), made the failure mode a *safe spoken fallback* instead of silence, and made the evaluation report count degraded turns explicitly (`Degraded planner turns: 3 (LLM_TIMEOUT: 3)`) rather than letting a provider hiccup masquerade as a logic defect.
 
 **2. Devanagari nukta is not one codepoint.** Prisma returned `ढ़` as the precomposed `U+095D`, while our confirmation whitelist was written for `ढ` + `U+093C`. The live transcript was correct; our normalisation was not, so a legitimate "हाँ ठीक है आगे बढ़ाइए" was rejected as a non-confirmation. Fix: fold precomposed nukta to decomposed form *before* token mapping.
 
@@ -533,7 +533,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and a Google Gemini API key
+- A Gnani API key (Prisma + Timbre) and an Ollama Cloud API key
 
 ### 1. Configure
 
@@ -546,28 +546,34 @@ Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
 GNANI_API_KEY=
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=
-LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta
-LLM_MODEL=gemini-3.1-flash-lite
-LLM_THINKING_LEVEL=minimal
+LLM_PROVIDER=ollama
+OLLAMA_API_KEY=
+# Empty base URL and model select the Ollama Cloud defaults below.
+LLM_BASE_URL=
+LLM_MODEL=
 LLM_TEMPERATURE=1.0
 LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
 
-The planner uses Google's native `generateContent` endpoint with JSON Schema
-output and minimal thinking. The output-token budget includes thinking tokens.
+The planner calls Ollama Cloud's OpenAI-compatible endpoint
+`https://ollama.com/v1` with `gpt-oss:120b`, `reasoning_effort=low` and
+reasoning text excluded from the response. Ollama's structured output does not
+support `$defs`, so the gateway inlines schema references before sending it.
 The backend validates the response, delivery policy, wording and explicit
 confirmation before saving a delivery commitment.
 
-Set `GEMINI_API_KEY` in `backend/.env`. The connection uses the official Google
-HTTPS endpoint and authenticates with a header. A missing key leaves the planner
-unconfigured. Gnani handles speech recognition and synthesis.
+Set `OLLAMA_API_KEY` in `backend/.env`. The connection authenticates with a
+Bearer header. A missing key leaves the planner unconfigured. Gnani handles
+speech recognition and synthesis.
 
-Check the active Gemini project's token/minute, request/minute and daily quotas
-in Google AI Studio before a live demo. HTTP 429 is exposed as `LLM_RATE_LIMIT`.
-A provider failure preserves the delivery state and returns a service message.
+`LLM_PROVIDER` also accepts `groq`, `openrouter` and `gemini`; each reads only
+its own key and its own default base URL and model. Switching provider is a
+one-line change, not a code change.
+
+Check the active Ollama Cloud plan's rate limits before a live demo. HTTP 429
+is exposed as `LLM_RATE_LIMIT`. A provider failure preserves the delivery state
+and returns a service message.
 
 `.env` is gitignored. Keys are never committed and never printed.
 
@@ -597,7 +603,7 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 382 tests, no external network required
+uv run pytest              # 657 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
 ```
 
@@ -627,9 +633,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Google Gemini** (`gemini-3.1-flash-lite`) | Native JSON Schema output, minimal thinking, server-side validation |
+| Planner | **Ollama Cloud** (`gpt-oss:120b`, `https://ollama.com/v1`) | OpenAI-compatible JSON Schema output with inlined `$defs`, `reasoning_effort=low`, server-side validation |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Gemini live acceptance is pending |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Ollama live acceptance is pending |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -654,11 +660,11 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Historical Groq validation:** earlier model/provider probes are not validation of the current Gemini configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Historical provider validation:** earlier Groq and NIM model/provider probes are not validation of the current Ollama Cloud configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
 - **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
-- **Planner stalls are external.** The 12 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.
+- **Planner stalls are external.** The 30 s bound is a product trade-off (silence on a call is worse than a safe re-ask), not a fix for the provider.
 - **Single-order scope.** No multi-parcel routing, no courier-side app, no dispatch integration.
 - **Evaluation scale.** 21 live scenarios, one planner model, one voice, one language mix. Changing the model, prompt, VAD thresholds or TTS settings invalidates comparisons with older reports.
 
@@ -770,7 +776,7 @@ earliest stored date. Legacy seeded examples retain their recorded availability.
 
 ### Conversation recovery
 
-The current planner is Google Gemini 3.1 Flash-Lite. Short acknowledgements preserve the
+The current planner is Ollama Cloud `gpt-oss:120b` with low reasoning effort. Short acknowledgements preserve the
 conversation language; substantial Hindi/English mixing selects Hinglish.
 The planner can mark an unfinished clarification with `awaiting_continuation`;
 voice output then waits up to two extra seconds, cancellable by resumed speech,
