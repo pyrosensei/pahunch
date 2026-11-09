@@ -134,6 +134,11 @@ def normalize_clarification(decision, details, order, slots):
     if decision.action != PlannerAction.ASK_CLARIFICATION or decision.request_details is None:
         return
     supplied = decision.request_details
+    # Policy needs a named recipient, never a house number, so an address can
+    # never be the fact a clarification waits on.
+    decision.missing_fields = [
+        field for field in decision.missing_fields if field != "recipient_address"
+    ]
     completing_time = supplied.window_start is not None or "end_time" in decision.missing_fields
     completing_recipient = (
         supplied.recipient_source is not None and details.action == "LEAVE_WITH_NEIGHBOR"
@@ -143,7 +148,12 @@ def normalize_clarification(decision, details, order, slots):
     if "continuation" in decision.missing_fields and "end_time" not in decision.missing_fields:
         return
     if details.window_start is None or details.time_source is None:
-        return
+        if not completing_recipient or {"time", "end_time"}.intersection(decision.missing_fields):
+            return
+        # A named handoff with no new time keeps the order's scheduled window.
+        details = details.model_copy(deep=True)
+        details.window_start = _utc(order.window_start).astimezone(IST)
+        details.window_end = _utc(order.window_end).astimezone(IST)
     if decision.missing_fields and any(
         field not in {"time", "end_time", "continuation"} for field in decision.missing_fields
     ):

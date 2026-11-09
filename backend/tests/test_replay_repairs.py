@@ -424,9 +424,9 @@ def test_repeated_recipient_quote_with_new_source_reference_is_not_progress(db, 
     daytime(db)
 
     def ask(turn_id=None):
-        item = decision(PlannerAction.ASK_CLARIFICATION, "What is your neighbour's house number?")
+        item = decision(PlannerAction.ASK_CLARIFICATION, "What time works for the handoff?")
         item.update(
-            missing_fields=["recipient_address"],
+            missing_fields=["time"],
             request_details={
                 "action": "LEAVE_WITH_NEIGHBOR",
                 "recipient_source": quote("शर्मा जी", turn_id),
@@ -450,3 +450,34 @@ def test_repeated_recipient_quote_with_new_source_reference_is_not_progress(db, 
     assert len(references) == 4
     assert all(reference is not None for reference in references)
     assert references[0] != references[1]
+
+
+def test_neighbour_address_question_becomes_a_scheduled_window_proposal(db, scripted_llm):
+    order = daytime(db)
+    order.requires_otp = False
+    order.declared_value_inr = 500
+    db.add(order)
+    db.commit()
+    item = decision(PlannerAction.ASK_CLARIFICATION, "Aapke padosi ka house number kya hai?")
+    item.update(
+        missing_fields=["recipient_address"],
+        request_details={
+            "action": "LEAVE_WITH_NEIGHBOR",
+            "recipient_source": quote("अविरल मिश्रा"),
+        },
+    )
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "उनका नाम है अविरल मिश्रा।")
+    assert result.planner.action == PlannerAction.PROPOSE_PLAN
+    assert result.planner.missing_fields == []
+    assert result.turn.verdict.valid
+    proposal_id = planner.calls.get_call(call.id).current_proposal_id
+    assert proposal_id is not None
+    plan = json.loads(db.get(PlanProposalRecord, proposal_id).proposal_json)
+    assert plan["primary"]["action"] == "LEAVE_WITH_NEIGHBOR"
+    assert plan["primary"]["named_recipient"] == "अविरल मिश्रा"
+    assert plan["primary"]["recipient_address"] is None
+    assert "10:00" in plan["primary"]["window_start"]
+    assert "12:00" in plan["primary"]["window_end"]
+    assert not result.turn.customer_confirmed
