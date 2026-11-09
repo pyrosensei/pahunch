@@ -762,6 +762,53 @@ def test_specific_model_clarification_with_a_date_is_kept(db, scripted_llm):
     assert result.planner.fallback_reason is None
 
 
+def test_customer_date_rewritten_in_another_script_is_kept(db, scripted_llm):
+    fixed_window(db)
+    message = "12 November ke kis samay aapko delivery chahiye?"
+    item = reply("ASK_CLARIFICATION", message)
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
+    assert result.agent_message == message
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+
+
+def test_date_near_the_customer_date_is_still_rejected(db, scripted_llm):
+    fixed_window(db)
+    item = reply("ASK_CLARIFICATION", "13 November ko kaunsa time theek rahega?")
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "13" not in result.agent_message
+
+
+@pytest.mark.parametrize(
+    "hours,kept",
+    [("10 AM-12 PM", True), ("3 AM-5 AM", False)],
+)
+def test_clarification_may_name_only_the_recorded_window_hours(db, scripted_llm, hours, kept):
+    fixed_window(db)
+    message = f"12 November ko kaunsa time theek rahega? Hamare paas sirf {hours} ka slot hai."
+    item = reply("ASK_CLARIFICATION", message)
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
+    if kept:
+        assert result.agent_message == message
+        assert result.planner.wording_source == "model"
+        assert result.planner.fallback_reason is None
+    else:
+        assert result.planner.wording_source == "template"
+        assert result.planner.fallback_reason == "UNSAFE_WORDING"
+        assert hours not in result.agent_message
+
+
 @pytest.mark.parametrize(
     "text,expected",
     [

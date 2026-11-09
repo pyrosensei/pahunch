@@ -972,6 +972,9 @@ class PlannerService:
             local = _local_time(window)
             facts.dates.add((local.day, local.month))
             facts.times.add(f"{local:%H:%M}")
+            # Naming a slot as "10 AM-12 PM" needs its bare digits too.
+            for part in (local.hour, local.minute):
+                facts.numbers.update({str(part), f"{part:02d}"})
         return facts
 
     def _slots(self, order_id: int) -> list[DeliverySlot]:

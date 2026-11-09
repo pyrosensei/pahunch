@@ -383,6 +383,22 @@ def _day_after(suffix: str) -> int | None:
     return None
 
 
+def stated_dates(text: str) -> set[tuple[int, int]]:
+    """Dates a speaker asked for, in any script and spelled-out or numeric form."""
+    normalized = normalize_text(text)
+    found: set[tuple[int, int]] = set()
+    for match in _MONTH_ANY.finditer(normalized):
+        month = _MONTH_NAMES.get(match.group(0))
+        if month is None:
+            continue
+        day = _day_before(normalized[: match.start()]) or _day_after(
+            normalized[match.end() :]
+        )
+        if day is not None and 1 <= day <= 31:
+            found.add((day, month))
+    return found
+
+
 def _mentioned_date_match(text: str) -> tuple[int, int, str] | None:
     normalized = normalize_text(text)
     for match in _MONTH_ANY.finditer(normalized):
@@ -662,6 +678,10 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
         )
         if source_text.strip():
             facts.quotes.add(normalize_text(source_text))
+        # A date the customer asked for is a fact, even when the reply spells it
+        # in another script ("बारह नवंबर" -> "12 November").
+        for quote in facts.quotes:
+            facts.dates.update(stated_dates(quote))
         if not _apply_known_dates(guarded, facts)[1]:
             return "UNSAFE_WORDING"
         if (facts.numbers or facts.order_ids or facts.dates or facts.times) and _numbers_are_known(guarded, facts):
