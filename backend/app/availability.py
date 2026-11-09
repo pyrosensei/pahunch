@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 from app.models import DeliverySlot, DialerEvent, Order, OrderStatus
 from app.policy import IST, _utc
 from app.schemas import PlanStep
+from app.speech_text import customer_window
 
 
 def availability_question(text: str) -> bool:
@@ -50,7 +51,7 @@ def availability_reply(
             alternatives.append((start, end))
     alternatives.sort()
     windows = "; ".join(
-        f"{start:%d %B %H:%M}-{end:%H:%M} IST" for start, end in alternatives[:3]
+        customer_window(start, end, language) for start, end in alternatives[:3]
     )
     if not windows:
         return {"en-IN": "No alternative delivery availability is recorded. This needs the delivery team's review; no change has been saved.",

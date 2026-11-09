@@ -5,7 +5,7 @@ from datetime import timedelta
 from sqlmodel import Session, select
 
 from app.calls import utc_now
-from app.language import has_otp_disclosure
+from app.language import has_otp_disclosure, recipient_label
 from app.models import AuditEvent, CallSession, Order, PlanProposalRecord, Speaker, Turn
 from app.policy import IST, _utc
 from app.schemas import (
@@ -81,7 +81,13 @@ def merge_details(db, session_id, text, old, new):
         ):
             raise ValueError("TIME_SOURCE_REQUIRED")
         result.window_end = new.window_end
-    if new.action != "UNSPECIFIED":
+    if new.action == "HAND_TO_CUSTOMER":
+        result.recipient_source = None
+        result.recipient_address_source = None
+    if new.action != "UNSPECIFIED" and not (
+        new.action == "RESCHEDULE"
+        and old.action in {"LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY"}
+    ):
         result.action = new.action
     result.call_on_arrival = new.call_on_arrival
     return result
@@ -109,7 +115,7 @@ def ground_recipient(db, session_id, text, step, details):
             value = evidence_text(db, session_id, text, evidence)
             if len(value) > 80:
                 raise ValueError("RECIPIENT_SOURCE_TOO_LONG")
-            setattr(step, field, value)
+            setattr(step, field, recipient_label(field, value))
             setattr(step, source_field, evidence)
         elif getattr(step, field):
             # Old JSON plans retain compatibility for literal source text.

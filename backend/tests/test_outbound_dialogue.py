@@ -28,7 +28,8 @@ def test_opening_contains_the_actual_order_window_and_relevant_payment_rule(db):
     call = start_call(CallService(db), 1043)
     message, meta = outbound_opening(db, call.id, "en-IN")
     assert "SwiftCart" in message and "1043" in message
-    assert "05 November 12:00-15:00 IST" in message
+    assert "05 November, 12 PM-3 PM" in message
+    assert "IST" not in message
     assert "Payment is due to the courier" in message
     assert "Will you be available" in message
     assert "How can I help" not in message
@@ -104,7 +105,8 @@ def test_socket_records_proactive_opening_and_first_yes_only_proposes():
             purpose = await socket.event("turn")
             assert purpose["planner"]["fallback_reason"] == "OUTBOUND_DELIVERY_PURPOSE"
             assert "1042" in purpose["agent_message"]
-            assert "क्या आप उस समय" in purpose["agent_message"]
+            assert "available hain" in purpose["agent_message"]
+            assert "IST" not in purpose["agent_message"]
             assert not purpose["turn"]["customer_confirmed"]
             purpose_end = await socket.event("agent_audio_end")
             socket.control("playback_done", generation_id=purpose_end["generation_id"])

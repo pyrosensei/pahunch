@@ -34,6 +34,10 @@ from app.language import (
     is_rejection,
     language_matches,
     mentioned_date,
+    mentioned_date_parts,
+    mentioned_time,
+    mentioned_times,
+    mixed_script,
     normalize_text,
     phrase,
     redact_customer_text,
@@ -66,6 +70,7 @@ from app.policy import HIGH_VALUE_THRESHOLD_INR, IST, _allowed_alternatives, val
 from app.schemas import (
     AgentTurnRequest,
     AgentTurnResponse,
+    CustomerEvidence,
     CustomerTurnRequest,
     PlanAction,
     PlannerAction,
@@ -74,9 +79,11 @@ from app.schemas import (
     PlanProposal,
     PlanStep,
     PolicyVerdict,
+    RequestDetails,
     TurnResult,
     ViolationCode,
 )
+from app.speech_text import customer_moment, customer_window, spoken_clock
 from app.tools import allowed_planner_actions, require_planner_action
 
 PLANNER_STATES = {
@@ -438,25 +445,9 @@ def _normalize_plan(decision: PlannerDecision, order: Order) -> PlanStep | None:
 
 def _window_label(step: PlanStep, language: str = "hi-en") -> str:
     assert step.window_start is not None and step.window_end is not None
-    start = _local_time(step.window_start)
-    end = _local_time(step.window_end)
-    if language == "hi-IN":
-        months = (
-            "जनवरी",
-            "फ़रवरी",
-            "मार्च",
-            "अप्रैल",
-            "मई",
-            "जून",
-            "जुलाई",
-            "अगस्त",
-            "सितंबर",
-            "अक्टूबर",
-            "नवंबर",
-            "दिसंबर",
-        )
-        return f"{start.day} {months[start.month - 1]} को {start:%H:%M}-{end:%H:%M} भारतीय समय"
-    return f"{start:%d %B} {start:%H:%M}-{end:%H:%M} IST"
+    return customer_window(
+        _local_time(step.window_start), _local_time(step.window_end), language
+    )
 
 
 def _respond_fallback(fallback_key: str | None, order: Order, language: str) -> str:
@@ -685,7 +676,7 @@ def _merge_completions(first: LLMCompletion, second: LLMCompletion) -> LLMComple
     )
 
 
-def outbound_opening(db: Session, session_id: str, language: str = "hi-IN") -> tuple[str, PlannerMeta]:
+def outbound_opening(db: Session, session_id: str, language: str = "hi-en") -> tuple[str, PlannerMeta]:
     """Render the reason for this outbound delivery call from server-owned facts."""
     call = CallService(db).get_call(session_id)
     order = db.get(Order, call.order_id)
@@ -752,7 +743,7 @@ def _order_date_reply(db: Session, order: Order, text: str, language: str) -> st
     if created:
         timestamp = created.created_at.replace(tzinfo=UTC) if created.created_at.tzinfo is None else created.created_at
         local = timestamp.astimezone(IST)
-        placed = f"{local:%d %B %H:%M} IST"
+        placed = customer_moment(local, language)
         return {"en-IN": f"Your order was placed on {placed}. Its scheduled delivery is {window}; the order time and delivery appointment are separate.", "hi-IN": f"आपका ऑर्डर {placed} को किया गया था। डिलीवरी {window} में निर्धारित है; ऑर्डर करने का समय और डिलीवरी का समय अलग हैं।", "hi-en": f"Aapka order {placed} ko place hua tha. Delivery {window} mein scheduled hai; order karne ka time aur delivery ka time alag hain."}[language]
     return {"en-IN": f"The order-placement time is not recorded for this demo order. The scheduled delivery is {window}; this is the delivery appointment, not the order time.", "hi-IN": f"इस डेमो ऑर्डर में ऑर्डर करने का समय दर्ज नहीं है। डिलीवरी {window} में निर्धारित है; यह डिलीवरी का समय है, ऑर्डर करने का समय नहीं।", "hi-en": f"Is demo order ka placement time recorded nahi hai. Delivery {window} mein scheduled hai; yeh delivery ka time hai, order karne ka time nahi."}[language]
 
@@ -796,7 +787,10 @@ RULES
 - awaiting_continuation is true ONLY with ASK_CLARIFICATION when the current utterance clearly trails off mid-thought, a conditional clause, or a dictated recipient/address. Infer this from conversation context, not punctuation alone. Supply a specific brief clarification in case the customer does not continue. Complete requests and ordinary acknowledgements use false. The voice layer waits briefly and cancels the clarification if speech resumes.
 - Interpret preferences, conditional alternatives, corrections and missing details from the whole conversation, not keywords. Preserve stated recipient details; never complete a cut-off house number by guessing.
 - If the customer is unavailable, ask whether an eligible authorized recipient can receive the parcel. If neither is available, offer the next recorded available subsequent-day period within operating hours. Do not invent availability or commit without confirmation.
-- Demo operating hours are 10 AM to 6 PM IST. Six PM is the end boundary, not a delivery window starting at six. Explain unavailable preferences and discuss an eligible alternative.
+- Demo operating hours are 10 AM to 6 PM. Six PM is the end boundary, not a delivery window starting at six. Explain unavailable preferences and discuss an eligible alternative.
+- Never say IST, भारतीय समय, or any timezone. Say only the clock, such as "10 AM", "4 PM", "सुबह 10 बजे" or "रात 8 बजे".
+- When response_language is hi-en, write natural Roman Hinglish and choose everyday wording yourself. Use English for OTP, verification, delivery, neighbour and time. Do not use formal Hindi such as सत्यापन or निषिद्ध, and do not answer in Devanagari unless response_language is hi-IN.
+- A named period fixes the clock. सुबह or morning is AM. दोपहर or afternoon is 12 PM through 5 PM. शाम or evening is PM. रात or night from 6 through 11 is PM, and रात from 1 through 5 is AM. रात के आठ is 20:00, रात के चार is 04:00, शाम के चार is 16:00, and सुबह के आठ is 08:00. Do not ask AM or PM when that period is already present. Two different times in one turn stay ASK_CLARIFICATION. named_recipient is only the person's name, and recipient_address is only the house number.
 - For an eligible named neighbour receiving an OTP order, the courier calls the customer and verifies OTP directly before handoff. The assistant never collects, verifies or records OTP. Verification failure means no handoff.
 - Frustration is not a reason to reject the customer's request. Respond helpfully; only sustained personal abuse warrants a brief polite boundary. Do not routinely tell customers to calm down.
 - call_date is today. "aaj"=call_date, "kal"=next day.
@@ -875,6 +869,52 @@ The top-level confidence is a number between 0 and 1. Do not add notes,
 customer_statements or nested confidence: they are absent from the provider schema.
 Do not put primary or fallback at the top level: they belong inside proposal.
 """
+
+
+def _fill_clear_time(decision: PlannerDecision, text: str, details: RequestDetails, order: Order) -> None:
+    """Store one unambiguous spoken time when the model only asks which time."""
+    if decision.action != PlannerAction.ASK_CLARIFICATION:
+        return
+    supplied = decision.request_details
+    if supplied is not None and supplied.window_start is not None and supplied.time_source is not None:
+        return
+    if decision.missing_fields and "time" not in decision.missing_fields and "end_time" not in decision.missing_fields:
+        return
+    clock = mentioned_time(text)
+    if clock is None:
+        return
+    hour, minute = clock
+    local = _local_time(order.window_start)
+    parts = mentioned_date_parts(text)
+    if parts is not None:
+        day, month = parts
+        try:
+            local = local.replace(month=month, day=day)
+        except ValueError:
+            return
+    start = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    action = details.action
+    if details.recipient_source is not None:
+        action = "LEAVE_WITH_NEIGHBOR"
+    elif action == "UNSPECIFIED":
+        action = "RESCHEDULE"
+    decision.request_details = RequestDetails(
+        window_start=start,
+        time_source=CustomerEvidence(quote=text.strip()),
+        recipient_source=details.recipient_source,
+        recipient_address_source=details.recipient_address_source,
+        action=action,
+        call_on_arrival=details.call_on_arrival,
+    )
+    missing = [
+        field
+        for field in decision.missing_fields
+        if not (field == "recipient" and details.recipient_source is not None)
+        and not (field == "recipient_address" and details.recipient_address_source is not None)
+    ]
+    if "time" not in missing:
+        missing.insert(0, "time")
+    decision.missing_fields = missing
 
 
 class PlannerService:
@@ -1454,6 +1494,7 @@ class PlannerService:
             if reason is None and not language_matches(decision.message, language):
                 meta.language_warning = "LANGUAGE_MISMATCH"
             date_aware = False
+            time_choices = False
             if decision.action == PlannerAction.ASK_CLARIFICATION:
                 details = load_details(self.db, session_id)
                 current = decision.request_details
@@ -1490,8 +1531,27 @@ class PlannerService:
                             "hi-en": f"{date_label} ko kaunsa time theek rahega?",
                         }[language]
                         date_aware = True
-            meta.wording_source = "template" if (reason is not None or date_aware) else "model"
+                clocks = mentioned_times(request.text)
+                if (
+                    {"time", "end_time"}.intersection(decision.missing_fields)
+                    and 1 < len(clocks) <= 3
+                    and (
+                        reason is not None
+                        or set(mentioned_times(message)) != set(clocks)
+                        or (language == "hi-en" and mixed_script(message))
+                    )
+                ):
+                    choices = [spoken_clock(hour, minute, language) for hour, minute in clocks]
+                    joined = (" या " if language == "hi-IN" else " or " if language == "en-IN" else " ya ").join(choices)
+                    message = {
+                        "en-IN": f"You mentioned {joined}. Which one should I check for delivery?",
+                        "hi-IN": f"आपने {joined} कहा। डिलीवरी के लिए किस समय की जाँच करूँ?",
+                        "hi-en": f"Aapne {joined} kaha. Delivery ke liye kaunsa time check karoon?",
+                    }[language]
+                    time_choices = True
+            meta.wording_source = "template" if (reason is not None or date_aware or time_choices) else "model"
             meta.fallback_reason = meta.fallback_reason or reason or (
+                "TIME_CHOICES_CLARIFICATION" if time_choices else
                 "DATE_AWARE_CLARIFICATION" if date_aware else None
             )
             turn = self.calls.submit_turn(
@@ -1918,10 +1978,18 @@ class PlannerService:
             self.db.commit()
 
         old_details = load_details(self.db, session_id)
+        _fill_clear_time(decision, request.text, old_details, order)
         try:
             details = merge_details(self.db, session_id, request.text, old_details, decision.request_details)
             normalize_clarification(decision, details, order, self._slots(order.id))
             if decision.proposal is not None:
+                primary = decision.proposal.primary
+                if (
+                    primary.action == PlanAction.RESCHEDULE
+                    and details.action in {"LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY"}
+                ):
+                    primary.action = PlanAction(details.action)
+                    primary.call_on_arrival = details.call_on_arrival
                 for step in (decision.proposal.primary, decision.proposal.fallback):
                     if step is not None:
                         ground_recipient(self.db, session_id, request.text, step, details)
@@ -2003,6 +2071,11 @@ class PlannerService:
         response = self._execute_decision(session_id, request, decision, meta)
         if decision.proposal is not None:
             primary = decision.proposal.primary
+            if primary.action in {
+                PlanAction.LEAVE_WITH_NEIGHBOR, PlanAction.LEAVE_WITH_SECURITY,
+                PlanAction.HAND_TO_CUSTOMER,
+            }:
+                details.action = primary.action.value
             for field in ("recipient_source", "recipient_address_source"):
                 if getattr(primary, field) is not None:
                     setattr(details, field, getattr(primary, field))

@@ -809,8 +809,9 @@ def test_config_message_sets_the_tts_sample_rate(scripted_llm):
             introduction = ws.receive_json()
             assert introduction["type"] == "opening"
             assert "1042" in introduction["agent_message"]
-            assert "उपलब्ध" in introduction["agent_message"]
-            assert introduction["planner"]["response_language"] == "hi-IN"
+            assert "available" in introduction["agent_message"]
+            assert "IST" not in introduction["agent_message"]
+            assert introduction["planner"]["response_language"] == "hi-en"
             opening = ws.receive_json()
             assert opening["type"] == "agent_audio_chunk"
             assert opening["sample_rate"] == 24_000

@@ -1,6 +1,7 @@
 """Pronounce server-rendered delivery dates without changing their stored values."""
 
 import re
+from datetime import datetime
 
 _EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 _HI = ["जनवरी", "फ़रवरी", "मार्च", "अप्रैल", "मई", "जून", "जुलाई", "अगस्त", "सितंबर", "अक्टूबर", "नवंबर", "दिसंबर"]
@@ -35,6 +36,67 @@ def _time(hour: int, minute: int, language: str) -> str:
     return f"{clock} {period}"
 
 
+def _hindi_period(hour: int) -> str:
+    if hour < 5 or hour >= 20:
+        return "रात"
+    if hour < 12:
+        return "सुबह"
+    if hour < 17:
+        return "दोपहर"
+    return "शाम"
+
+
+def _clock_number(moment: datetime) -> str:
+    twelve = moment.hour % 12 or 12
+    if moment.minute:
+        return f"{twelve}:{moment.minute:02d}"
+    return str(twelve)
+
+
+def spoken_clock(hour: int, minute: int, language: str) -> str:
+    """One clock time, with the part of day and no timezone."""
+    twelve = hour % 12 or 12
+    clock = f"{twelve}:{minute:02d}" if minute else str(twelve)
+    if language == "hi-IN":
+        return f"{_hindi_period(hour)} {clock} बजे"
+    if language == "hi-en":
+        period = {"रात": "raat", "सुबह": "subah", "दोपहर": "dopahar", "शाम": "shaam"}[
+            _hindi_period(hour)
+        ]
+        return f"{period} {clock} baje"
+    return f"{clock} {'AM' if hour < 12 else 'PM'}"
+
+
+def customer_moment(moment: datetime, language: str) -> str:
+    """A single clock time with no timezone name."""
+    if language == "hi-IN":
+        return f"{moment.day} {_HI[moment.month - 1]}, {_hindi_period(moment.hour)} {_clock_number(moment)} बजे"
+    suffix = "AM" if moment.hour < 12 else "PM"
+    return f"{moment:%d %B}, {_clock_number(moment)} {suffix}"
+
+
+def customer_window(start: datetime, end: datetime, language: str) -> str:
+    """A delivery window the way a person would say it, without IST."""
+    if language == "hi-IN":
+        if start.date() == end.date():
+            when = f"{start.day} {_HI[start.month - 1]}"
+        else:
+            when = f"{start.day} {_HI[start.month - 1]} से {end.day} {_HI[end.month - 1]}"
+        start_period = _hindi_period(start.hour)
+        end_period = _hindi_period(end.hour)
+        if start_period == end_period:
+            span = f"{start_period} {_clock_number(start)} से {_clock_number(end)} बजे"
+        else:
+            span = f"{start_period} {_clock_number(start)} से {end_period} {_clock_number(end)} बजे"
+        return f"{when}, {span}"
+    start_suffix = "AM" if start.hour < 12 else "PM"
+    end_suffix = "AM" if end.hour < 12 else "PM"
+    clocks = f"{_clock_number(start)} {start_suffix}-{_clock_number(end)} {end_suffix}"
+    if start.date() == end.date():
+        return f"{start:%d %B}, {clocks}"
+    return f"{start:%d %B} {clocks.split('-')[0]}-{end:%d %B} {_clock_number(end)} {end_suffix}"
+
+
 def spoken_text(text: str, language: str = "hi-en") -> str:
     """Convert date/time labels only; keep identifiers and customer names intact.
 
@@ -54,4 +116,5 @@ def spoken_text(text: str, language: str = "hi-en") -> str:
     # A range dash belongs to the clock label, not an order number or name.
     rendered = re.sub(r"(?<=\d{2}:\d{2})\s*[-–—]\s*(?=\d{1,2}:\d{2})", " से " if language == "hi-IN" else " to ", rendered)
     rendered = _TIME.sub(lambda m: _time(int(m[1]), int(m[2]), language), rendered)
-    return re.sub(r"\bIST\b", "भारतीय समय" if language == "hi-IN" else "Indian Standard Time", rendered)
+    rendered = re.sub(r"\bIST\b|भारतीय समय|Indian Standard Time", "", rendered, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]{2,}", " ", rendered).strip()

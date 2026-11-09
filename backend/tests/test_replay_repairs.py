@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 
+import pytest
 from sqlmodel import select
 from test_planner import db as planner_database
 from test_planner import decision, run, start_call, valid_proposal
@@ -9,9 +10,70 @@ from app.calls import MAX_CLARIFICATIONS, CallService
 from app.llm import LLMStructuredOutputError
 from app.models import AuditEvent, DeliverySlot, Order, PlanProposalRecord, Speaker, Turn
 from app.planner import PlannerService
+from app.policy import IST, _utc
 from app.schemas import PlannerAction
 
 db = planner_database
+
+
+@pytest.mark.parametrize("text", [
+    "4 PM or 8 PM", "4pm or 8pm", "दोपहर चार बजे या रात आठ बजे",
+])
+def test_two_clock_question_names_the_choices_without_broken_script(db, scripted_llm, text):
+    daytime(db)
+    item = decision(PlannerAction.ASK_CLARIFICATION, "कृपया एक hi समय बताइए.")
+    item.update(missing_fields=["time"], request_details=None)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, text)
+    assert "4" in result.agent_message and "8" in result.agent_message
+    assert "एक hi" not in result.agent_message
+    assert result.planner.wording_source == "template"
+    assert not result.turn.customer_confirmed
+    assert planner.calls.get_call(call.id).current_proposal_id is None
+
+
+@pytest.mark.parametrize(("hour", "direct"), [(16, False), (20, False), (16, True)])
+def test_model_reschedule_preserves_verified_neighbour_and_otp(db, scripted_llm, hour, direct):
+    order = daytime(db)
+    proposal = valid_proposal()
+    proposal["primary"].update(
+        action="LEAVE_WITH_NEIGHBOR",
+        window_start=order.window_start.isoformat(), window_end=order.window_end.isoformat(),
+        named_recipient="Sharma ji", recipient_address="403",
+        recipient_source=quote("Sharma ji"), recipient_address_source=quote("403"),
+        call_on_arrival=True,
+    )
+    changed = valid_proposal()
+    start = _utc(order.window_start).astimezone(IST).replace(hour=hour, minute=0)
+    changed["primary"].update(
+        action="RESCHEDULE", window_start=start.isoformat(),
+        window_end=start.replace(hour=hour + 1).isoformat(),
+    )
+    first = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)
+    second = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=changed)
+    second["request_details"] = {
+        "action": "HAND_TO_CUSTOMER" if direct else "RESCHEDULE",
+        "window_start": start.isoformat(),
+        "time_source": quote(f"{hour}:00"),
+    }
+    planner = PlannerService(db, scripted_llm([first, second]))
+    call = start_call(planner.calls)
+    run(planner, call.id, "Please leave it with Sharma ji at 403")
+    text = f"Change the time to {hour}:00"
+    if direct:
+        text += " and give it directly to me instead"
+    result = run(planner, call.id, text)
+    record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
+    primary = json.loads(record.proposal_json)["primary"]
+    assert primary["action"] == ("RESCHEDULE" if direct else "LEAVE_WITH_NEIGHBOR")
+    assert primary["named_recipient"] == (None if direct else "Sharma ji")
+    assert primary["recipient_address"] == (None if direct else "403")
+    assert primary["call_on_arrival"] is True
+    if not direct:
+        assert primary["recipient_source"]["turn_id"] is not None
+    assert result.turn.verdict.valid == (hour == 16)
+    assert not result.turn.customer_confirmed
 
 
 def daytime(db):
@@ -30,6 +92,32 @@ def daytime(db):
 
 def quote(text, turn_id=None):
     return {"turn_id": turn_id, "quote": text}
+
+
+def test_neighbour_and_new_time_in_one_turn_are_kept_together(db, scripted_llm):
+    order = daytime(db)
+    start = _utc(order.window_start).astimezone(IST).replace(hour=16, minute=0)
+    proposal = valid_proposal()
+    proposal["primary"].update(
+        action="RESCHEDULE", window_start=start.isoformat(),
+        window_end=start.replace(hour=17).isoformat(),
+    )
+    item = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)
+    item["request_details"] = {
+        "action": "LEAVE_WITH_NEIGHBOR", "window_start": start.isoformat(),
+        "time_source": quote("4pm"), "recipient_source": quote("Arvind"),
+        "recipient_address_source": quote("403"), "call_on_arrival": True,
+    }
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "Please deliver at 4pm to my neighbour Arvind in house 403")
+    record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
+    primary = json.loads(record.proposal_json)["primary"]
+    assert result.turn.verdict.valid
+    assert primary["action"] == "LEAVE_WITH_NEIGHBOR"
+    assert primary["named_recipient"] == "Arvind"
+    assert primary["recipient_address"] == "403"
+    assert not result.turn.customer_confirmed
 
 
 def test_five_oclock_after_four_clarifications_proposes_and_commits(db, scripted_llm):
@@ -167,7 +255,7 @@ def test_clarification_inserts_recorded_window_and_language_warning_keeps_topic(
     planner = PlannerService(db, llm)
     call = start_call(planner.calls)
     result = run(planner, call.id, "थोड़ा पहले आएंगे?")
-    assert "10:00-12:00" in result.agent_message
+    assert "सुबह 10" in result.agent_message and "दोपहर 12" in result.agent_message
     assert result.planner.wording_source == "model"
     result = run(planner, call.id, "Aapki aawaz toot rahi hai, meri baat aapko samajh aa rahi hai?")
     assert "hear my last reply" in result.agent_message

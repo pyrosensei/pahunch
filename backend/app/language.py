@@ -105,6 +105,23 @@ def response_language(text: str) -> str:
     return "en-IN"
 
 
+_TIME_CUE = re.compile(
+    r"\b(?:am|pm|baje|subah|dopahar|shaam|raat|morning|afternoon|evening|night|o'clock)\b|"
+    r"बजे|सुबह|दोपहर|शाम|रात",
+    re.IGNORECASE,
+)
+_DIGIT_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ek": "1", "do": "2", "teen": "3", "char": "4", "chaar": "4", "paanch": "5",
+    "panch": "5", "chhe": "6", "che": "6", "saat": "7", "aath": "8", "nau": "9",
+    "shunya": "0",
+    "शून्य": "0", "एक": "1", "दो": "2", "तीन": "3", "चार": "4", "पाँच": "5",
+    "पांच": "5", "छह": "6", "सात": "7", "आठ": "8", "नौ": "9",
+}
+_HOUSE_CUE = re.compile(r"house|हाउस|number|नंबर|नम्बर|\bno\b|ghar|मकान", re.IGNORECASE)
+
+
 def conversation_language(text: str, previous: str = "hi-IN") -> str:
     """Keep acknowledgements and brief Hindi replies in the established language."""
     if re.fullmatch(r"\s*(?:please\s+)?(?:speak|reply|continue|talk)(?: to me)?(?: in)? english[.!?\s]*", text, re.IGNORECASE):
@@ -122,6 +139,10 @@ def conversation_language(text: str, previous: str = "hi-IN") -> str:
     hindi_words = re.findall(r"[\u0900-\u097f]+", text)
     if hindi_words and not words and len(hindi_words) <= 2:
         return previous
+    # A Hinglish call stays Hinglish when the customer answers in Devanagari.
+    # Full Hindi is only for an explicit request, handled above.
+    if hindi_words and previous == "hi-en":
+        return "hi-en"
     if hindi_words:
         # One borrowed word must not change a whole conversation. Substantial
         # evidence in both scripts represents mixed speech, not pure Hindi.
@@ -323,6 +344,8 @@ _DAY_WORDS = {
     "बाईस": 22, "तेईस": 23, "चौबीस": 24, "पच्चीस": 25, "छब्बीस": 26,
     "सत्ताईस": 27, "अट्ठाईस": 28, "उनतीस": 29, "तीस": 30, "इकतीस": 31,
 }
+_CLOCK_HOURS = {word: value for word, value in _DAY_WORDS.items() if value <= 12}
+_CLOCK_HOURS.update({"zero": 0, "shunya": 0, "शून्य": 0})
 
 
 @dataclass
@@ -360,19 +383,202 @@ def _day_after(suffix: str) -> int | None:
     return None
 
 
-def mentioned_date(text: str, language: str) -> str | None:
-    """Return the date the customer named, for a date-aware clarification."""
+def _mentioned_date_match(text: str) -> tuple[int, int, str] | None:
     normalized = normalize_text(text)
     for match in _MONTH_ANY.finditer(normalized):
-        if _MONTH_NAMES.get(normalize_text(match.group(0))) is None:
+        month = _MONTH_NAMES.get(normalize_text(match.group(0)))
+        if month is None:
             continue
         day = _day_before(normalized[: match.start()]) or _day_after(
             normalized[match.end() :]
         )
         if day is None or not 1 <= day <= 31:
             continue
-        return f"{day} {match.group(0)}"
+        return day, month, match.group(0)
     return None
+
+
+def mentioned_date_parts(text: str) -> tuple[int, int] | None:
+    """Return the day and month number the customer named."""
+    found = _mentioned_date_match(text)
+    if found is None:
+        return None
+    return found[0], found[1]
+
+
+def mentioned_date(text: str, language: str) -> str | None:
+    """Return the date the customer named, for a date-aware clarification."""
+    found = _mentioned_date_match(text)
+    if found is None:
+        return None
+    return f"{found[0]} {found[2]}"
+
+
+def _period_name(token: str) -> str | None:
+    if token == "am":
+        return "ampm-am"
+    if token == "pm":
+        return "ampm-pm"
+    if re.fullmatch(r"सुबह|subah|morning", token):
+        return "morning"
+    if re.fullmatch(r"दोपहर|dopahar|afternoon|noon", token):
+        return "afternoon"
+    if re.fullmatch(r"शाम|shaam|evening", token):
+        return "evening"
+    if re.fullmatch(r"रात|raat|night", token):
+        return "night"
+    return None
+
+
+def _clock_token(token: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", token)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+        return None
+    attached = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm)", token)
+    if attached:
+        hour = int(attached.group(1))
+        minute = int(attached.group(2) or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    if token.isdigit():
+        hour = int(token)
+        return (hour, 0) if 0 <= hour <= 23 else None
+    hour = _CLOCK_HOURS.get(token)
+    if hour is None:
+        return None
+    return hour, 0
+
+
+def _resolve_clock(period: str, hour: int, minute: int) -> tuple[int, int] | None:
+    if not 0 <= minute <= 59:
+        return None
+    if period == "ampm-am":
+        if hour == 12:
+            hour = 0
+        elif hour > 12:
+            return None
+    elif period == "ampm-pm":
+        if hour < 12:
+            hour += 12
+        elif hour > 23:
+            return None
+    elif period == "morning":
+        if not 1 <= hour <= 12:
+            return None
+    elif period == "afternoon":
+        if hour == 12:
+            pass
+        elif 1 <= hour <= 6:
+            hour += 12
+        elif not 13 <= hour <= 18:
+            return None
+    elif period == "evening":
+        if 1 <= hour <= 11:
+            hour += 12
+        elif not 12 <= hour <= 23:
+            return None
+    elif period == "night":
+        if hour == 12:
+            hour = 0
+        elif 1 <= hour <= 5:
+            pass
+        elif 6 <= hour <= 11:
+            hour += 12
+        elif not 0 <= hour <= 23:
+            return None
+    else:
+        return None
+    return hour, minute
+
+
+def mentioned_times(text: str) -> list[tuple[int, int]]:
+    """Every explicit clock in the utterance, in order, without duplicates."""
+    tokens = re.sub(r"[,.!?।]", " ", normalize_text(text)).split()
+    clocks = [(index, _clock_token(token)) for index, token in enumerate(tokens)]
+    clocks = [(index, clock) for index, clock in clocks if clock is not None]
+    periods = [(index, _period_name(token)) for index, token in enumerate(tokens)]
+    periods = [(index, period) for index, period in periods if period is not None]
+    found: list[tuple[int, int]] = []
+    for index, (hour, minute) in clocks:
+        attached = re.fullmatch(r"\d{1,2}(?::\d{2})?(am|pm)", tokens[index])
+        if attached:
+            resolved = _resolve_clock(f"ampm-{attached.group(1)}", hour, minute)
+            if resolved is not None:
+                found.append(resolved)
+            continue
+        nearest: tuple[int, str] | None = None
+        for period_index, period in periods:
+            distance = abs(period_index - index)
+            limit = 1 if period.startswith("ampm") else 4
+            if distance == 0 or distance > limit:
+                continue
+            if any(min(index, period_index) < other < max(index, period_index) for other, _ in clocks):
+                continue
+            if nearest is None or distance < nearest[0] or (
+                distance == nearest[0] and period_index > index
+            ):
+                nearest = (distance, period)
+        if nearest is None:
+            if ":" in tokens[index] and (hour >= 13 or hour == 0):
+                found.append((hour, minute))
+            continue
+        resolved = _resolve_clock(nearest[1], hour, minute)
+        if resolved is not None:
+            found.append(resolved)
+    return list(dict.fromkeys(found))
+
+
+def mentioned_time(text: str) -> tuple[int, int] | None:
+    """Return one explicit clock time, or None when the utterance is ambiguous."""
+    found = mentioned_times(text)
+    if len(found) != 1:
+        return None
+    return found[0]
+
+
+def mixed_script(text: str) -> bool:
+    """A reply that switches between Devanagari and Latin in one sentence."""
+    return bool(_HINDI.search(text) and re.search(r"[A-Za-z]", text))
+
+
+def number_words(text: str) -> set[str]:
+    """Digit strings for number words, so a spoken hour can be repeated."""
+    found: set[str] = set()
+    for token in re.findall(r"[A-Za-z\u0900-\u097f]+|\d+", normalize_text(text)):
+        if token.isdigit():
+            found.add(str(int(token)))
+            if int(token) < 10:
+                found.add(f"{int(token):02d}")
+            continue
+        digit = _DIGIT_WORDS.get(token)
+        if digit is None:
+            continue
+        found.add(digit)
+        if len(digit) == 1:
+            found.add(f"0{digit}")
+    return found
+
+
+def recipient_label(field: str, quote: str) -> str:
+    """Keep a courier label to the name or house number inside a longer sentence."""
+    text = " ".join(quote.split())
+    if field == "named_recipient":
+        match = re.match(r"(.+?)\s+(?:नाम|naam|name)\b", text, re.IGNORECASE)
+        if match and 1 <= len(match.group(1).split()) <= 3:
+            return match.group(1).strip(" ,.")
+        return text
+    if field != "recipient_address" or _HOUSE_CUE.search(text) is None:
+        return text
+    digits = []
+    for token in normalize_text(text).split():
+        if token.isdigit():
+            digits.append(token)
+        elif token in _DIGIT_WORDS:
+            digits.append(_DIGIT_WORDS[token])
+    return "".join(digits) if digits else text
 
 
 def _apply_known_dates(text: str, facts: KnownFacts) -> tuple[str, bool]:
@@ -447,7 +653,11 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
             dates=set(known_facts.dates) if known_facts else set(),
             times=set(known_facts.times) if known_facts else set(),
             numbers=(set(known_facts.numbers) if known_facts else set())
-            | set(re.findall(r"\d+", source_text)),
+            | (
+                number_words(source_text)
+                if _TIME_CUE.search(source_text)
+                else set(re.findall(r"\d+", source_text))
+            ),
             quotes=set(known_facts.quotes) if known_facts else set(),
         )
         if source_text.strip():

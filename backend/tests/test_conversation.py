@@ -7,7 +7,7 @@ from test_planner import db as planner_database
 from test_planner import run, start_call, valid_proposal
 
 from app.calls import MAX_CLARIFICATIONS, MAX_TURNS
-from app.language import conversation_language, mentioned_date, phrase
+from app.language import conversation_language, mentioned_date, mentioned_time, phrase
 from app.llm import LLMTimeoutError
 from app.models import Order, PaymentMode, PlanProposalRecord, Turn
 from app.planner import PlannerService
@@ -77,6 +77,7 @@ def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
         ("Cancel delivery", "hi-IN", "en-IN"),
         ("Please tell me the delivery details", "hi-IN", "en-IN"),
         ("मुझे डिलीवरी का समय बताइए", "en-IN", "hi-IN"),
+        ("मुझे डिलीवरी का समय बताइए", "hi-en", "hi-en"),
         ("मैंने अभी order किया, order और delivery date अलग होगी ना?", "hi-IN", "hi-en"),
     ],
 )
@@ -147,7 +148,10 @@ def test_model_wrapper_uses_server_facts_and_records_source(
     assert result.planner.wording_source == "model"
     assert result.planner.fallback_reason is None
     assert result.planner.response_language == language
-    assert "18:00" in result.agent_message and "20:00" in result.agent_message
+    if language == "hi-IN":
+        assert "शाम 6" in result.agent_message and "रात 8" in result.agent_message
+    else:
+        assert "6 PM" in result.agent_message and "8 PM" in result.agent_message
     assert "{" not in result.agent_message
     assert result.turn.verdict.valid and not result.turn.customer_confirmed
     agent = list(db.exec(select(Turn).where(Turn.session_id == call.id)).all())[-1]
@@ -185,7 +189,7 @@ def test_unsafe_or_unknown_wrapper_falls_back_without_discarding_valid_plan(
     assert result.turn.verdict.valid
     assert not result.turn.customer_confirmed
     assert "123456" not in result.agent_message
-    assert "18:00" in result.agent_message
+    assert "6 PM" in result.agent_message and "8 PM" in result.agent_message
 
 
 def test_invalid_policy_always_uses_deterministic_refusal(db, scripted_llm):
@@ -399,7 +403,7 @@ def test_timeout_fallback_mirrors_english(db, scripted_llm):
 @pytest.mark.parametrize(
     "message,expected",
     [
-        ("Your scheduled delivery window is {order_window}.", "18:00-20:00"),
+        ("Your scheduled delivery window is {order_window}.", "12 PM-3 PM"),
         ("The payment mode is {payment_mode}.", "cash on delivery"),
         ("{handoff_policy}", "Direct customer handoff is required"),
     ],
@@ -409,7 +413,7 @@ def test_question_answers_use_server_order_and_policy_facts(db, scripted_llm, me
     call = start_call(planner.calls, 1043)
     result = run(planner, call.id, "What are my delivery details?")
     if "window" in message:
-        assert "12:00-15:00" in result.agent_message
+        assert "12 PM-3 PM" in result.agent_message
     else:
         assert expected in result.agent_message
     assert result.planner.wording_source == "model"
@@ -447,7 +451,7 @@ def test_distinct_customer_turns_get_distinct_contextual_replies_then_commit(db,
         "Please hand it directly to me and retry after fifteen minutes if unreachable",
     )
     assert greeting.agent_message != answer.agent_message != offered.agent_message
-    assert "18:00-20:00" in answer.agent_message
+    assert "6 PM-8 PM" in answer.agent_message
     assert offered.planner.wording_source == "model"
     assert '"recent_turns"' in llm.requests[-1]["user_prompt"]
     assert "Hello, how can I help" in llm.requests[-1]["user_prompt"]
@@ -487,7 +491,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
     assert result.turn.verdict.valid
     assert result.planner.wording_source == "model"
     assert "Sharma ji" in result.agent_message
-    assert "14:00-16:00" in result.agent_message
+    assert "2 PM-4 PM" in result.agent_message
 
 
 def test_recipient_text_cannot_insert_an_otp_request_into_server_wording(db, scripted_llm):
@@ -543,7 +547,8 @@ def test_response_placeholder_is_filled_with_server_facts(db, scripted_llm):
     result = run(planner, call.id, "मुझे एक बात बतानी थी")
     assert result.planner.wording_source == "model"
     assert result.planner.fallback_reason is None
-    assert "10:00-12:00" in result.agent_message
+    assert "सुबह 10" in result.agent_message and "दोपहर 12" in result.agent_message
+    assert "IST" not in result.agent_message and "भारतीय समय" not in result.agent_message
     assert "{" not in result.agent_message
 
 
@@ -690,7 +695,8 @@ def test_rejected_reply_fallback_restates_the_scheduled_window(db, scripted_llm)
     result = run(planner, call.id, "मुझे एक बात बतानी थी")
     assert result.planner.wording_source == "template"
     assert result.planner.fallback_reason == "UNSAFE_WORDING"
-    assert "10:00-12:00" in result.agent_message
+    assert "सुबह 10" in result.agent_message and "दोपहर 12" in result.agent_message
+    assert "IST" not in result.agent_message
 
 
 def test_promise_to_hand_the_parcel_to_someone_is_rejected(db, scripted_llm):
@@ -754,3 +760,83 @@ def test_specific_model_clarification_with_a_date_is_kept(db, scripted_llm):
     assert result.agent_message == "क्या बारह नवंबर को शाम छह बजे ठीक है?"
     assert result.planner.wording_source == "model"
     assert result.planner.fallback_reason is None
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("रात के आठ बजे", (20, 0)),
+        ("रात के चार बजे", (4, 0)),
+        ("शाम के चार बजे", (16, 0)),
+        ("सुबह के आठ बजे", (8, 0)),
+        ("8 बजे रात", (20, 0)),
+        ("4 PM", (16, 0)),
+        ("10 AM", (10, 0)),
+        ("20:00", (20, 0)),
+        ("चार बजे like दोपहर को हो सकता है, या फिर रात के आठ बजे", None),
+        ("6 se 8", None),
+        ("पाँच बजे", None),
+    ],
+)
+def test_mentioned_time_accepts_one_explicit_clock(text, expected):
+    assert mentioned_time(text) == expected
+
+
+def test_spoken_hour_words_can_be_repeated_as_digits(db, scripted_llm):
+    fixed_window(db)
+    message = "क्या आप 4 बजे दोपहर या 8 बजे रात को डिलीवरी चाहते हैं?"
+    item = reply("ASK_CLARIFICATION", message)
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(
+        planner,
+        call.id,
+        "वैसे चार बजे like दोपहर को हो सकता है, या फिर रात के आठ बजे।",
+    )
+    assert result.planner.action.value == "ASK_CLARIFICATION"
+    assert result.planner.wording_source == "model"
+    assert result.agent_message == message
+
+
+def test_one_clear_time_is_stored_with_the_named_neighbour(db, scripted_llm):
+    proposal = valid_proposal()
+    proposal["primary"]["action"] = "LEAVE_WITH_NEIGHBOR"
+    proposal["primary"]["named_recipient"] = "अरविंद नाम है हमारे भाई का"
+    proposal["primary"]["recipient_address"] = "house number four zero three"
+    proposal["primary"]["recipient_source"] = {
+        "turn_id": None,
+        "quote": "अरविंद नाम है हमारे भाई का",
+    }
+    proposal["primary"]["recipient_address_source"] = {
+        "turn_id": None,
+        "quote": "house number four zero three",
+    }
+    follow = reply("ASK_CLARIFICATION", "डिलीवरी का कौन सा समय आपके लिए ठीक रहेगा?")
+    follow.update(missing_fields=["time", "recipient"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(
+        db,
+        scripted_llm(
+            [
+                reply("PROPOSE_PLAN", "{plan_summary} {confirmation_question}", proposal),
+                follow,
+            ]
+        ),
+    )
+    call = start_call(planner.calls)
+    first = run(
+        planner,
+        call.id,
+        "अरविंद नाम है हमारे भाई का, वो हमारे बगल वाले घर में रहते हैं, house number four zero three में।",
+    )
+    assert first.turn.verdict is not None and first.turn.verdict.valid
+    assert "अरविंद" in first.agent_message and "403" in first.agent_message
+    assert "नाम है हमारे भाई" not in first.agent_message
+    result = run(planner, call.id, "शाम के छह बजे।")
+    assert result.planner.action.value == "PROPOSE_PLAN"
+    assert "कौन सा समय" not in result.agent_message
+    record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
+    stored = json.loads(record.proposal_json)
+    assert stored["primary"]["named_recipient"] == "अरविंद"
+    assert stored["primary"]["recipient_address"] == "403"
+    assert "T18:00" in stored["primary"]["window_start"]

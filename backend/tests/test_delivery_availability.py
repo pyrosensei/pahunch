@@ -56,7 +56,7 @@ def test_requested_three_pm_requires_confirmation_then_commits(db, scripted_llm)
     planner = PlannerService(db, llm)
     proposed = run(planner, call.id, "Please move delivery to 3 pm on the same date")
     assert proposed.turn.verdict.valid and not proposed.turn.customer_confirmed
-    assert "15:00" in proposed.agent_message
+    assert "3 PM-5 PM" in proposed.agent_message
     with pytest.raises(DomainError):
         planner.calls.commit_plan(call.id, "unconfirmed-change")
     confirmed = run(planner, call.id, "Yes, please go ahead")
@@ -76,9 +76,13 @@ def test_availability_questions_do_not_call_model_or_repeat_rejected_plan(db, qu
     call = start_call(CallService(db))
     response = run(PlannerService(db, NoModel()), call.id, question)
     assert response.planner.fallback_reason == "DELIVERY_AVAILABILITY"
-    assert "10:00" in response.agent_message and "18:00" in response.agent_message
-    assert "08:00" not in response.agent_message
-    assert "05 November" in response.agent_message and "06 November" in response.agent_message
+    if response.planner.response_language == "hi-IN":
+        assert "सुबह 10" in response.agent_message and "शाम 6" in response.agent_message
+        assert "नवंबर" in response.agent_message
+    else:
+        assert "10 AM" in response.agent_message and "6 PM" in response.agent_message
+        assert "05 November" in response.agent_message and "06 November" in response.agent_message
+    assert "08:00" not in response.agent_message and "8 AM" not in response.agent_message
     assert not response.turn.customer_confirmed
 
 
@@ -88,8 +92,8 @@ def test_out_of_hours_request_offers_actual_dates_and_no_false_reschedule(db, sc
     llm = scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal={"primary": {"action": "RESCHEDULE", "window_start": at("05T19:00:00").isoformat(), "window_end": at("05T21:00:00").isoformat()}})])
     response = run(PlannerService(db, llm), call.id, "Please deliver at 7 pm on the same day")
     assert not response.turn.verdict.valid
-    assert "06 November" in response.agent_message and "18:00" in response.agent_message
-    assert "10:00" in response.agent_message
+    assert "06 November" in response.agent_message and "10 AM" in response.agent_message
+    assert "6 PM" in response.agent_message
     assert "05 November" not in response.agent_message
     assert not response.turn.customer_confirmed
 
