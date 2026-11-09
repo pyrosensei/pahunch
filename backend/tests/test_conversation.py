@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 import pytest
 from sqlmodel import select
@@ -6,9 +7,9 @@ from test_planner import db as planner_database
 from test_planner import run, start_call, valid_proposal
 
 from app.calls import MAX_CLARIFICATIONS, MAX_TURNS
-from app.language import conversation_language, phrase
+from app.language import conversation_language, mentioned_date, phrase
 from app.llm import LLMTimeoutError
-from app.models import PlanProposalRecord, Turn
+from app.models import Order, PaymentMode, PlanProposalRecord, Turn
 from app.planner import PlannerService
 from app.schemas import PlannerDecision
 
@@ -32,6 +33,8 @@ def reply(action, message, proposal=None, confidence=0.95):
         ("नमस्ते", "greeting", "hi-IN"),
         ("Namaste", "greeting", "hi-IN"),
         ("Can you hear me?", "heard", "en-IN"),
+        ("आपको मेरी आवाज़ आ रही?", "heard", "hi-IN"),
+        ("आपको मेरी आवाज़ आ रही है?", "heard", "hi-IN"),
     ],
 )
 def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
@@ -44,6 +47,18 @@ def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
     assert result.planner.wording_source == "template"
     assert result.planner.fallback_reason == "UNSAFE_WORDING"
     assert result.turn.verdict is None
+    rejected = [
+        json.loads(event.payload_json)
+        for event in planner.calls.list_events(call.id)
+        if event.event_type == "WORDING_REJECTED"
+    ]
+    assert rejected[-1] == {
+        "action": "RESPOND",
+        "reason": "UNSAFE_WORDING",
+        "wording": "I will deliver the parcel.",
+        "outcome": "replaced",
+        "fallback": key,
+    }
 
 
 @pytest.mark.parametrize(
@@ -507,3 +522,235 @@ def test_unfinished_customer_detail_is_marked_without_saving_a_plan(db, scripted
     assert result.planner.wording_source == "model"
     assert not result.turn.customer_confirmed
     assert planner.calls.get_call(call.id).current_proposal_id is None
+
+
+def fixed_window(db):
+    order = db.get(Order, 1042)
+    order.window_start = datetime.fromisoformat("2026-11-05T10:00:00+05:30")
+    order.window_end = datetime.fromisoformat("2026-11-05T12:00:00+05:30")
+    db.add(order)
+    db.commit()
+    return order
+
+
+def test_response_placeholder_is_filled_with_server_facts(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपकी डिलीवरी का निर्धारित समय {order_window} है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+    assert "10:00-12:00" in result.agent_message
+    assert "{" not in result.agent_message
+
+
+def test_response_may_repeat_known_order_facts(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपका ऑर्डर 1042 है और डिलीवरी 10:00-12:00 में है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+    assert "1042" in result.agent_message
+
+
+def test_response_with_invented_date_and_time_is_rejected(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपकी डिलीवरी 25 दिसंबर को 09:30 बजे है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "25" not in result.agent_message
+    assert "09:30" not in result.agent_message
+
+
+def test_response_commitment_language_stays_blocked_with_a_placeholder(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "मैं आपका पार्सल पड़ोसी को सौंप दूँगा {order_window} में।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "पड़ोसी" not in result.agent_message
+
+
+def multi_handoff_order(db):
+    order = db.get(Order, 1042)
+    order.payment_mode = PaymentMode.PREPAID
+    order.safe_drop_allowed = True
+    order.security_drop_allowed = True
+    order.neighbour_drop_allowed = True
+    order.requires_otp = False
+    order.declared_value_inr = 500
+    order.window_start = datetime.fromisoformat("2026-11-05T10:00:00+05:30")
+    order.window_end = datetime.fromisoformat("2026-11-05T12:00:00+05:30")
+    db.add(order)
+    db.commit()
+    return order
+
+
+def test_response_uses_the_server_handoff_policy(db, scripted_llm):
+    multi_handoff_order(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "{handoff_policy} जानकारी दीजिए।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+    assert "अनुमत तरीके" in result.agent_message
+
+
+def test_delivery_commitment_in_english_is_rejected(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "I will give it to the guard at the gate.")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "guard" not in result.agent_message
+
+
+def test_delivery_commitment_in_hindi_is_rejected(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "मैं आपका पार्सल पड़ोसी को दे दूँगा।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "पड़ोसी" not in result.agent_message
+
+
+def test_invented_hindi_month_is_rejected_even_when_the_day_is_known(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपकी डिलीवरी 5 दिसंबर को है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "फ्लैट 5 में रहता हूँ")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "दिसंबर" not in result.agent_message
+
+
+def test_spelled_out_month_in_a_reply_is_rejected(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपकी डिलीवरी दिसंबर में है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "दिसंबर" not in result.agent_message
+
+
+def test_known_day_and_month_in_a_reply_is_kept(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "आपकी डिलीवरी 5 नवंबर को तय है।")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+    assert "5 नवंबर" in result.agent_message
+
+
+def test_rejected_reply_fallback_restates_the_scheduled_window(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "I will deliver the parcel myself.")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मुझे एक बात बतानी थी")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "10:00-12:00" in result.agent_message
+
+
+def test_promise_to_hand_the_parcel_to_someone_is_rejected(db, scripted_llm):
+    fixed_window(db)
+    planner = PlannerService(
+        db,
+        scripted_llm([reply("RESPOND", "I will hand it to Sharma ji at the gate.")]),
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "��?�� �Ϫ����� �Ϫ��υ������? �Ͼ��?")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "UNSAFE_WORDING"
+    assert "Sharma" not in result.agent_message
+
+
+@pytest.mark.parametrize(
+    "text,language,expected",
+    [
+        ("बारह नवंबर को हो सकता है।", "hi-IN", "12 नवंबर"),
+        ("12 नवंबर को शाम 6 से 8 बजे।", "hi-IN", "12 नवंबर"),
+        ("12 November works for me", "en-IN", "12 november"),
+        ("November 12 works for me", "en-IN", "12 november"),
+        ("You may call me later", "en-IN", None),
+    ],
+)
+def test_mentioned_date_extracts_a_day_and_month(text, language, expected):
+    assert mentioned_date(text, language) == expected
+
+
+def test_date_only_utterance_gets_a_date_aware_time_clarification(db, scripted_llm):
+    fixed_window(db)
+    item = reply("ASK_CLARIFICATION", "डिलीवरी का कौन सा समय आपके लिए ठीक रहेगा?")
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
+    assert result.agent_message == "12 नवंबर को कौन सा समय ठीक रहेगा?"
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "DATE_AWARE_CLARIFICATION"
+
+
+def test_date_only_utterance_gets_a_date_aware_time_clarification_in_english(db, scripted_llm):
+    fixed_window(db)
+    item = reply("ASK_CLARIFICATION", "Which delivery time works for you?")
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "12 November works for me")
+    assert result.agent_message == "What time on 12 November works for you?"
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "DATE_AWARE_CLARIFICATION"
+
+
+def test_specific_model_clarification_with_a_date_is_kept(db, scripted_llm):
+    fixed_window(db)
+    item = reply("ASK_CLARIFICATION", "क्या बारह नवंबर को शाम छह बजे ठीक है?")
+    item.update(missing_fields=["time"], request_details=None, awaiting_continuation=False)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
+    assert result.agent_message == "क्या बारह नवंबर को शाम छह बजे ठीक है?"
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None

@@ -25,6 +25,7 @@ from app.language import (
     OTP_WORD,
     PLAN_PLACEHOLDERS,
     WRAPPER_PREFIXES,
+    KnownFacts,
     conversation_language,
     conversational_input,
     has_otp_disclosure,
@@ -32,6 +33,8 @@ from app.language import (
     is_call_purpose_question,
     is_rejection,
     language_matches,
+    mentioned_date,
+    normalize_text,
     phrase,
     redact_customer_text,
     translate_fixed,
@@ -55,6 +58,7 @@ from app.models import (
     Order,
     PaymentMode,
     PlanProposalRecord,
+    PolicyDecisionRecord,
     Speaker,
     Turn,
 )
@@ -185,6 +189,12 @@ _CONFIRMATION_WORDS = _AFFIRMATIVE_WORDS | {
     "ji",
     "kar",
     "kardo",
+    "de",
+    "dena",
+    "hi",
+    "use",
+    "us",
+    "usko",
     "kariye",
     "karo",
     "ke",
@@ -235,6 +245,11 @@ _DEVANAGARI_WORD_MAP = {
     "बढाओ": "badhao",
     "बढ़ाइए": "badhaiye",
     "बढाइए": "badhaiye",
+    "उसे": "use",
+    "उस": "us",
+    "उसको": "usko",
+    "ही": "hi",
+    "दें": "de",
     "प्लान": "plan",
     "प्लीज़": "please",
     "प्लीज": "please",
@@ -444,6 +459,89 @@ def _window_label(step: PlanStep, language: str = "hi-en") -> str:
     return f"{start:%d %B} {start:%H:%M}-{end:%H:%M} IST"
 
 
+def _respond_fallback(fallback_key: str | None, order: Order, language: str) -> str:
+    """Acknowledge without dead-ending, and restate the scheduled window from the order."""
+    base = phrase(fallback_key or "ack", language)
+    if len([part for part in re.split(r"[.!?।]+", base) if part.strip()]) > 1:
+        return base
+    window = _window_label(
+        PlanStep(
+            action=PlanAction.HAND_TO_CUSTOMER,
+            window_start=order.window_start,
+            window_end=order.window_end,
+        ),
+        language,
+    )
+    fact = {
+        "en-IN": f"Your delivery is scheduled for {window}.",
+        "hi-IN": f"आपकी डिलीवरी {window} में तय है।",
+        "hi-en": f"Aapki delivery {window} mein hai.",
+    }[language]
+    return f"{base} {fact}"
+
+
+def _model_own_wording(message: str, language: str) -> str:
+    """Strip the approved fact-template scaffolding so only the model's words are checked."""
+    text = message
+    for template in FACT_TEMPLATES[language]:
+        for fragment in re.split(r"\{[a-z_]+\}", template):
+            if fragment.strip():
+                text = text.replace(fragment, " ")
+    return re.sub(r"\{(?:order_window|payment_mode|handoff_policy)\}", " ", text)
+
+
+def _payment_mode(order: Order, language: str) -> str:
+    if language == "hi-IN":
+        return "डिलीवरी पर भुगतान" if order.payment_mode == PaymentMode.COD else "पहले से भुगतान"
+    return "cash on delivery" if order.payment_mode == PaymentMode.COD else "prepaid"
+
+
+def _handoff_policy(order: Order, language: str) -> str:
+    alternatives = _allowed_alternatives(order)
+    handoffs = [
+        a
+        for a in alternatives
+        if a
+        in {
+            PlanAction.HAND_TO_CUSTOMER,
+            PlanAction.LEAVE_WITH_SECURITY,
+            PlanAction.LEAVE_WITH_NEIGHBOR,
+        }
+    ]
+    if not handoffs:
+        return {
+            "en-IN": "Delivery details are incomplete; human review is required.",
+            "hi-IN": "डिलीवरी की जानकारी अधूरी है; मानव समीक्षा आवश्यक है।",
+            "hi-en": "Delivery ki details incomplete hain; human review zaroori hai.",
+        }[language]
+    if len(handoffs) <= 1:
+        return {
+            "en-IN": "Direct customer handoff is required.",
+            "hi-IN": "सीधे ग्राहक को पार्सल सौंपना आवश्यक है।",
+            "hi-en": "Is order mein direct handoff zaroori hai.",
+        }[language]
+    verdict = PolicyVerdict(valid=True, violations=[], allowed_alternatives=handoffs)
+    return {
+        "en-IN": "Permitted handoffs: ",
+        "hi-IN": "अनुमत तरीके: ",
+        "hi-en": "Is order ke allowed handoffs: ",
+    }[language] + _offer_labels(verdict, language)
+
+
+def _fill_fact_placeholders(message: str, order: Order, language: str) -> str:
+    """Fill the placeholders the prompt hands to the model with server-owned facts."""
+    window = PlanStep(
+        action=PlanAction.HAND_TO_CUSTOMER,
+        window_start=order.window_start,
+        window_end=order.window_end,
+    )
+    return (
+        message.replace("{order_window}", _window_label(window, language))
+        .replace("{payment_mode}", _payment_mode(order, language))
+        .replace("{handoff_policy}", _handoff_policy(order, language))
+    )
+
+
 def _step_summary(step: PlanStep, language: str = "hi-en") -> str:
     if language == "hi-IN":
         labels = {
@@ -594,7 +692,23 @@ def outbound_opening(db: Session, session_id: str, language: str = "hi-IN") -> t
     product = db.get(DemoOrderProduct, order.id)
     item = product.product_name if product else f"order #{order.id}"
     record = db.get(PlanProposalRecord, call.current_proposal_id) if call.current_proposal_id else None
-    if record:
+    # A policy-rejected plan is not a delivery instruction to repeat to the customer.
+    valid = (
+        db.exec(
+            select(PolicyDecisionRecord).where(
+                PolicyDecisionRecord.proposal_id == call.current_proposal_id
+            )
+        ).first()
+        if record is not None
+        else None
+    )
+    proposal = None
+    if record is not None and valid is not None and valid.valid:
+        try:
+            proposal = PlanProposal.model_validate_json(record.proposal_json)
+        except ValidationError:
+            proposal = None
+    if proposal is not None:
         proposal = PlanProposal.model_validate_json(record.proposal_json)
         prefix = {"en-IN": f"Hello, I am {order.merchant_name}'s automated delivery assistant. We were reviewing these delivery instructions:",
                   "hi-en": f"Namaste, main {order.merchant_name} ki automated delivery assistant hoon. Yeh delivery instructions confirm karne hain:",
@@ -782,6 +896,43 @@ class PlannerService:
         if order is None:
             raise DomainError(404, "Order not found")
         return order
+
+    def _known_facts(self, session_id: str, order: Order) -> KnownFacts:
+        """Server-owned facts a reply may repeat without being treated as invented."""
+        facts = KnownFacts()
+        facts.order_ids.add(str(order.id))
+        windows: list[datetime | None] = [order.window_start, order.window_end]
+        details = load_details(self.db, session_id)
+        if details is not None:
+            for evidence in (details.recipient_source, details.recipient_address_source):
+                if evidence is not None and evidence.quote:
+                    facts.quotes.add(normalize_text(evidence.quote))
+                    facts.numbers.update(re.findall(r"\d+", evidence.quote))
+        call = self.calls.get_call(session_id)
+        if call.current_proposal_id:
+            record = self.db.get(PlanProposalRecord, call.current_proposal_id)
+            decision = self.db.exec(
+                select(PolicyDecisionRecord)
+                .where(PolicyDecisionRecord.proposal_id == call.current_proposal_id)
+            ).first()
+            # A rejected proposal is not a fact the agent may state.
+            if record is not None and decision is not None and decision.valid:
+                try:
+                    proposal = PlanProposal.model_validate_json(record.proposal_json)
+                except ValidationError:
+                    proposal = None
+                if proposal is not None:
+                    windows.extend([proposal.primary.window_start, proposal.primary.window_end])
+        # Bookable slots are server-owned too, so the agent may name them.
+        for slot in self._slots(order.id):
+            windows.extend([slot.start_at, slot.end_at])
+        for window in windows:
+            if window is None:
+                continue
+            local = _local_time(window)
+            facts.dates.add((local.day, local.month))
+            facts.times.add(f"{local:%H:%M}")
+        return facts
 
     def _slots(self, order_id: int) -> list[DeliverySlot]:
         return list(
@@ -1267,88 +1418,82 @@ class PlannerService:
                 decision.action == PlannerAction.RESPOND
                 and decision.message in FACT_TEMPLATES[language]
             ):
-                order = self._order(self.calls.get_call(session_id).order_id)
-                window = PlanStep(
-                    action=PlanAction.HAND_TO_CUSTOMER,
-                    window_start=order.window_start,
-                    window_end=order.window_end,
-                )
-                alternatives = _allowed_alternatives(order)
-                handoffs = [
-                    a
-                    for a in alternatives
-                    if a
-                    in {
-                        PlanAction.HAND_TO_CUSTOMER,
-                        PlanAction.LEAVE_WITH_SECURITY,
-                        PlanAction.LEAVE_WITH_NEIGHBOR,
-                    }
-                ]
-                if len(handoffs) <= 1:
-                    policy = {
-                        "en-IN": "Direct customer handoff is required.",
-                        "hi-IN": "सीधे ग्राहक को पार्सल सौंपना आवश्यक है।",
-                        "hi-en": "Is order mein direct handoff zaroori hai.",
-                    }[language]
-                else:
-                    label_verdict = PolicyVerdict(
-                        valid=True, violations=[], allowed_alternatives=handoffs
-                    )
-                    policy = {
-                        "en-IN": "Permitted handoffs: ",
-                        "hi-IN": "अनुमत तरीके: ",
-                        "hi-en": "Is order ke allowed handoffs: ",
-                    }[language] + _offer_labels(label_verdict, language)
-                if not handoffs:
-                    policy = {
-                        "en-IN": "Delivery details are incomplete; human review is required.",
-                        "hi-IN": "डिलीवरी की जानकारी अधूरी है; मानव समीक्षा आवश्यक है।",
-                        "hi-en": "Delivery ki details incomplete hain; human review zaroori hai.",
-                    }[language]
-                payment = "cash on delivery" if order.payment_mode == PaymentMode.COD else "prepaid"
-                if language == "hi-IN":
-                    payment = (
-                        "डिलीवरी पर भुगतान"
-                        if order.payment_mode == PaymentMode.COD
-                        else "पहले से भुगतान"
-                    )
-                message = (
-                    decision.message.replace("{order_window}", _window_label(window, language))
-                    .replace("{payment_mode}", payment)
-                    .replace("{handoff_policy}", policy)
-                )
+                message = _fill_fact_placeholders(decision.message, order, language)
                 reason = None
             else:
+                checked_message = (
+                    _fill_fact_placeholders(decision.message, order, language)
+                    if decision.action == PlannerAction.RESPOND
+                    else decision.message
+                )
+                uses_fact_template = bool(
+                    re.search(r"\{(?:order_window|payment_mode|handoff_policy)\}", decision.message)
+                )
                 reason = wording_error(
-                    decision.message, language, respond=decision.action == PlannerAction.RESPOND, source_text=request.text, clarification=decision.action == PlannerAction.ASK_CLARIFICATION, relax_language=not bool(re.search(r"(?:speak|reply|continue|talk).{0,15}english|hindi mein|हिंदी में", request.text, re.IGNORECASE))
+                    checked_message, language, respond=decision.action == PlannerAction.RESPOND, source_text=request.text, known_facts=self._known_facts(session_id, order), clarification=decision.action == PlannerAction.ASK_CLARIFICATION, relax_language=not bool(re.search(r"(?:speak|reply|continue|talk).{0,15}english|hindi mein|हिंदी में", request.text, re.IGNORECASE)), wording_text=_model_own_wording(decision.message, language) if uses_fact_template else None
                 )
-                message = (
-                    " ".join(decision.message.split())
-                    if reason is None
-                    else (phrase(conversational_input(request.text), language) if conversational_input(request.text) else clarification_fallback(decision.missing_fields, language))
-                )
+                fallback_key = conversational_input(request.text)
+                if reason is None:
+                    message = " ".join(checked_message.split())
+                elif decision.action == PlannerAction.RESPOND:
+                    message = _respond_fallback(fallback_key, order, language)
+                else:
+                    message = phrase(fallback_key, language) if fallback_key else clarification_fallback(decision.missing_fields, language)
+                if reason is not None:
+                    self.calls._audit(
+                        session_id,
+                        "WORDING_REJECTED",
+                        {
+                            "action": decision.action.value,
+                            "reason": reason,
+                            "wording": redact_customer_text(" ".join(decision.message.split()))[:280],
+                            "outcome": "replaced",
+                            "fallback": fallback_key or ("ack" if decision.action == PlannerAction.RESPOND else "clarification"),
+                        },
+                    )
             if reason is None and not language_matches(decision.message, language):
                 meta.language_warning = "LANGUAGE_MISMATCH"
-            if reason is None and decision.action == PlannerAction.ASK_CLARIFICATION:
+            date_aware = False
+            if decision.action == PlannerAction.ASK_CLARIFICATION:
                 details = load_details(self.db, session_id)
                 current = decision.request_details
                 if current is not None:
+                    # Record what the customer said even when the wording was
+                    # replaced; otherwise the same question repeats forever.
                     try:
                         details = merge_details(self.db, session_id, request.text, details, current)
                     except ValueError:
                         pass
-                replacements = {"order_window": _window_label(PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end), language)}
-                for key, field in (("recipient", "recipient_source"), ("recipient_address", "recipient_address_source")):
-                    evidence = getattr(details, field)
-                    if evidence is not None:
-                        replacements[key] = evidence_text(self.db, session_id, request.text, evidence)
-                for key, value in replacements.items():
-                    message = message.replace("{" + key + "}", value)
-                if "{" in message:
-                    reason = "MISSING_CLARIFICATION_FACT"
-                    message = clarification_fallback(decision.missing_fields, language)
-            meta.wording_source = "model" if reason is None else "template"
-            meta.fallback_reason = meta.fallback_reason or reason
+                if reason is None:
+                    replacements = {"order_window": _window_label(PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end), language)}
+                    for key, field in (("recipient", "recipient_source"), ("recipient_address", "recipient_address_source")):
+                        evidence = getattr(details, field)
+                        if evidence is not None:
+                            try:
+                                replacements[key] = evidence_text(self.db, session_id, request.text, evidence)
+                            except ValueError:
+                                reason = "UNGROUNDED_EVIDENCE"
+                                replacements[key] = ""
+                    for key, value in replacements.items():
+                        message = message.replace("{" + key + "}", value)
+                    if "{" in message:
+                        reason = "MISSING_CLARIFICATION_FACT"
+                        message = clarification_fallback(decision.missing_fields, language)
+                if "time" in decision.missing_fields:
+                    generic = clarification_fallback(decision.missing_fields, language)
+                    date_label = mentioned_date(request.text, language)
+                    if date_label and " ".join(message.split()) == " ".join(generic.split()):
+                        date_label = date_label.title()
+                        message = {
+                            "en-IN": f"What time on {date_label} works for you?",
+                            "hi-IN": f"{date_label} को कौन सा समय ठीक रहेगा?",
+                            "hi-en": f"{date_label} ko kaunsa time theek rahega?",
+                        }[language]
+                        date_aware = True
+            meta.wording_source = "template" if (reason is not None or date_aware) else "model"
+            meta.fallback_reason = meta.fallback_reason or reason or (
+                "DATE_AWARE_CLARIFICATION" if date_aware else None
+            )
             turn = self.calls.submit_turn(
                 session_id,
                 CustomerTurnRequest(text=request.text),

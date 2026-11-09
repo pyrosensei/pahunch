@@ -7,7 +7,7 @@ from test_planner import db as planner_database
 from test_planner import start_call
 from test_realtime_a1 import voice
 
-from app.calls import CallService
+from app.calls import CallService, utc_now
 from app.errors import DomainError
 from app.language import phrase
 from app.models import AuditEvent, Speaker, Turn
@@ -47,6 +47,34 @@ def test_call_purpose_is_answered_with_delivery_context_not_generic_help(db, utt
     assert planner.calls.get_call(call.id).current_proposal_id is None
     assert "checking" not in result.agent_message
     assert "जाँच कर रही" not in result.agent_message
+
+
+def record_opening(db, session_id):
+    db.add(
+        Turn(
+            session_id=session_id,
+            speaker=Speaker.AGENT,
+            text="opening",
+            structured_payload_json=json.dumps({"opening": True}),
+            created_at=utc_now(),
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["आपको मेरी आवाज़ आ रही?", "Hello, आपको मेरी आवाज़ आ रही है?"],
+)
+def test_audibility_question_uses_heard_and_delivery_purpose(db, utterance):
+    planner = PlannerService(db, NoModel())
+    call = start_call(planner.calls, 1042)
+    record_opening(db, call.id)
+    result = asyncio.run(planner.handle_turn(call.id, AgentTurnRequest(text=utterance)))
+    assert result.planner.fallback_reason == "OUTBOUND_DELIVERY_PURPOSE"
+    assert result.agent_message.startswith("हाँ, आपकी आवाज सुनाई दे रही है।")
+    assert "1042" in result.agent_message
+    assert not result.turn.customer_confirmed
 
 
 def test_prepaid_opening_explains_courier_otp_without_collecting_it(db):

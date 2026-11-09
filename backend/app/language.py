@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from dataclasses import dataclass, field
 
 _HINDI = re.compile(r"[\u0900-\u097f]")
 _HINGLISH_WORDS = {
@@ -82,6 +83,16 @@ _RESPONSE_ACTION = re.compile(
     r"\b(leave|security|neighbou?r|handoff|hand-off|reschedule|retry|confirm|finali[sz]e|"
     r"prepaid|cod|payment|cash|scheduled|window|tomorrow|today|padosi|chhod\w*|handover)\b|"
     r"सिक्योरिटी|पड़ोसी|सौंप|छोड़|पुनर्निर्धार|कन्फर्म|पुष्टि|मंजूर|भुगतान|प्रीपेड|नकद|निर्धारित",
+    re.IGNORECASE,
+)
+_DELIVERY_COMMITMENT = re.compile(
+    r"\b(?:will|shall|would|going to|i'll|i will)\b[^.?!]{0,25}?\b(?:left|handed\s+over|given|dropped|placed|dispatched)\b|"
+    r"\b(?:hand\s+over|hand|give|drop|place|leave)\w*\b[^.?!]{0,20}?\b(?:parcel|package|"
+    r"to\s+(?:the\s+|my\s+)?(?:guard|security|neighbou?r|neighbor|door|watchman|porter))\b|"
+    r"\b(?:hand|give|leave|drop)\w*\s+(?:it|them|the\s+parcel|parcel)\s+to\s+\w+|"
+    r"(?:सौंप|छोड़|दे|रख|भेज)\s*(?:दूँगा|दूंगा|देंगे|जाएगा|जायेगा|दिया जाएगा|दिया जायेगा)|"
+    r"(?:पड़ोसी|सिक्योरिटी|गार्ड|नौकर|दरवाज़े)[^.।?!]{0,20}(?:सौंप|छोड़|दे|रख|भेज)\w*\s*"
+    r"(?:दूँगा|दूंगा|देंगे|जाएगा|जायेगा|दिया जाएगा|दिया जायेगा|सकते हैं|सकती हैं)",
     re.IGNORECASE,
 )
 
@@ -274,19 +285,177 @@ FACT_TEMPLATES = {
 }
 
 
-def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False, source_text: str = "", clarification: bool = False, relax_language: bool = False):
+_NUMERIC_EXPRESSION = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?|\d+")
+_MONTH_NAMES = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+    "जनवरी": 1, "फ़रवरी": 2, "फरवरी": 2, "मार्च": 3, "अप्रैल": 4, "मई": 5,
+    "जून": 6, "जुलाई": 7, "अगस्त": 8, "सितंबर": 9, "अक्टूबर": 10, "नवंबर": 11,
+    "दिसंबर": 12,
+}
+_MONTH_ANY = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(name) for name in sorted(_MONTH_NAMES, key=len, reverse=True))
+    + r")(?!\w)",
+    re.IGNORECASE,
+)
+_DAY_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "twenty-one": 21, "twenty-two": 22, "twenty-three": 23,
+    "twenty-four": 24, "twenty-five": 25, "twenty-six": 26,
+    "twenty-seven": 27, "twenty-eight": 28, "twenty-nine": 29,
+    "thirty": 30, "thirty-one": 31,
+    "ek": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5,
+    "panch": 5, "chhe": 6, "che": 6, "saat": 7, "aath": 8, "nau": 9,
+    "das": 10, "gyarah": 11, "barah": 12, "terah": 13, "chaudah": 14,
+    "pandrah": 15, "solah": 16, "satrah": 17, "atharah": 18, "unnis": 19,
+    "bees": 20, "ikkees": 21, "bais": 22, "teis": 23, "chaubis": 24,
+    "pachchis": 25, "chhabbis": 26, "sattais": 27, "atthais": 28,
+    "untees": 29, "tees": 30, "ikattis": 31,
+    "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पाँच": 5, "पांच": 5,
+    "छह": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10, "ग्यारह": 11,
+    "बारह": 12, "तेरह": 13, "चौदह": 14, "पंद्रह": 15, "सोलह": 16,
+    "सत्रह": 17, "अठारह": 18, "उन्नीस": 19, "बीस": 20, "इक्कीस": 21,
+    "बाईस": 22, "तेईस": 23, "चौबीस": 24, "पच्चीस": 25, "छब्बीस": 26,
+    "सत्ताईस": 27, "अट्ठाईस": 28, "उनतीस": 29, "तीस": 30, "इकतीस": 31,
+}
+
+
+@dataclass
+class KnownFacts:
+    """Facts the backend already knows, so a reply may repeat them unchanged."""
+
+    order_ids: set[str] = field(default_factory=set)
+    dates: set[tuple[int, int]] = field(default_factory=set)
+    times: set[str] = field(default_factory=set)
+    numbers: set[str] = field(default_factory=set)
+    quotes: set[str] = field(default_factory=set)
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _day_before(prefix: str) -> int | None:
+    match = re.search(r"(\d{1,2})\s+$", prefix)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"([a-z\u0900-\u097f-]+)\s+$", prefix)
+    if match:
+        return _DAY_WORDS.get(match.group(1))
+    return None
+
+
+def _day_after(suffix: str) -> int | None:
+    match = re.match(r"\s+(\d{1,2})\b", suffix)
+    if match:
+        return int(match.group(1))
+    match = re.match(r"\s+([a-z\u0900-\u097f-]+)\b", suffix)
+    if match:
+        return _DAY_WORDS.get(match.group(1))
+    return None
+
+
+def mentioned_date(text: str, language: str) -> str | None:
+    """Return the date the customer named, for a date-aware clarification."""
+    normalized = normalize_text(text)
+    for match in _MONTH_ANY.finditer(normalized):
+        if _MONTH_NAMES.get(normalize_text(match.group(0))) is None:
+            continue
+        day = _day_before(normalized[: match.start()]) or _day_after(
+            normalized[match.end() :]
+        )
+        if day is None or not 1 <= day <= 31:
+            continue
+        return f"{day} {match.group(0)}"
+    return None
+
+
+def _apply_known_dates(text: str, facts: KnownFacts) -> tuple[str, bool]:
+    """Accept only dates the backend or the customer already stated."""
+    masked = list(text)
+    known = True
+    for match in _MONTH_ANY.finditer(text):
+        month = _MONTH_NAMES.get(normalize_text(match.group(0)))
+        if month is None:
+            continue
+        before = text[: match.start()]
+        after = text[match.end() :]
+        day_before = re.search(r"(\d{1,2})\s+$", before)
+        day_after = re.match(r"\s+(\d{1,2})\b", after)
+        if day_before is None and day_after is None and not _is_date_context(before, after):
+            continue
+        day = int((day_before or day_after).group(1)) if (day_before or day_after) else None
+        if day is not None and (day, month) in facts.dates:
+            start = match.start() - len(day_before.group(0)) if day_before else match.start()
+            for index in range(start, match.end()):
+                masked[index] = " "
+            continue
+        if _said_by_customer(match.group(0), facts):
+            for index in range(match.start(), match.end()):
+                masked[index] = " "
+            continue
+        known = False
+    return "".join(masked), known
+
+
+def _is_date_context(before: str, after: str) -> bool:
+    prefix = re.search(r"(?:\b(?:in|on|at|of|for|by|until|till|through|during|since|from)|[मेंकोतकसे])\s*$", before, re.IGNORECASE)
+    suffix = re.match(r"\s*(?:\b(?:in|on|at|of|for|by|until|till|through|during|since|from)|[मेंकोतकसे])\b", after, re.IGNORECASE)
+    return bool(prefix or suffix)
+
+
+def _said_by_customer(phrase: str, facts: KnownFacts) -> bool:
+    wording = normalize_text(phrase)
+    return bool(wording) and any(wording in quote for quote in facts.quotes)
+
+
+def _numbers_are_known(compact: str, facts: KnownFacts) -> bool:
+    """Allow only numbers the backend already knows, so invented facts stay blocked."""
+    masked, dates_ok = _apply_known_dates(compact, facts)
+    if not dates_ok:
+        return False
+    for value in _NUMERIC_EXPRESSION.findall(masked):
+        if ":" in value:
+            if value not in facts.times:
+                return False
+        elif value not in facts.numbers and value not in facts.order_ids:
+            return False
+    return True
+
+
+def wording_error(message: str, language: str, *, proposal: bool = False, respond: bool = False, source_text: str = "", known_facts: KnownFacts | None = None, clarification: bool = False, relax_language: bool = False, wording_text: str | None = None):
     compact = " ".join(unicodedata.normalize("NFKC", message).split())
     if not compact:
         return "EMPTY_MESSAGE"
     if len(compact) > 280:
         return "MESSAGE_TOO_LONG"
-    checked = compact
+    # Server-filled facts are trusted; only the model's own words face the guards.
+    guarded = compact if wording_text is None else " ".join(
+        unicodedata.normalize("NFKC", wording_text).split()
+    )
+    checked = guarded
     if clarification:
         checked = re.sub(r"\{(?:order_window|recipient|recipient_address)\}", "", checked)
-    if source_text and not proposal:
-        numbers = re.findall(r"\d+", compact)
-        if numbers and all(n in re.findall(r"\d+", source_text) for n in numbers):
-            checked = re.sub(r"\d+", "", compact)
+    if not proposal:
+        facts = KnownFacts(
+            order_ids=set(known_facts.order_ids) if known_facts else set(),
+            dates=set(known_facts.dates) if known_facts else set(),
+            times=set(known_facts.times) if known_facts else set(),
+            numbers=(set(known_facts.numbers) if known_facts else set())
+            | set(re.findall(r"\d+", source_text)),
+            quotes=set(known_facts.quotes) if known_facts else set(),
+        )
+        if source_text.strip():
+            facts.quotes.add(normalize_text(source_text))
+        if not _apply_known_dates(guarded, facts)[1]:
+            return "UNSAFE_WORDING"
+        if (facts.numbers or facts.order_ids or facts.dates or facts.times) and _numbers_are_known(guarded, facts):
+            checked = re.sub(r"\d+", "", checked)
     if OTP_WORD.search(compact) or _UNSAFE.search(checked):
         return "UNSAFE_WORDING"
     if proposal:
@@ -304,7 +473,9 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
             return "INVALID_PLACEHOLDERS"
         if not relax_language and not language_matches(compact, language):
             return "LANGUAGE_MISMATCH"
-        if respond and _RESPONSE_ACTION.search(compact):
+        if respond and _RESPONSE_ACTION.search(checked):
+            return "UNSAFE_WORDING"
+        if _DELIVERY_COMMITMENT.search(checked):
             return "UNSAFE_WORDING"
         if len([p for p in re.split(r"[.!?।]+", compact) if p.strip()]) > 2:
             return "MESSAGE_TOO_LONG"
@@ -312,7 +483,9 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
 
 
 def conversational_input(text: str) -> str | None:
-    cleaned = " ".join(re.sub(r"[?!.।,]", " ", text.casefold()).split())
+    cleaned = " ".join(
+        unicodedata.normalize("NFKC", re.sub(r"[?!.।,]", " ", text.casefold())).split()
+    )
     if cleaned in {"hello", "helo", "hi", "hey", "namaste", "नमस्ते", "हेलो"}:
         return "greeting"
     audio_check = cleaned
@@ -330,6 +503,20 @@ def conversational_input(text: str) -> str | None:
         "क्या मेरी आवाज आ रही है",
     }:
         return "heard"
+    if len(audio_check.split()) <= 8 and (
+        re.search(r"\b(?:hear|hearing|audible)\b", audio_check)
+        or re.search(r"आवाज़?|a{1,2}w+a{1,2}z|सुनाई|sunai", audio_check)
+    ):
+        speaker_cue = re.search(
+            r"\b(?:me|you|my|voice)\b|मेरी|मेरा|मुझे|आपको|आपकी|aapko|meri|mera|mujhe",
+            audio_check,
+        )
+        heard_cue = re.search(
+            r"\b(?:can you hear|do you hear|are you hearing)\b|आ रही|आ रहा|aa rahi|aa raha|aa rhi",
+            audio_check,
+        )
+        if speaker_cue and heard_cue:
+            return "heard"
     return None
 
 
