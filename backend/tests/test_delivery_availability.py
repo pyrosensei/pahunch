@@ -66,7 +66,7 @@ def test_requested_three_pm_requires_confirmation_then_commits(db, scripted_llm)
     assert order.window_start.astimezone(at("05T15:00:00").tzinfo).hour == 15
 
 
-@pytest.mark.parametrize("question", ["Which time is available?", "What delivery slots are available?", "कौन सा टाइम उपलब्ध है?", "टाइम चेंज नहीं कर सकते विच टाइम इज़ अवेलेबल"])
+@pytest.mark.parametrize("question", ["Which time is available?", "What delivery slots are available?", "कौन सा टाइम उपलब्ध है?", "टाइम चेंज नहीं कर सकते विच टाइम इज़ अवेलेबल", "क्या बारह नवंबर को आप यह चीज कर सकते हैं?", "Can you deliver on 12 November?"])
 def test_availability_questions_do_not_call_model_or_repeat_rejected_plan(db, question):
     setup_availability(db)
     class NoModel:
@@ -86,6 +86,72 @@ def test_availability_questions_do_not_call_model_or_repeat_rejected_plan(db, qu
     assert not response.turn.customer_confirmed
 
 
+def test_date_question_with_a_clock_still_reaches_the_planner(db, scripted_llm):
+    setup_availability(db)
+    item = decision(PlannerAction.ASK_CLARIFICATION, "कौन सा समय ठीक रहेगा?")
+    item.update(missing_fields=["time"], request_details=None)
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    response = run(planner, call.id, "क्या आप 12 नवंबर को 6 बजे दे सकते हैं?")
+    assert response.planner.fallback_reason != "DELIVERY_AVAILABILITY"
+    assert response.planner.model != "rules:delivery-availability"
+
+
+@pytest.mark.parametrize("question,present,absent", [
+    ("Can you deliver on 6 November?", "06 November is available", "05 November"),
+    ("Can you deliver on 12 November?", "12 November is not available", None),
+    ("क्या बारह नवंबर को आप यह चीज कर सकते हैं?", "12 नवंबर उपलब्ध नहीं है", None),
+    ("क्या छह नवंबर को हो सकता है?", "6 नवंबर उपलब्ध है", "5 नवंबर"),
+])
+def test_feasibility_answer_addresses_the_date_asked_about(db, question, present, absent):
+    setup_availability(db)
+    class NoModel:
+        model_name = "unused"
+        async def complete_json(self, **kwargs):
+            raise AssertionError("Availability comes from backend data")
+    call = start_call(CallService(db))
+    response = run(PlannerService(db, NoModel()), call.id, question)
+    assert response.planner.fallback_reason == "DELIVERY_AVAILABILITY"
+    assert present in response.agent_message
+    if absent is not None:
+        assert absent not in response.agent_message
+    assert not response.turn.customer_confirmed
+
+
+def test_a_slot_spanning_days_covers_the_date_in_its_middle(db):
+    order = db.get(Order, 1042)
+    db.exec(delete(DeliverySlot).where(DeliverySlot.order_id == order.id))
+    db.add(DeliverySlot(order_id=order.id, start_at=at("05T10:00:00"), end_at=at("08T18:00:00")))
+    db.commit()
+    class NoModel:
+        model_name = "unused"
+        async def complete_json(self, **kwargs):
+            raise AssertionError("Availability comes from backend data")
+    call = start_call(CallService(db))
+    response = run(PlannerService(db, NoModel()), call.id, "Can you deliver on 7 November?")
+    assert "07 November is available" in response.agent_message
+
+
+def test_accepting_a_policy_rejected_plan_explains_instead_of_re_asking(db, scripted_llm):
+    order, _ = setup_availability(db)
+    original = order.window_start
+    llm = scripted_llm([
+        decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal={"primary": {"action": "RESCHEDULE", "window_start": at("05T19:00:00").isoformat(), "window_end": at("05T21:00:00").isoformat()}}),
+        decision(PlannerAction.CONFIRM_PLAN, "Done, your delivery is rescheduled."),
+    ])
+    planner = PlannerService(db, llm)
+    call = start_call(planner.calls)
+    rejected = run(planner, call.id, "Please deliver at 7 pm on the same day")
+    assert not rejected.turn.verdict.valid
+    response = run(planner, call.id, "Yes, please go ahead")
+    assert response.planner.error_code == "ACTION_NOT_ALLOWED"
+    assert "accept the delivery plan just read out" not in response.agent_message
+    assert "06 November" in response.agent_message
+    assert not response.turn.customer_confirmed
+    db.refresh(order)
+    assert order.window_start == original
+
+
 def test_out_of_hours_request_offers_actual_dates_and_no_false_reschedule(db, scripted_llm):
     setup_availability(db)
     call = start_call(CallService(db))
@@ -95,6 +161,18 @@ def test_out_of_hours_request_offers_actual_dates_and_no_false_reschedule(db, sc
     assert "06 November" in response.agent_message and "10 AM" in response.agent_message
     assert "6 PM" in response.agent_message
     assert "05 November" not in response.agent_message
+    assert not response.turn.customer_confirmed
+
+
+def test_later_than_every_recorded_slot_still_names_the_recorded_options(db, scripted_llm):
+    setup_availability(db)
+    call = start_call(CallService(db))
+    llm = scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal={"primary": {"action": "RESCHEDULE", "window_start": at("12T19:00:00").isoformat(), "window_end": at("12T21:00:00").isoformat()}})])
+    response = run(PlannerService(db, llm), call.id, "Please deliver on 12 November at 7 pm")
+    assert not response.turn.verdict.valid
+    assert "06 November" in response.agent_message
+    assert "No alternative delivery availability" not in response.agent_message
+    assert "recorded nahi hai" not in response.agent_message
     assert not response.turn.customer_confirmed
 
 

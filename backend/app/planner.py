@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pydantic import ValidationError
 from sqlmodel import Session, select
 
-from app.availability import availability_question, availability_reply
+from app.availability import availability_question, availability_reply, date_feasibility_question
 from app.calls import ADMISSION_LOCK, CallService, pending_operator_revision, utc_now
 from app.dialogue import (
     clarification_fallback,
@@ -800,6 +800,7 @@ RULES
 - A start time without an end takes the order window's duration, capped at the containing availability period's end. For example 3 PM inside 10:00-18:00 becomes 15:00-17:00; 5 PM becomes 17:00-18:00. Explicit requested endpoints must not be shortened.
 - HAND_TO_CUSTOMER means hand-off inside the order's own scheduled window. Any other window is RESCHEDULE.
 - Never repeat a plan policy rejected. Build a fresh plan from the customer's latest instruction.
+- Never repeat a clarification question verbatim. When the customer asks whether a date or time is possible instead of supplying the missing detail, answer from available_slots in at most two sentences: name the recorded alternative or say the requested one is unavailable, then ask for the missing detail once.
 - Two contradictory instructions in one turn: ASK_CLARIFICATION. Never pick one.
 - A correction ("ruko ruko", "nahi", "actually") plus a clear new instruction: PROPOSE_PLAN with the new instruction. Never ask which version.
 - A conditional retry never replaces the handoff. Keep the handoff as primary and add fallback.action=RETRY_AFTER_DELAY with the stated delay_minutes and max_retries=1.
@@ -997,6 +998,25 @@ class PlannerService:
         except json.JSONDecodeError:
             return None
         return value if isinstance(value, dict) else None
+
+    def _rejected_plan_reply(self, call: CallSession, order: Order, language: str) -> str | None:
+        """Accepting a plan policy refused must explain the refusal, not re-ask."""
+        if call.current_proposal_id is None:
+            return None
+        record = self.db.get(PlanProposalRecord, call.current_proposal_id)
+        if record is None:
+            return None
+        try:
+            proposal = PlanProposal.model_validate_json(record.proposal_json)
+        except ValidationError:
+            return None
+        slots = self._slots(order.id)
+        verdict = validate_plan(proposal, order, slots)
+        if verdict.valid:
+            return None
+        if all(v.code == ViolationCode.SLOT_NOT_AVAILABLE for v in verdict.violations):
+            return availability_reply(order, slots, language, rejected=True, requested=proposal.primary)
+        return plan_result_message(verdict, proposal, language)
 
     def _last_agent_action(self, session_id: str) -> PlannerAction | None:
         turn = self.db.exec(
@@ -1663,11 +1683,13 @@ class PlannerService:
                 turn, message, meta = cancellation
                 return self._respond(session_id, turn, message, meta)
 
-            if availability_question(request.text):
+            if availability_question(request.text) or date_feasibility_question(request.text):
                 language = self._language(session_id, request.text)
                 order = self._order(call.order_id)
                 turn = self.calls.submit_turn(session_id, CustomerTurnRequest(text=request.text))
-                return self._respond(session_id, turn, availability_reply(order, self._slots(order.id), language),
+                return self._respond(session_id, turn,
+                                     availability_reply(order, self._slots(order.id), language,
+                                                        asked=mentioned_date_parts(request.text)),
                                      PlannerMeta(model="rules:delivery-availability", action=PlannerAction.RESPOND,
                                                  confidence=1.0, response_language=language, fallback_reason="DELIVERY_AVAILABILITY"))
 
@@ -1947,11 +1969,16 @@ class PlannerService:
         try:
             require_planner_action(call.state, decision.action)
         except DomainError:
+            message = SAFE_UNCLEAR_MESSAGE
+            if decision.action == PlannerAction.CONFIRM_PLAN:
+                message = self._rejected_plan_reply(
+                    call, order, self._language(session_id, request.text)
+                ) or message
             return self._degraded_turn(
                 session_id,
                 request,
                 error_code="ACTION_NOT_ALLOWED",
-                message=SAFE_UNCLEAR_MESSAGE,
+                message=message,
                 meta=meta,
             )
 

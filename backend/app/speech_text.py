@@ -75,6 +75,13 @@ def customer_moment(moment: datetime, language: str) -> str:
     return f"{moment:%d %B}, {_clock_number(moment)} {suffix}"
 
 
+def customer_date(day: int, month: int, language: str) -> str:
+    """A calendar date without a year, matching how windows name their days."""
+    if language == "hi-IN":
+        return f"{day} {_HI[month - 1]}"
+    return f"{day:02d} {_EN[month - 1]}"
+
+
 def customer_window(start: datetime, end: datetime, language: str) -> str:
     """A delivery window the way a person would say it, without IST."""
     if language == "hi-IN":
