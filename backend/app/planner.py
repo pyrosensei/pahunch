@@ -976,6 +976,11 @@ class PlannerService:
             # Naming a slot as "10 AM-12 PM" needs its bare digits too.
             for part in (local.hour, local.minute):
                 facts.numbers.update({str(part), f"{part:02d}"})
+            # The same time in 12-hour form ("6 PM" for 18:00) is still a fact;
+            # the server says it that way, so the model may repeat it that way.
+            hour12 = local.hour % 12 or 12
+            facts.numbers.update({str(hour12), f"{hour12:02d}"})
+            facts.times.add(f"{hour12}:{local.minute:02d}")
         return facts
 
     def _slots(self, order_id: int) -> list[DeliverySlot]:
@@ -1886,7 +1891,10 @@ class PlannerService:
             self.calls._audit(session_id, "LLM_PROVIDER_FAILURE", {"category": error.category, "status_code": error.status_code, "error_type": type(error).__name__})
             with ADMISSION_LOCK:
                 self._check_turn_context(session_id, context)
-                error_code = "LLM_RATE_LIMIT" if error.category == "rate_limit" else "LLM_UNAVAILABLE"
+                error_code = {
+                    "rate_limit": "LLM_RATE_LIMIT",
+                    "billing": "LLM_BILLING_REQUIRED",
+                }.get(error.category, "LLM_UNAVAILABLE")
                 message = phrase("rate_limit") if error.category == "rate_limit" else SAFE_UNAVAILABLE_MESSAGE
                 return self._degraded_turn(
                     session_id,

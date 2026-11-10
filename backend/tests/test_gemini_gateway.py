@@ -124,7 +124,7 @@ def test_model_code_cannot_change_the_google_request_path(model):
         )
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 429, 503])
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 429, 503])
 def test_google_failure_is_not_retried_or_committed(db, status):
     requests = []
 
@@ -141,9 +141,10 @@ def test_google_failure_is_not_retried_or_committed(db, status):
             planner = PlannerService(db, client)
             call = start_call(planner.calls, 1043)
             result = await planner.handle_turn(call.id, AgentTurnRequest(text="Keep the original time"))
-            assert result.planner.error_code == (
-                "LLM_RATE_LIMIT" if status == 429 else "LLM_UNAVAILABLE"
-            )
+            assert result.planner.error_code == {
+                402: "LLM_BILLING_REQUIRED",
+                429: "LLM_RATE_LIMIT",
+            }.get(status, "LLM_UNAVAILABLE")
             assert result.planner.degraded
             assert not result.turn.customer_confirmed
             assert planner.calls.get_call(call.id).current_proposal_id is None

@@ -707,7 +707,9 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
             return "UNSAFE_WORDING"
         if _DELIVERY_COMMITMENT.search(checked):
             return "UNSAFE_WORDING"
-        if len([p for p in re.split(r"[.!?।]+", compact) if p.strip()]) > 2:
+        # The server's own availability reply is three sentences, so a model
+        # repeating it verbatim must not be rejected for length.
+        if len([p for p in re.split(r"[.!?।]+", compact) if p.strip()]) > 3:
             return "MESSAGE_TOO_LONG"
     return None
 

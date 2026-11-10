@@ -4,13 +4,13 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · Ollama Cloud gpt-oss:120b planner · FastAPI · SQLite
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Google Gemini 3.1 Flash-Lite planner · FastAPI · SQLite · React 19
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![Ollama](https://img.shields.io/badge/planner-Ollama%20Cloud%20gpt--oss%3A120b-000000.svg)](https://ollama.com/library/gpt-oss)
-[![Tests](https://img.shields.io/badge/tests-657%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Gemini](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-4285F4.svg)](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
+[![Tests](https://img.shields.io/badge/tests-662%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Ollama)          │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (Gemini)          │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (Ollama, JSON Schema)        │  │
+       │                          │  │ Planner (Gemini, JSON Schema)        │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -297,20 +297,29 @@ the UI waits for backend-redacted text before displaying typed input.
 | `backend/app/gnani.py` | Gnani REST client: batch STT + TTS |
 | `backend/app/voice.py` | Speech orchestration: transcribe → plan → synthesise |
 | `backend/app/planner.py` | LLM planner, prompt, guards, repair, normalisation |
+| `backend/app/dialogue.py` | Clarification merging, source-grounded recipients and proposal normalisation |
+| `backend/app/availability.py` | Server-owned delivery availability, date feasibility and synthetic slot expansion |
 | `backend/app/language.py` | Language selection, localized wording, placeholder validation and OTP redaction |
+| `backend/app/speech_text.py` | Natural spoken date/time rendering for TTS |
 | `backend/app/policy.py` | Pure policy engine — the only component allowed to say "allowed" |
 | `backend/app/state_machine.py` | Call states, legal transitions, terminal states |
 | `backend/app/calls.py` | Call lifecycle, turns, proposals, commits, idempotency, audit |
 | `backend/app/dialer.py` | Automatic browser scheduling, recovery, current skip state and change-only audit |
+| `backend/app/cancellation.py` | Pending-order cancellation rules and dispatch-safe responses |
+| `backend/app/catalog.py` | Server-owned SwiftCart product catalog |
 | `backend/app/demo.py` | Synthetic checkout, readiness and bounded operator APIs |
+| `backend/app/operator.py` | Operator review, rejection and policy-validated plan revisions |
+| `backend/app/phone_control.py` | Phone consent and per-session dispatch controls |
 | `backend/app/telephony.py`, `backend/app/phone_media.py`, `backend/app/phone_audio.py` | Gated Twilio dispatch, signed callbacks, phone audio/playback adaptation and consent |
 | `backend/app/tools.py` | Tool names and per-state tool permissions |
 | `backend/app/models.py` | SQLModel entities: Order, DeliverySlot, CallSession, Turn, Proposal, Decision, Commit, AuditEvent |
 | `backend/app/schemas.py` | Pydantic request/response contracts |
-| `backend/app/llm.py` | OpenAI-compatible client with strict JSON Schema mode, timeouts, token accounting |
+| `backend/app/llm.py` | OpenAI-compatible and Gemini clients with strict JSON Schema mode, timeouts, token accounting |
+| `backend/app/http_pool.py` | Shared HTTP client pool with proxy-bypass handling |
 | `backend/app/seed.py` | Synthetic SwiftCart orders (1042–1049) covering every policy branch |
 | `backend/app/config.py` | All settings, env-var driven |
-| `backend/static/` | Browser voice demo (mic / push-to-talk, live transcript, plan verdict, courier card) |
+| `backend/static/` | Legacy browser voice demo; the React app is served from `frontend/dist` when built |
+| `frontend/` | React 19 + Vite dashboard, SwiftCart shop, voice studio and operator review |
 | `evals/` | Deterministic scenarios, live planner cases, live voice matrix + reports |
 
 ### 4.6 Automatic browser scheduling
@@ -462,8 +471,11 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **657 tests** |
-| Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **23 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **662 tests** |
+| Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **24 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
+| Frontend unit | `cd frontend && npm test` | none | **34 Vitest tests** for delivery progress, voice controller and selection state |
+| Frontend e2e | `cd frontend && npm run test:e2e` | none | **150 Playwright checks** across desktop, mobile and tablet for landing, shop, dashboard, voice and operator flows |
+| Frontend build | `cd frontend && npm run build` | none | TypeScript and Vite production build served by FastAPI |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
 | Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + configured planner | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
@@ -473,7 +485,7 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
 **Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
-describe the current Ollama Cloud configuration. Current provider and microphone acceptance remain pending.
+describe the current Gemini configuration. Current provider and microphone acceptance remain pending.
 
 | Metric | Value |
 |---|---|
@@ -533,7 +545,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and an Ollama Cloud API key
+- A Gnani API key (Prisma + Timbre) and a Google Gemini API key
 
 ### 1. Configure
 
@@ -546,34 +558,39 @@ Set the speech/planner credentials and planner connection in `.env`:
 
 ```dotenv
 GNANI_API_KEY=
-LLM_PROVIDER=ollama
-OLLAMA_API_KEY=
-# Empty base URL and model select the Ollama Cloud defaults below.
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=
+# Empty base URL and model select the Gemini defaults below.
 LLM_BASE_URL=
 LLM_MODEL=
+LLM_THINKING_LEVEL=minimal
 LLM_TEMPERATURE=1.0
 LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
 
-The planner calls Ollama Cloud's OpenAI-compatible endpoint
-`https://ollama.com/v1` with `gpt-oss:120b`, `reasoning_effort=low` and
-reasoning text excluded from the response. Ollama's structured output does not
-support `$defs`, so the gateway inlines schema references before sending it.
-The backend validates the response, delivery policy, wording and explicit
-confirmation before saving a delivery commitment.
+The planner calls Google's native `generateContent` endpoint at
+`https://generativelanguage.googleapis.com/v1beta` with
+`gemini-3.1-flash-lite`, JSON Schema output and minimal thinking. The
+output-token budget includes thinking tokens. The backend validates the
+response, delivery policy, wording and explicit confirmation before saving a
+delivery commitment.
 
-Set `OLLAMA_API_KEY` in `backend/.env`. The connection authenticates with a
-Bearer header. A missing key leaves the planner unconfigured. Gnani handles
-speech recognition and synthesis.
+Set `GEMINI_API_KEY` in `backend/.env`. The connection uses the official Google
+HTTPS endpoint and authenticates with a header. A missing key leaves the planner
+unconfigured. Gnani handles speech recognition and synthesis.
 
-`LLM_PROVIDER` also accepts `groq`, `openrouter` and `gemini`; each reads only
-its own key and its own default base URL and model. Switching provider is a
-one-line change, not a code change.
+`LLM_PROVIDER` also accepts `ollama`, `groq` and `openrouter`; each reads only
+its own key (`GEMINI_API_KEY`, `OLLAMA_API_KEY`, `GROQ_API_KEY`,
+`OPENROUTER_API_KEY`) and its own default base URL and model. The generic
+`LLM_API_KEY` is not used. Switching provider is a one-line change, not a code
+change.
 
-Check the active Ollama Cloud plan's rate limits before a live demo. HTTP 429
-is exposed as `LLM_RATE_LIMIT`. A provider failure preserves the delivery state
-and returns a service message.
+Ollama Cloud remains selectable but is now a paid service: without a paid plan
+it answers HTTP 402, which the planner reports as `LLM_BILLING_REQUIRED`. Check
+the active Gemini project's token/minute, request/minute and daily quotas before
+a live demo. HTTP 429 is exposed as `LLM_RATE_LIMIT`. A provider failure
+preserves the delivery state and returns a service message.
 
 `.env` is gitignored. Keys are never committed and never printed.
 
@@ -603,8 +620,14 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 657 tests, no external network required
-node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs
+uv run pytest              # 662 tests, no external network required
+node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs  # 24 browser regressions
+
+cd ../frontend
+npm ci
+npm test                   # 34 frontend unit tests
+npm run test:e2e           # 150 Playwright checks (mocked API)
+npm run build              # production build served by FastAPI
 ```
 
 ### 4. Run the evaluations
@@ -633,9 +656,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Ollama Cloud** (`gpt-oss:120b`, `https://ollama.com/v1`) | OpenAI-compatible JSON Schema output with inlined `$defs`, `reasoning_effort=low`, server-side validation |
+| Planner | **Google Gemini** (`gemini-3.1-flash-lite`, `https://generativelanguage.googleapis.com/v1beta`) | Native JSON Schema output, minimal thinking, server-side validation. Ollama Cloud, Groq and OpenRouter remain selectable; Ollama Cloud is paid and returns `LLM_BILLING_REQUIRED` on HTTP 402 |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Ollama live acceptance is pending |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Gemini live acceptance is pending |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -652,7 +675,7 @@ Honesty about this is deliberate — the evaluation claims only hold if the boun
 | Configured planner producing the structured plan when available | Orders, customers and the SwiftCart merchant are **synthetic** |
 | Real policy evaluation, state machine, commit, SQLite writes, audit trail | Twilio adapter is gated and tested with mocks; no real handset call was exercised |
 | Real commit-time revalidation and idempotency | Commit is a local revalidation + SQLite write, not a remote tool — so T19's failure semantics are covered by tests instead of a live timeout |
-| Real Prisma/Timbre/NIM calls in the live matrix | Prisma streaming STT emits **no confidence score**, so the live path relies on the explicit-confirmation gate; low-confidence rejection is covered by deterministic tests |
+| Real Prisma/Timbre calls and the historical NIM planner in the live matrix | Prisma streaming STT emits **no confidence score**, so the live path relies on the explicit-confirmation gate; low-confidence rejection is covered by deterministic tests |
 
 No real customer data, no real phone numbers, no OTP collection, and no impersonation of any real delivery company.
 
@@ -660,7 +683,8 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Historical provider validation:** earlier Groq and NIM model/provider probes are not validation of the current Ollama Cloud configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Historical provider validation:** earlier Groq and NIM model/provider probes are not validation of the current Gemini configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Ollama Cloud is paid.** It remains selectable, but a key without an active paid plan returns HTTP 402; the planner reports `LLM_BILLING_REQUIRED` and preserves the delivery state. Gemini is the default.
 - **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
 - **Streaming STT gives no confidence**, so the live path cannot reject a low-confidence transcript by score; it compensates with the explicit-confirmation gate.
@@ -682,10 +706,14 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 ```
 pahunch/
 ├── backend/
-│   ├── app/            # the service
-│   ├── static/         # browser voice demo
+│   ├── app/            # FastAPI service, planner, policy, voice and operator APIs
+│   ├── static/         # legacy browser voice demo
 │   ├── tests/          # Python integration tests and Node browser-audio regressions
 │   └── scripts/        # realtime smoke test, STT latency spike
+├── frontend/
+│   ├── src/            # React 19 dashboard, SwiftCart shop, voice studio and operator console
+│   ├── tests/          # Vitest unit tests and Playwright acceptance/visual checks
+│   └── dist/           # production build served by FastAPI when present
 ├── evals/
 │   ├── scenarios.json          # deterministic call scenarios
 │   ├── planner_cases.json      # live planner cases
@@ -719,6 +747,15 @@ npm run dev
 
 Open the Vite URL printed in the terminal. Its development proxy forwards
 `/api`, `/health`, `/ws` and the audio worklets to the local backend.
+
+Run the frontend unit tests, browser checks and production build with:
+
+```bash
+cd frontend
+npm test
+npm run test:e2e
+npm run build
+```
 
 For one server hosting the built frontend and backend:
 
@@ -776,13 +813,17 @@ earliest stored date. Legacy seeded examples retain their recorded availability.
 
 ### Conversation recovery
 
-The current planner is Ollama Cloud `gpt-oss:120b` with low reasoning effort. Short acknowledgements preserve the
-conversation language; substantial Hindi/English mixing selects Hinglish.
-The planner can mark an unfinished clarification with `awaiting_continuation`;
-voice output then waits up to two extra seconds, cancellable by resumed speech,
-without a second model request. Complete delivery actions cannot use this flag.
-Noise calibration and browser noise suppression help capture but do not guarantee
-speech/noise separation. Human microphone validation is still required.
+The current planner is Google Gemini 3.1 Flash-Lite with minimal thinking. Short
+acknowledgements preserve the conversation language; substantial Hindi/English
+mixing selects Hinglish. Server-known delivery windows are accepted in both
+24-hour and 12-hour forms (`18:00` and `6 PM`). Model replies may use up to three
+sentences, matching the server's own availability reply; four sentences still
+fall back to deterministic wording. The planner can mark an unfinished
+clarification with `awaiting_continuation`; voice output then waits up to two
+extra seconds, cancellable by resumed speech, without a second model request.
+Complete delivery actions cannot use this flag. Noise calibration and browser
+noise suppression help capture but do not guarantee speech/noise separation.
+Human microphone validation is still required.
 
 OTP neighbour delivery is permitted only for an eligible, named recipient with
 an arrival call. The courier must contact the customer and verify OTP directly

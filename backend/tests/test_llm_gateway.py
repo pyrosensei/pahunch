@@ -167,6 +167,7 @@ def test_http_and_malformed_provider_errors_are_mapped():
         (400, "invalid_request_error", LLMResponseError, "invalid_request"),
         (401, "authentication_error", LLMResponseError, "access"),
         (403, "permission_error", LLMResponseError, "access"),
+        (402, "payment_required", LLMResponseError, "billing"),
         (429, "rate_limit_exceeded", LLMResponseError, "rate_limit"),
         (503, "service_unavailable", LLMResponseError, "provider"),
     ],
@@ -403,8 +404,8 @@ def test_removed_providers_are_rejected(provider):
         Settings(_env_file=None, llm_provider=provider)
 
 
-@pytest.mark.parametrize("provider", ["groq", "openrouter", "ollama"])
-def test_supported_free_providers_are_accepted(provider):
+@pytest.mark.parametrize("provider", ["groq", "openrouter", "ollama", "gemini"])
+def test_supported_providers_are_accepted(provider):
     assert Settings(_env_file=None, llm_provider=provider).llm_provider == provider
 
 
@@ -417,9 +418,23 @@ def test_each_provider_uses_only_its_own_key():
     assert Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key").llm_provider == "groq"
 
 
-def test_default_provider_is_ollama_cloud_with_its_own_defaults():
-    config = Settings(_env_file=None, ollama_api_key="ollama-key", gemini_api_key="google-key")
-    assert config.llm_provider == "ollama"
+def test_default_provider_is_gemini_with_its_own_defaults():
+    config = Settings(_env_file=None, gemini_api_key="google-key", ollama_api_key="ollama-key")
+    assert config.llm_provider == "gemini"
+    client = build_llm_client(config)
+    assert isinstance(client, GeminiClient)
+    assert client._base_url == "https://generativelanguage.googleapis.com/v1beta"
+    assert client._model == "gemini-3.1-flash-lite"
+    assert client._api_key == "google-key"
+
+
+def test_ollama_remains_selectable_with_its_own_defaults():
+    config = Settings(
+        _env_file=None,
+        llm_provider="ollama",
+        ollama_api_key="ollama-key",
+        gemini_api_key="google-key",
+    )
     client = build_llm_client(config)
     assert isinstance(client, OpenAICompatibleClient)
     assert client._base_url == "https://ollama.com/v1"
@@ -494,7 +509,7 @@ def test_groq_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("status", [402, 429, 503])
 def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
     requests = []
 
@@ -512,7 +527,10 @@ def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
             planner = PlannerService(db, llm)
             call = start_call(planner.calls, 1043)
             result = await planner.handle_turn(call.id, AgentTurnRequest(text="Please hand it to me"))
-            assert result.planner.error_code == ("LLM_RATE_LIMIT" if status == 429 else "LLM_UNAVAILABLE")
+            assert result.planner.error_code == {
+                402: "LLM_BILLING_REQUIRED",
+                429: "LLM_RATE_LIMIT",
+            }.get(status, "LLM_UNAVAILABLE")
             assert result.planner.wording_source == "template"
             assert not result.turn.customer_confirmed
             assert planner.calls.get_call(call.id).current_proposal_id is None

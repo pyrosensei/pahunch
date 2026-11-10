@@ -169,6 +169,8 @@ def _provider_http_error(status_code: int, text: str) -> LLMGatewayError:
         )
     if status_code in {401, 403}:
         category = "access"
+    elif status_code == 402:
+        category = "billing"
     elif status_code == 429:
         category = "rate_limit"
     elif status_code == 400:

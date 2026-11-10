@@ -887,3 +887,48 @@ def test_one_clear_time_is_stored_with_the_named_neighbour(db, scripted_llm):
     assert stored["primary"]["named_recipient"] == "अरविंद"
     assert stored["primary"]["recipient_address"] == "403"
     assert "T18:00" in stored["primary"]["window_start"]
+
+
+def test_known_window_time_may_be_repeated_in_twelve_hour_form(db, scripted_llm):
+    """The server labels 18:00-20:00 as "6 PM-8 PM", so the model may say it too."""
+    planner = PlannerService(
+        db, scripted_llm([reply("RESPOND", "Aapki delivery 05 November, 6 PM-8 PM mein hai.")])
+    )
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "ek baat karni hai")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+    assert result.agent_message == "Aapki delivery 05 November, 6 PM-8 PM mein hai."
+
+
+def test_known_window_time_in_twelve_hour_form_is_a_server_fact(db, scripted_llm):
+    planner = PlannerService(db, scripted_llm([]))
+    call = start_call(planner.calls)
+    facts = planner._known_facts(call.id, planner._order(1042))
+    assert "18:00" in facts.times and "20:00" in facts.times
+    assert "6:00" in facts.times and "8:00" in facts.times
+    assert {"6", "06", "8", "08"} <= facts.numbers
+
+
+def test_reply_may_be_as_long_as_the_servers_own_availability_reply(db, scripted_llm):
+    message = (
+        "Aapke order ki delivery 06 November, 10 AM-12 PM mein hai. "
+        "Ye time theek rahega? Kripya bataiye."
+    )
+    planner = PlannerService(db, scripted_llm([reply("RESPOND", message)]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "ek baat karni hai")
+    assert result.planner.wording_source == "model"
+    assert result.planner.fallback_reason is None
+
+
+def test_a_four_sentence_reply_is_still_too_long(db, scripted_llm):
+    message = (
+        "Aapke order ki delivery 06 November, 10 AM-12 PM mein hai. "
+        "Ye time theek rahega? Kripya bataiye. Main intezaar kar rahi hoon."
+    )
+    planner = PlannerService(db, scripted_llm([reply("RESPOND", message)]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "ek baat karni hai")
+    assert result.planner.wording_source == "template"
+    assert result.planner.fallback_reason == "MESSAGE_TOO_LONG"

@@ -6,8 +6,8 @@ Four suites, from cheapest to most realistic:
 |---|---|---|---|
 | Unit and integration tests | `cd backend && uv run pytest` | none | Policy, state machine, planner gates, voice socket, streaming STT against fakes |
 | Deterministic call scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
-| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Groq | The model returns schema-valid decisions for fixed Hinglish turns |
-| Live voice matrix | `matrix_runner.py` (below) | Gnani STT/TTS + Groq | The real WebSocket voice path, policy, commit, and audit trail for T01–T22 |
+| Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
+| Live voice matrix | `matrix_runner.py` (below) | Gnani STT/TTS + configured planner | The real WebSocket voice path, policy, commit, and audit trail for T01–T22 |
 
 ## Live voice matrix
 
@@ -49,7 +49,10 @@ Reports land in `evals/reports/matrix-<UTC timestamp>.json` plus `matrix-latest.
 - Planner calls time out at 12 s. Historical NVIDIA NIM latency for the structured planner schema was measured at 0.7–7 s for the same prompt, so a stalled provider shows up as an `LLM_TIMEOUT` degraded turn and a failed scenario; that is provider variance, not a policy outcome.
 - The matrix measures the current configuration. Changing the planner model, prompts, VAD thresholds, or TTS settings invalidates comparisons with older reports.
 
-The current planner uses `GROQ_API_KEY` and `openai/gpt-oss-20b`. Older published
-NIM results are historical; rerun the selected live checks before making Groq
-quality or latency claims. Groq limits apply at the organization level; inspect
-your account limits before running a full matrix.
+The planner provider is whatever `LLM_PROVIDER` selects in `backend/.env`; each
+provider uses only its own key. The default is Gemini
+(`gemini-3.1-flash-lite`); Ollama Cloud, Groq and OpenRouter remain selectable.
+Published NIM results are historical — rerun the selected live checks before
+making any quality or latency claim about the current provider. Provider limits
+apply at the account level; inspect your account limits before running a full
+matrix.
