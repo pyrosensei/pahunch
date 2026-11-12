@@ -7,6 +7,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.db import get_session
 from app.main import create_app
+from app.operator import require_operator_key
 from app.seed import seed_database
 
 START = datetime.fromisoformat("2026-11-05T18:00:00+05:30")
@@ -54,6 +55,7 @@ def planner_client(scripted_llm, outcomes: list[object]):
             yield session
 
     app = create_app(init_database=False, llm_client=scripted_llm(outcomes))
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = override_session
     with TestClient(app) as client:
         yield client

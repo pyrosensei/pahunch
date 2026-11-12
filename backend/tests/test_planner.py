@@ -374,6 +374,9 @@ def test_planner_rejects_non_conversation_state(db, scripted_llm):
         "हाँ, ठीक है आगे बढ़ाइए",
         # Live Prisma transcript: precomposed U+095D instead of ढ + nukta.
         "हाँ ठीक है आगे बढ़ाइए",
+        "हाँ, इस प्लान को आगे बढ़ाइए।",
+        "हाँ, इस योजना को आगे बढ़ाइए।",
+        "जी हाँ, इसे कर दीजिए।",
     ],
 )
 def test_explicit_confirmation_phrases(text):
@@ -395,6 +398,8 @@ def test_explicit_confirmation_phrases(text):
         "नहीं",
         "हाँ, लेकिन कल 6 बजे",
         "हाँ, पड़ोसी को दे दो",
+        "हाँ, इस प्लान को आगे बढ़ाइए लेकिन समय बदलना है।",
+        "हाँ, इस प्लान को आगे बढ़ाइए पर पड़ोसी को देना है।",
         "हम्म, ठीक लग रहा है।",
         "नहीं, ठीक है",
         "theek lag raha hai",

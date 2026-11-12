@@ -32,8 +32,14 @@ SLOT_ACTIONS = {
 
 class CustomerEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    turn_id: int | None = None  # null refers to the current customer utterance
-    quote: str = Field(min_length=1, max_length=2_000)
+    turn_id: int | None = Field(
+        default=None,
+        description="Use null for the current customer utterance. Historical IDs must identify a CUSTOMER turn in this session, never an agent or system turn.",
+    )
+    quote: str = Field(
+        min_length=1, max_length=2_000,
+        description="Exact verbatim substring of that customer turn in its original script. Preserve spelling. Use null for unused evidence fields, never invent or translate a quote.",
+    )
 
 
 class RequestDetails(BaseModel):
@@ -127,6 +133,7 @@ class ViolationCode(str, Enum):
     SECURITY_DROP_NOT_ALLOWED = "SECURITY_DROP_NOT_ALLOWED"
     NEIGHBOUR_DROP_NOT_ALLOWED = "NEIGHBOUR_DROP_NOT_ALLOWED"
     NAMED_RECIPIENT_REQUIRED = "NAMED_RECIPIENT_REQUIRED"
+    RECIPIENT_LOCATION_REQUIRED = "RECIPIENT_LOCATION_REQUIRED"
     MISSING_ORDER_METADATA = "MISSING_ORDER_METADATA"
     ESCALATION_REQUIRED = "ESCALATION_REQUIRED"
 
@@ -200,6 +207,7 @@ class VoiceTimings(BaseModel):
     tts_ms: int = 0
     total_ms: int = 0
     first_audio_ms: int = 0
+    first_response_audio_ms: int | None = None
 
 
 class VoiceTurnResponse(BaseModel):
@@ -229,6 +237,8 @@ class CourierCard(BaseModel):
     window_start: datetime | None
     window_end: datetime | None
     call_on_arrival: bool
+    named_recipient: str | None = None
+    recipient_address: str | None = None
     instructions: list[str]
     generated_at: datetime
 

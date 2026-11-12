@@ -304,7 +304,7 @@ def test_operator_facts_preserve_untouched_sources_and_clear_edited_attribution(
     assert edited.primary.named_recipient == "वर्मा जी"
     assert edited.primary.recipient_source is None
     assert edited.primary.recipient_address == "हाउस नंबर 403"
-    assert edited.primary.recipient_address_source.quote == "हाउस नंबर 403"
+    assert edited.primary.recipient_address_source is None
 
     changed_action = json.loads(original.model_dump_json())
     changed_action["primary"]["action"] = "LEAVE_WITH_SECURITY"
@@ -450,3 +450,20 @@ def test_phone_notice_requires_played_current_audio_before_releasing_quarantine(
     with Session(review.engine) as db:
         assert pending_operator_revision(db, review.sid, pid) == (mode != "played")
         assert not db.get(CallSession, review.sid).customer_confirmed
+
+
+def test_courier_release_comes_from_single_committed_record(review):
+    with Session(review.engine) as db:
+        calls = CallService(db)
+        calls.submit_turn(review.sid, CustomerTurnRequest(text="Yes", confirmation=True))
+        saved = calls.commit_plan(review.sid, "courier-release-test")
+        assert calls.commit_plan(review.sid, "courier-release-test").reused
+    route = '/api/orders/1043/courier-instructions'
+    response = review.client.get(route, headers={"X-Operator-Token": "test-operator-token"})
+    assert response.status_code == 200
+    release = response.json()
+    assert release['commit_id'] == saved.commit_id
+    assert release['session_id'] == review.sid
+    assert release['original_delivery_address']
+    assert release['contact'] is None
+    assert release['courier_card']['instructions'] == saved.courier_card.instructions

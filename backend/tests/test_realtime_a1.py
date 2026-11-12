@@ -554,6 +554,7 @@ def test_barge_in_after_completed_commit_reuses_clean_stt_connection(scripted_ll
         async with voice(scripted_llm([proposal_decision()]), streaming=stream) as (ws, _, _, _):
             ws.control("config", playback_tracking=True)
             opening = await ws.event("agent_audio_end")
+            assert stream.connect_attempts == 0
             ws.control("playback_done", generation_id=opening["generation_id"])
             ws.control("start")
             await ws.event("listening")
@@ -714,15 +715,20 @@ def test_failed_stt_capture_is_discarded_once_and_reconnects_before_next_capture
     async def run():
         stream = Stream()
         stt = _StreamingInput(stream, 16000, lambda *args: None)
+        await asyncio.sleep(0)
+        assert stream.connects == 0
         capture = stt.begin()
         assert await stt.finish(capture) is None
-        await stt.connection
-        assert stream.connects == 2
+        assert stream.connects == 1
         stt.abort()
         await stt.barrier
         assert stream.cancels == 1
+        capture = stt.begin()
+        assert await stt.finish(capture) is None
+        assert stream.connects == 2
+        assert stream.cancels == 2
         await stt.close()
-        assert stream.cancels == 1
+        assert stream.cancels == 2
     asyncio.run(run())
 
 

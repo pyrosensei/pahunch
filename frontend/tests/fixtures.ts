@@ -54,6 +54,8 @@ export async function mockApi(page: Page, options: {
     requests.push({ method, path, body });
     const fulfill = (json: unknown, status = 200) => route.fulfill({ status, json });
     if (options.failure) return fulfill({ detail: 'Demo backend unavailable' }, 503);
+    if (path === '/api/operator/access') return fulfill({ authorized: true });
+    if (path.endsWith('/courier-instructions')) return fulfill(null);
     if (path === '/api/catalog') return fulfill(catalog);
     if (path === '/api/orders' && method === 'POST') {
       const input = body as { payment_mode: string; product_id?: string; parcel_type?: string };

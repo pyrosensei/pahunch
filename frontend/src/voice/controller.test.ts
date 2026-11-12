@@ -49,7 +49,9 @@ describe('voice controller connection and safety', () => {
   it('recovers recognition without closing the microphone or replaying a turn', async () => {
     const f = fixture(); await f.connect(); await f.controller.toggleMicrophone();
     f.sockets[0].event({ type: 'speech_end' });
+    expect(f.controller.getSnapshot().processing).toBe(true);
     f.sockets[0].event({ type: 'no_speech', reason: 'RECOGNITION_EMPTY', recoverable: true });
+    expect(f.controller.getSnapshot().processing).toBe(false);
     expect(f.controller.getSnapshot().hint).toContain('listening again');
     f.sockets[0].event({ type: 'listening' });
     expect(f.controller.getSnapshot().listening).toBe(true);
@@ -62,6 +64,7 @@ describe('voice controller connection and safety', () => {
   it('preserves the initial idle prompt through a mount-cleanup cycle', () => {
     const f = fixture(); f.controller.disconnect();
     expect(f.controller.getSnapshot().hint).toBe('Choose an order, then connect when you are ready.');
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, plannerModel: null, plannerError: null });
   });
   it('resumes an active browser session without creating another call or requesting the microphone', async () => {
     const f = fixture(); await f.connect();
@@ -84,6 +87,114 @@ describe('voice controller connection and safety', () => {
     f.sockets[0].event({ type: 'turn', generation_id: 1, state: 'DISCOVERY', transcript: 'My OTP is [redacted]', agent_message: 'Please do not share your OTP.', turn: { customer_confirmed: false } });
     expect(f.controller.getSnapshot().lines.map(line => line.text).join(' ')).not.toContain('123456');
     expect(f.controller.getSnapshot().lines[0].text).toContain('[redacted]'); f.controller.disconnect();
+  });
+  it('rejects duplicate pending text without resetting playback or sending again', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'opening', generation_id: 1, agent_message: 'How should we deliver your order?' });
+    const lines = f.controller.getSnapshot().lines;
+    expect(f.controller.sendText('  My OTP is 123456  ')).toBe(true);
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, listening: false, autoListen: false });
+    expect(f.controller.getSnapshot().lines).toBe(lines);
+    const pending = f.controller.getSnapshot(); const messages = f.player.messages.length;
+    expect(f.controller.sendText('My OTP is 123456')).toBe(false);
+    expect(f.controller.sendText('A different reply')).toBe(false);
+    expect(f.controller.getSnapshot()).toBe(pending);
+    expect(f.player.messages).toHaveLength(messages);
+    expect(ws.sent.filter(event => event.type === 'reset' || event.type === 'scripted_turn')).toEqual([
+      { type: 'reset' }, { type: 'scripted_turn', text: 'My OTP is 123456' },
+    ]);
+    ws.event({ type: 'turn', generation_id: 2, transcript: 'My OTP is [redacted]', turn: { customer_confirmed: false } });
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['How should we deliver your order?', 'My OTP is [redacted]']);
+    expect(f.controller.sendText('Please hand it to me')).toBe(true);
+    f.controller.disconnect();
+  });
+  it('invalidates confirmation immediately and refuses stale commits while a reply is pending', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'turn', generation_id: 1, state: 'PENDING_CONFIRMATION', transcript: 'Yes, that works.', turn: { customer_confirmed: true } });
+    expect(f.controller.getSnapshot().session?.customer_confirmed).toBe(true);
+    const lines = f.controller.getSnapshot().lines;
+    expect(f.controller.sendText('Actually, change the delivery instructions')).toBe(true);
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, session: { customer_confirmed: false } });
+    expect(f.controller.getSnapshot().lines).toBe(lines);
+    await f.controller.commit();
+    // A cancelled generation cannot reinstate confirmation or release the pending guard.
+    ws.event({ type: 'turn', generation_id: 1, turn: { customer_confirmed: true } });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, session: { customer_confirmed: false } });
+    await settle(); await f.controller.commit();
+    expect(f.requests.some(request => request.url.endsWith('/commit'))).toBe(false);
+    ws.event({ type: 'turn', generation_id: 2, state: 'NEGOTIATION', turn: { customer_confirmed: false } });
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    await f.controller.commit();
+    expect(f.requests.some(request => request.url.endsWith('/commit'))).toBe(false);
+    f.controller.disconnect();
+  });
+  it('rejects text without sending or resetting while a commit is busy', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'turn', generation_id: 1, state: 'PENDING_CONFIRMATION', turn: { customer_confirmed: true } });
+    const normal = f.fetcher.getMockImplementation()!;
+    let resolve!: (response: Response) => void;
+    f.fetcher.mockImplementation((input, options) => String(input).endsWith('/commit')
+      ? new Promise<Response>(done => { resolve = done; }) : normal(input, options));
+    const commit = f.controller.commit();
+    const busy = f.controller.getSnapshot(); const sent = ws.sent.length; const messages = f.player.messages.length;
+    expect(busy.commitBusy).toBe(true);
+    expect(f.controller.sendText('Change my plan')).toBe(false);
+    expect(f.controller.getSnapshot()).toBe(busy);
+    expect(ws.sent).toHaveLength(sent); expect(f.player.messages).toHaveLength(messages);
+    resolve(new Response(JSON.stringify({ state: 'COMMITTED', courier_card: { action: 'HAND_TO_CUSTOMER' } }), { status: 200 }));
+    await commit;
+    expect(f.controller.getSnapshot().commitBusy).toBe(false);
+    f.controller.disconnect();
+  });
+  it('retains accepted provider errors through audio feedback and clears them on a healthy turn', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'opening', generation_id: 1, agent_message: 'Please tell me your delivery preference.',
+      planner: { model: 'demo-planner', error_code: 'SERVICE_UNAVAILABLE', degraded: true } });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, plannerModel: 'demo-planner', plannerError: 'SERVICE_UNAVAILABLE' });
+    expect(f.controller.sendText('Hand it to me')).toBe(true);
+    ws.event({ type: 'turn', generation_id: 2, agent_message: 'Please repeat your delivery preference.',
+      planner: { model: 'demo-planner', error_code: 'RATE_LIMITED', degraded: true }, turn: { customer_confirmed: false } });
+    for (const event of [
+      { type: 'audio_level', speech: true }, { type: 'listening' },
+      { type: 'agent_audio_chunk', generation_id: 2, chunk_base64: 'AAA=' },
+      { type: 'agent_audio_end', generation_id: 2, audio_error: true },
+      { type: 'turn', generation_id: 1, planner: { model: 'obsolete', degraded: false } },
+    ]) ws.event(event);
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, plannerModel: 'demo-planner', plannerError: 'RATE_LIMITED' });
+    expect(f.controller.sendText('Hand it to me')).toBe(true);
+    expect(f.controller.getSnapshot().plannerError).toBe('RATE_LIMITED');
+    ws.event({ type: 'audio_level', speech: false });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, plannerError: 'RATE_LIMITED' });
+    ws.event({ type: 'turn', generation_id: 3, planner: { model: 'healthy-planner', degraded: false }, turn: { customer_confirmed: false } });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, plannerModel: 'healthy-planner', plannerError: null });
+    f.controller.disconnect();
+  });
+  it('clears pending work on wire errors, socket failure, disconnect and selection reset', async () => {
+    const f = fixture(); await f.connect(); const old = f.sockets[0];
+    old.event({ type: 'opening', generation_id: 1, planner: { model: 'demo-planner', error_code: 'SERVICE_UNAVAILABLE', degraded: true } });
+    f.controller.sendText('First attempt');
+    old.event({ type: 'error', detail: 'The service is temporarily unavailable.' });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, error: 'The service is temporarily unavailable.', plannerError: 'SERVICE_UNAVAILABLE' });
+    expect(f.controller.sendText('Try again')).toBe(true);
+    old.onerror?.();
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    f.controller.sendText('Retry');
+    old.close();
+    expect(f.controller.getSnapshot()).toMatchObject({ connected: false, processing: false });
+    const reconnect = f.controller.connect({ orderId: 42 });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, plannerModel: null, plannerError: null, error: null });
+    await reconnect;
+    const current = f.sockets[1]; current.event({ type: 'ready', state: 'DISCOVERY' });
+    expect(f.controller.sendText('New connection')).toBe(true);
+    old.event({ type: 'turn', generation_id: 99, planner: { model: 'obsolete', error_code: 'OLD_ERROR' }, turn: { customer_confirmed: true } });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, plannerModel: null, plannerError: null, session: { customer_confirmed: false } });
+    f.controller.disconnect();
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    await f.controller.connect({ orderId: 42 }); f.sockets[2].event({ type: 'ready', state: 'DISCOVERY' });
+    f.sockets[2].event({ type: 'opening', generation_id: 1, planner: { model: 'demo-planner', error_code: 'SERVICE_UNAVAILABLE' } });
+    f.controller.sendText('Cancel this request'); f.controller.resetSelection();
+    expect(f.controller.getSnapshot()).toMatchObject({ connected: false, processing: false, plannerModel: null, plannerError: null, session: null, lines: [] });
   });
   it('resumes the scheduler-created session when creation races with admission', async () => {
     const f = fixture(); const normal = f.fetcher.getMockImplementation()!;
@@ -131,7 +242,10 @@ describe('voice controller connection and safety', () => {
     f.sockets[0].event({ type: 'turn', generation_id: 1, state: 'PENDING_CONFIRMATION', turn: { customer_confirmed: false } });
     f.sockets[0].event({ type: 'turn', generation_id: 2, state: 'PENDING_CONFIRMATION', planner: { operator_revision_id: 'new-plan' }, turn: { customer_confirmed: false } });
     expect(f.requests.some(request => request.url.endsWith('/commit'))).toBe(false);
+    expect(f.controller.sendText('Yes, confirm that plan')).toBe(true);
+    expect(f.controller.getSnapshot().processing).toBe(true);
     f.sockets[0].event({ type: 'turn', generation_id: 3, state: 'PENDING_CONFIRMATION', turn: { customer_confirmed: true } });
+    expect(f.controller.getSnapshot().processing).toBe(false);
     await vi.waitFor(() => expect(f.controller.getSnapshot().session?.state).toBe('COMMITTED'));
     expect(f.requests.filter(request => request.url.endsWith('/commit'))).toHaveLength(1);
     f.controller.disconnect();
@@ -166,14 +280,49 @@ describe('playback generations and cleanup', () => {
     const f = fixture(); await f.connect(); await f.controller.toggleMicrophone();
     const ws = f.sockets[0];
     ws.event({ type: 'speech_end', duration_ms: 900 });
+    expect(f.controller.getSnapshot().processing).toBe(true);
+    expect(f.controller.sendText('Do not replace the pending voice reply')).toBe(false);
+    ws.event({ type: 'turn', generation_id: 1, turn: { customer_confirmed: false } });
+    expect(f.controller.getSnapshot().processing).toBe(false);
     ws.event({ type: 'agent_audio_chunk', generation_id: 1, chunk_base64: 'AAA=' });
     const buffer = new ArrayBuffer(640);
     f.mic.port.onmessage?.({ data: { type: 'audio', buffer } });
     expect(ws.binary).toEqual([buffer]);
     expect(f.controller.getSnapshot().listening).toBe(false);
-    f.controller.sendText('I need to change my plan');
+    expect(f.controller.sendText('I need to change my plan')).toBe(true);
     f.mic.port.onmessage?.({ data: { type: 'audio', buffer } });
     expect(ws.binary).toHaveLength(1); f.controller.disconnect();
+  });
+  it('allows microphone interruption without allowing cancelled generations to clear a newer pending reply', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'turn', generation_id: 1, state: 'PENDING_CONFIRMATION', turn: { customer_confirmed: true } });
+    ws.event({ type: 'agent_audio_chunk', generation_id: 1, chunk_base64: 'AAA=' });
+    ws.event({ type: 'speech_start' });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, session: { customer_confirmed: false } });
+    ws.event({ type: 'speech_end' });
+    expect(f.controller.getSnapshot().processing).toBe(true);
+    ws.event({ type: 'stop_speaking', generation_id: 99 });
+    expect(f.controller.getSnapshot().processing).toBe(true);
+    ws.event({ type: 'stop_speaking', generation_id: 1 });
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, speaking: false });
+    expect(f.controller.sendText('New instructions')).toBe(true);
+    const messages = f.player.messages.length;
+    ws.event({ type: 'stop_speaking', generation_id: 1 });
+    ws.event({ type: 'turn', generation_id: 1, turn: { customer_confirmed: true } });
+    ws.event({ type: 'agent_audio_end', generation_id: 1 }); f.player.drain(1);
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, session: { customer_confirmed: false } });
+    expect(f.player.messages).toHaveLength(messages);
+    expect(ws.sent.some(event => event.type === 'playback_done')).toBe(false);
+    await f.controller.beginPushToTalk();
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: false, listening: true, microphone: true });
+    f.controller.endPushToTalk();
+    expect(f.controller.getSnapshot()).toMatchObject({ processing: true, listening: false });
+    ws.event({ type: 'no_speech', reason: 'NO_SPEECH_DETECTED' });
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    expect(f.controller.sendText('Try typing instead')).toBe(true);
+    ws.event({ type: 'speech_start' });
+    expect(f.controller.getSnapshot().processing).toBe(false);
+    f.controller.disconnect();
   });
   it('acknowledges drain only after generation end, once, and ignores cancelled audio', async () => {
     const f = fixture(); await f.connect(); const ws = f.sockets[0];
@@ -213,6 +362,7 @@ describe('playback generations and cleanup', () => {
     let resolve!: (stream: MediaStream) => void;
     const f = fixture({ microphone: () => new Promise(done => { resolve = done; }) }); await f.connect();
     const pending = f.controller.beginPushToTalk(); await settle(); f.controller.endPushToTalk();
+    expect(f.controller.getSnapshot().processing).toBe(false);
     resolve({ getTracks: () => [] } as unknown as MediaStream); await pending;
     expect(f.sockets[0].sent.some(event => event.type === 'start')).toBe(false); f.controller.disconnect();
   });
@@ -234,6 +384,8 @@ it('reports playback starvation only for the current generation and connection',
   report(1, 0); report(2, 1);
   expect(f.sockets[0].sent.filter(event => event.type === 'playback_underrun')).toHaveLength(0);
   report(1, 1);
-  expect(f.sockets[0].sent).toContainEqual({ type: 'playback_underrun', generation_id: 1 });
+  expect(f.sockets[0].sent.filter(event => event.type === 'playback_underrun')).toEqual([{ type: 'playback_underrun', generation_id: 1 }]);
+  f.sockets[0].event({ type: 'stop_speaking', generation_id: 1 }); report(1, 1);
+  expect(f.sockets[0].sent.filter(event => event.type === 'playback_underrun')).toHaveLength(1);
   f.controller.disconnect();
 });

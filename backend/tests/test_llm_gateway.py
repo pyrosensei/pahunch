@@ -360,6 +360,42 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     asyncio.run(run())
 
 
+def test_openrouter_sends_the_free_gemma_model_with_strict_json_schema():
+    schema = _planner_schema()
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+        assert payload["model"] == "google/gemma-4-31b-it:free"
+        assert "reasoning_effort" not in payload
+        assert "max_completion_tokens" not in payload
+        assert payload["max_tokens"] == 1024
+        assert payload["response_format"]["json_schema"]["schema"] == schema
+        assert payload["response_format"]["json_schema"]["strict"] is True
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps({
+                "action": "RESPOND", "message": "Hello, how can I help?",
+                "proposal": None, "escalation_reason": None, "confidence": 0.95,
+            })}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30},
+        })
+
+    async def run():
+        client = OpenAICompatibleClient(
+            base_url="https://openrouter.ai/api/v1/",
+            api_key="test-or-key", model="google/gemma-4-31b-it:free",
+            provider="openrouter",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            result = await client.complete_json(system_prompt="system", user_prompt="Hello", schema_name="planner_decision", schema=schema)
+            assert PlannerDecision.model_validate_json(result.text).action.value == "RESPOND"
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_builder_uses_only_google_credentials():
     config = Settings(
         _env_file=None, llm_provider="gemini", gemini_api_key="test-google-key",
@@ -419,13 +455,27 @@ def test_each_provider_uses_only_its_own_key():
 
 
 def test_default_provider_is_gemini_with_its_own_defaults():
-    config = Settings(_env_file=None, gemini_api_key="google-key", ollama_api_key="ollama-key")
+    config = Settings(_env_file=None, gemini_api_key="google-key", openrouter_api_key="or-key")
     assert config.llm_provider == "gemini"
     client = build_llm_client(config)
     assert isinstance(client, GeminiClient)
     assert client._base_url == "https://generativelanguage.googleapis.com/v1beta"
     assert client._model == "gemini-3.1-flash-lite"
     assert client._api_key == "google-key"
+
+
+def test_openrouter_remains_selectable_with_its_own_defaults():
+    config = Settings(
+        _env_file=None,
+        llm_provider="openrouter",
+        openrouter_api_key="or-key",
+        gemini_api_key="google-key",
+    )
+    client = build_llm_client(config)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._base_url == "https://openrouter.ai/api/v1"
+    assert client._model == "google/gemma-4-31b-it:free"
+    assert client._api_key == "or-key"
 
 
 def test_ollama_remains_selectable_with_its_own_defaults():

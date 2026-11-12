@@ -440,7 +440,7 @@ class GeminiClient:
 PROVIDER_DEFAULTS: ClassVar[dict[str, tuple[str, str]]] = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-3.1-flash-lite"),
     "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
-    "openrouter": ("https://openrouter.ai/api/v1", "google/gemma-3-27b-it:free"),
+    "openrouter": ("https://openrouter.ai/api/v1", "google/gemma-4-31b-it:free"),
     "ollama": ("https://ollama.com/v1", "gpt-oss:120b"),
 }
 # Ollama's structured output has no $defs support, so its schema is inlined.

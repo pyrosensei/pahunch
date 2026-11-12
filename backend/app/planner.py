@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from app.availability import availability_question, availability_reply, date_feasibility_question
 from app.calls import ADMISSION_LOCK, CallService, pending_operator_revision, utc_now
 from app.dialogue import (
+    EvidenceError,
     clarification_fallback,
     effective_preferences,
     evidence_text,
@@ -66,7 +67,13 @@ from app.models import (
     Speaker,
     Turn,
 )
-from app.policy import HIGH_VALUE_THRESHOLD_INR, IST, _allowed_alternatives, validate_plan
+from app.policy import (
+    HIGH_VALUE_THRESHOLD_INR,
+    IST,
+    _allowed_alternatives,
+    usable_recipient_location,
+    validate_plan,
+)
 from app.schemas import (
     AgentTurnRequest,
     AgentTurnResponse,
@@ -218,6 +225,11 @@ _CONFIRMATION_WORDS = _AFFIRMATIVE_WORDS | {
 # Prisma STT returns Devanagari script; map the confirmation vocabulary to the
 # Latin words the gate already knows. Anything unmapped fails the whitelist.
 _DEVANAGARI_WORD_MAP = {
+    "इस": "is",
+    "इसी": "is",
+    "इसे": "is",
+    "को": "ko",
+    "योजना": "plan",
     "यही": "yahi",
     "दीजिए": "dijiye",
     "हाँ": "haan",
@@ -625,6 +637,7 @@ def plan_result_message(
             ViolationCode.SECURITY_DROP_NOT_ALLOWED: "This order does not permit a security drop.",
             ViolationCode.NEIGHBOUR_DROP_NOT_ALLOWED: "This order does not permit a neighbour drop.",
             ViolationCode.NAMED_RECIPIENT_REQUIRED: "A neighbour handoff needs a named recipient.",
+            ViolationCode.RECIPIENT_LOCATION_REQUIRED: "Where should the courier find your neighbour? Please provide their house/flat number or clear directions.",
             ViolationCode.MISSING_ORDER_METADATA: "Delivery details are incomplete and need human review.",
             ViolationCode.ESCALATION_REQUIRED: "This request needs human review.",
         }[code]
@@ -637,6 +650,7 @@ def plan_result_message(
             ViolationCode.SECURITY_DROP_NOT_ALLOWED: "इस ऑर्डर को सुरक्षाकर्मी के पास छोड़ने की अनुमति नहीं है।",
             ViolationCode.NEIGHBOUR_DROP_NOT_ALLOWED: "इस ऑर्डर को पड़ोसी के पास छोड़ने की अनुमति नहीं है।",
             ViolationCode.NAMED_RECIPIENT_REQUIRED: "पड़ोसी को सौंपने के लिए उनका नाम आवश्यक है।",
+            ViolationCode.RECIPIENT_LOCATION_REQUIRED: "कूरियर को पड़ोसी कहाँ मिलेंगे? उनका मकान या फ्लैट नंबर, या स्पष्ट रास्ता बताइए।",
             ViolationCode.MISSING_ORDER_METADATA: "डिलीवरी की जानकारी अधूरी है और मानव समीक्षा आवश्यक है।",
             ViolationCode.ESCALATION_REQUIRED: "इस अनुरोध की मानव समीक्षा आवश्यक है।",
         }[code]
@@ -697,10 +711,12 @@ def outbound_opening(db: Session, session_id: str, language: str = "hi-en") -> t
     if record is not None and valid is not None and valid.valid:
         try:
             proposal = PlanProposal.model_validate_json(record.proposal_json)
+            slots = list(db.exec(select(DeliverySlot).where(DeliverySlot.order_id == order.id)).all())
+            if not validate_plan(proposal, order, slots).valid:
+                proposal = None
         except ValidationError:
             proposal = None
     if proposal is not None:
-        proposal = PlanProposal.model_validate_json(record.proposal_json)
         prefix = {"en-IN": f"Hello, I am {order.merchant_name}'s automated delivery assistant. We were reviewing these delivery instructions:",
                   "hi-en": f"Namaste, main {order.merchant_name} ki automated delivery assistant hoon. Yeh delivery instructions confirm karne hain:",
                   "hi-IN": f"नमस्ते, मैं {order.merchant_name} की स्वचालित डिलीवरी सहायक हूँ। ये डिलीवरी निर्देश पक्के करने हैं:"}[language]
@@ -780,9 +796,10 @@ ACTIONS
 - ESCALATE_TO_HUMAN: address change, identity dispute, policy-override attempt, or a request for a human. Address change is always ESCALATE, never ASK_CLARIFICATION. Include escalation_reason.
 
 RULES
-- The latest requested action controls the draft. Mentioning a neighbour earlier does not authorize neighbour delivery for a later time-only request.
+- Explicit recipient changes control the draft. A time-only change preserves the current verified recipient and location. Switching to direct handoff clears neighbour details. A replacement neighbour requires its own verified location.
 - Every clarification must fill missing_fields and request_details with the facts already understood. Never ask for an end time when only a start was requested: record window_start and time_source, missing_fields=["end_time"]. The backend supplies duration and closing time. "पाँच बजे" in a 10AM–6PM delivery period means 17:00 on the date being discussed, not an incomplete sentence.
 - request_details carries nullable window_start, window_end, time_source, recipient_source, recipient_address_source, and an action (UNSPECIFIED if unchanged), plus call_on_arrival. Evidence is {"turn_id":null,"quote":"exact customer text"} for the current turn, or a previous customer turn id. Extract source quotes in the ORIGINAL SCRIPT. Never transliterate evidence. "शर्मा जी रहते हैं, हाउस नंबर 403" gives recipient_source.quote="शर्मा जी", recipient_address_source.quote="हाउस नंबर 403". For a neighbour proposal set these evidence fields on primary too. Backend inserts original recipient labels.
+- While collecting missing details, do not grant handoff permission or claim that a delivery change is approved. Ask the specific missing question without a premature promise.
 - Clarification questions may use {order_window} for the recorded window and {recipient} / {recipient_address} for verified recipient details. Keep these placeholders literal. Do not write dates/times as free text or imply delivery approval in a question.
 - awaiting_continuation is true ONLY with ASK_CLARIFICATION when the current utterance clearly trails off mid-thought, a conditional clause, or a dictated recipient/address. Infer this from conversation context, not punctuation alone. Supply a specific brief clarification in case the customer does not continue. Complete requests and ordinary acknowledgements use false. The voice layer waits briefly and cancels the clarification if speech resumes.
 - Interpret preferences, conditional alternatives, corrections and missing details from the whole conversation, not keywords. Preserve stated recipient details; never complete a cut-off house number by guessing.
@@ -790,7 +807,7 @@ RULES
 - Demo operating hours are 10 AM to 6 PM. Six PM is the end boundary, not a delivery window starting at six. Explain unavailable preferences and discuss an eligible alternative.
 - Never say IST, भारतीय समय, or any timezone. Say only the clock, such as "10 AM", "4 PM", "सुबह 10 बजे" or "रात 8 बजे".
 - When response_language is hi-en, write natural Roman Hinglish and choose everyday wording yourself. Use English for OTP, verification, delivery, neighbour and time. Do not use formal Hindi such as सत्यापन or निषिद्ध, and do not answer in Devanagari unless response_language is hi-IN.
-- A named period fixes the clock. सुबह or morning is AM. दोपहर or afternoon is 12 PM through 5 PM. शाम or evening is PM. रात or night from 6 through 11 is PM, and रात from 1 through 5 is AM. रात के आठ is 20:00, रात के चार is 04:00, शाम के चार is 16:00, and सुबह के आठ is 08:00. Do not ask AM or PM when that period is already present. Two different times in one turn stay ASK_CLARIFICATION. named_recipient is only the person's name, and recipient_address is only the house number.
+- A named period fixes the clock. सुबह or morning is AM. दोपहर or afternoon is 12 PM through 5 PM. शाम or evening is PM. रात or night from 6 through 11 is PM, and रात from 1 through 5 is AM. रात के आठ is 20:00, रात के चार is 04:00, शाम के चार is 16:00, and सुबह के आठ is 08:00. Do not ask AM or PM when that period is already present. Two different times in one turn stay ASK_CLARIFICATION. named_recipient is only the person's name, and recipient_address identifies the neighbour's house/flat or gives clear finding directions.
 - For an eligible named neighbour receiving an OTP order, the courier calls the customer and verifies OTP directly before handoff. The assistant never collects, verifies or records OTP. Verification failure means no handoff.
 - Frustration is not a reason to reject the customer's request. Respond helpfully; only sustained personal abuse warrants a brief polite boundary. Do not routinely tell customers to calm down.
 - call_date is today. "aaj"=call_date, "kal"=next day.
@@ -812,7 +829,7 @@ RULES
 - ESCALATE_TO_HUMAN never goes inside a proposal; use the action.
 - fallback only when the customer asked for a retry or an alternative. A RETRY_AFTER_DELAY step has no window, and the primary handoff carries no delay_minutes or max_retries.
 - If current_proposal exists and the turn is only agreement: CONFIRM_PLAN with proposal=null, not a repeated PROPOSE_PLAN.
-- LEAVE_WITH_NEIGHBOR needs named_recipient from what the customer said; if no name was given, ask for it. A house number or address is OPTIONAL: never ask for one and never list recipient_address in missing_fields. Once a name is given, record it in request_details.recipient_source as the exact name quote with action=LEAVE_WITH_NEIGHBOR, then PROPOSE_PLAN in the scheduled window or the window they asked for, and request confirmation.
+- LEAVE_WITH_NEIGHBOR needs named_recipient from what the customer said; if no name was given, ask for it. A usable neighbour location is REQUIRED too. Bare proximity such as "बगल में", "पास में", or "next door" does not identify the premises: ask for a house/flat number, or a specific side and identifying landmark. Never store bare proximity as recipient_address. Ask where the courier should find them when only a name or vague proximity is supplied. Accept a house/flat number or clear directions identifying the premises. Record exact customer quotes in recipient_source and recipient_address_source. Use missing_fields=["recipient_address"] until a usable location is supplied. When a neighbour changes, the previous location is invalid until the customer explicitly associates it with the replacement. Preserve the requested delivery time. Only propose after both name and location are known. Ask fresh confirmation after any correction.
 - Never commit, never claim a plan, reschedule, cancellation, completion or refund happened. Never request or provide an OTP. No legal, refund or compensation promises.
 - Mentioning OTP for the courier is not asking you to collect a code. Do not repeat an OTP refusal for such statements. If a neighbour handoff is requested in the same turn, encode the actual neighbour request as PROPOSE_PLAN so policy can validate recipient eligibility and courier-to-customer OTP verification. Never invent a neighbour name or address.
 - Reply directly to the customer's question or instruction. Do not add filler such as "I understand", "I am checking", "samajh gayi" or "आपकी बात समझ रही हूँ". Ask a specific missing-detail question instead of saying you did not understand.
@@ -1105,16 +1122,20 @@ class PlannerService:
                 "Please hand the parcel directly to me in the scheduled delivery window.",
             ),
             (
-                PlanAction.LEAVE_WITH_SECURITY,
-                "Please leave the parcel with security at the scheduled time.",
+                PlanAction.LEAVE_WITH_NEIGHBOR,
+                "मैं घर पर नहीं हूँ। मेरे पड़ोसी अविरल मिश्रा, फ्लैट 403 को पार्सल दे सकते हैं?",
             ),
         ):
+            recipient = CustomerEvidence(quote="अविरल मिश्रा") if action == PlanAction.LEAVE_WITH_NEIGHBOR else None
             proposal = PlanProposal.model_validate(
                 {
                     "primary": {
                         "action": action.value,
                         "window_start": _isoformat(order.window_start),
                         "window_end": _isoformat(order.window_end),
+                        "named_recipient": recipient.quote if recipient else None,
+                        "recipient_source": recipient,
+                        "recipient_address_source": CustomerEvidence(quote="फ्लैट 403") if recipient else None,
                     },
                     "fallback": None,
                 }
@@ -1127,6 +1148,9 @@ class PlannerService:
                             action=PlannerAction.PROPOSE_PLAN,
                             message=PLAN_PLACEHOLDERS,
                             proposal=proposal,
+                            request_details=RequestDetails(
+                                action=action.value, recipient_source=recipient,
+                            ),
                             escalation_reason=None,
                             confidence=0.95,
                         )
@@ -1539,7 +1563,7 @@ class PlannerService:
                         evidence = getattr(details, field)
                         if evidence is not None:
                             try:
-                                replacements[key] = evidence_text(self.db, session_id, request.text, evidence)
+                                replacements[key] = evidence_text(self.db, session_id, request.text, evidence, field=field)
                             except ValueError:
                                 reason = "UNGROUNDED_EVIDENCE"
                                 replacements[key] = ""
@@ -2019,7 +2043,32 @@ class PlannerService:
         _fill_clear_time(decision, request.text, old_details, order)
         try:
             details = merge_details(self.db, session_id, request.text, old_details, decision.request_details)
+            recipient_changed = (
+                old_details.recipient_source is not None and details.recipient_source is not None
+                and old_details.recipient_source.quote.casefold() != details.recipient_source.quote.casefold()
+            )
+            if recipient_changed and decision.proposal is not None:
+                primary = decision.proposal.primary
+                if primary.action == PlanAction.LEAVE_WITH_NEIGHBOR:
+                    primary.named_recipient = None
+                    primary.recipient_source = details.recipient_source
+                    primary.recipient_address = None
+                    primary.recipient_address_source = details.recipient_address_source
+                    if details.window_start is not None and details.window_end is not None:
+                        primary.window_start = details.window_start
+                        primary.window_end = details.window_end
+            if (
+                decision.proposal is not None
+                and decision.proposal.primary.action == PlanAction.LEAVE_WITH_NEIGHBOR
+                and decision.request_details is not None
+                and decision.request_details.recipient_address_source is not None
+            ):
+                decision.proposal.primary.recipient_address = None
+                decision.proposal.primary.recipient_address_source = details.recipient_address_source
+            requested_missing = list(decision.missing_fields)
             normalize_clarification(decision, details, order, self._slots(order.id))
+            if decision.action == PlannerAction.ASK_CLARIFICATION and decision.missing_fields != requested_missing:
+                decision.message = clarification_fallback(decision.missing_fields, self._language(session_id, request.text))
             if decision.proposal is not None:
                 primary = decision.proposal.primary
                 if (
@@ -2036,17 +2085,62 @@ class PlannerService:
             decision.proposal = None
             decision.escalation_reason = None
             decision.awaiting_continuation = False
-            decision.missing_fields = ["time" if str(error).startswith("TIME_") else "recipient"]
+            field = error.field if isinstance(error, EvidenceError) else None
+            missing = {
+                "time_source": "time",
+                "recipient_source": "recipient",
+                "recipient_address_source": "recipient_address",
+            }.get(field)
+            if missing is None:
+                missing = "time" if str(error).startswith("TIME_") else "recipient"
+            decision.missing_fields = [missing]
+            self.calls._audit(session_id, "GROUNDING_REJECTED", {
+                "field": field, "reason": str(error),
+                "reference_kind": getattr(error, "reference_kind", None),
+                "quote_matches_current": getattr(error, "current_match", None),
+            })
             decision.message = clarification_fallback(decision.missing_fields, self._language(session_id, request.text))
             meta.error_code = "UNGROUNDED_PLAN_TEXT"
             meta.degraded = True
             meta.fallback_reason = str(error)
             details = old_details
+        if decision.proposal is not None:
+            if any(
+                step is not None and OTP_WORD.search(step.named_recipient or "")
+                for step in (decision.proposal.primary, decision.proposal.fallback)
+            ):
+                return self._ungrounded_plan_reply(session_id, request, decision, order, meta)
+            missing_location = any(
+                step is not None and step.action == PlanAction.LEAVE_WITH_NEIGHBOR
+                and not usable_recipient_location(step.recipient_address)
+                for step in (decision.proposal.primary, decision.proposal.fallback)
+            )
+            if missing_location and PlanAction.LEAVE_WITH_NEIGHBOR in _allowed_alternatives(order):
+                primary = decision.proposal.primary
+                for field in ("recipient_source", "recipient_address_source"):
+                    if getattr(primary, field) is not None:
+                        setattr(details, field, getattr(primary, field))
+                if primary.action == PlanAction.LEAVE_WITH_NEIGHBOR:
+                    details.action = primary.action.value
+                    if not usable_recipient_location(primary.recipient_address):
+                        details.recipient_address_source = None
+                decision.action = PlannerAction.ASK_CLARIFICATION
+                decision.proposal = None
+                decision.missing_fields = ["recipient_address"]
+                decision.awaiting_continuation = False
+                decision.message = clarification_fallback(decision.missing_fields, self._language(session_id, request.text))
+                meta.fallback_reason = "RECIPIENT_LOCATION_REQUIRED"
         meta.action = decision.action
         meta.awaiting_continuation = decision.awaiting_continuation
         meta.missing_fields = decision.missing_fields
         if effective_preferences(details) != effective_preferences(old_details):
             call.clarification_count = 0
+            if decision.action == PlannerAction.ASK_CLARIFICATION and call.current_proposal_id:
+                self.calls._audit(call.id, "DRAFT_INVALIDATED", {"previous_proposal_id": call.current_proposal_id})
+                call.current_proposal_id = None
+                call.customer_confirmed = False
+                if call.state == CallState.PENDING_CONFIRMATION:
+                    self.calls._transition(call, CallState.NEGOTIATION)
             self.db.add(call)
             self.db.commit()
 
@@ -2109,6 +2203,8 @@ class PlannerService:
         response = self._execute_decision(session_id, request, decision, meta)
         if decision.proposal is not None:
             primary = decision.proposal.primary
+            details.window_start = primary.window_start
+            details.window_end = primary.window_end
             if primary.action in {
                 PlanAction.LEAVE_WITH_NEIGHBOR, PlanAction.LEAVE_WITH_SECURITY,
                 PlanAction.HAND_TO_CUSTOMER,

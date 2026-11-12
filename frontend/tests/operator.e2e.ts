@@ -68,6 +68,7 @@ async function operatorBackend(page: Page, options: { confirmed?: boolean; polic
     const request = route.request(); const url = new URL(request.url()); const path = url.pathname;
     allRequests.push(`${request.method()} ${path}`);
     const fulfill = (json: unknown, status = 200) => route.fulfill({ json, status });
+    if (path === '/api/operator/access') return fulfill(request.headers()['x-operator-token'] === TOKEN ? {authorized:true} : {detail:'A valid operator token is required'}, request.headers()['x-operator-token'] === TOKEN ? 200 : 401);
     if (path === '/api/sessions') return fulfill([{ ...session, state: summary.state, current_proposal_id: summary.proposal?.id || null, customer_confirmed: summary.confirmation.confirmed, proposal: summary.proposal?.plan || null, verdict: summary.proposal?.policy || null }]);
     if (path.endsWith('/turns')) {
       const after = Number(url.searchParams.get('after_id'));
@@ -107,19 +108,16 @@ async function unlock(page: Page, value = TOKEN) {
   await page.getByRole('button', { name: /Enter operator key|Change operator key/ }).click();
   await page.getByLabel('Operator key', { exact: true }).fill(value);
   await page.getByRole('button', { name: 'Use operator key' }).click();
+  await page.getByRole('tab', {name:'Review',exact:true}).click();
 }
 
 test('operator monitor is separate from customer PC voice and uses tab-only authenticated access', async ({ page }, testInfo) => {
   const backend = await operatorBackend(page); const sockets: string[] = []; page.on('websocket', socket => { if (socket.url().includes('/ws/sessions/')) sockets.push(socket.url()); });
   await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'Agent activity' })).toBeVisible();
-  await page.getByText('Customer request & outcome', { exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText(CUSTOMER_NEED);
-  await expect(page.getByRole('region', { name: 'Customer needs' })).not.toContainText(SYSTEM_NOTE);
-  const pc = page.getByRole('link', { name: 'Start customer voice demo' });
-  await expect(pc).toHaveAttribute('target', '_blank');
-  await expect(pc).toHaveAttribute('href', `/voice?session_id=${session.id}&order_id=${order.id}&pc_demo=1`);
-  await expect(pc).toHaveAttribute('rel', /noopener/);
+  await expect(page.getByRole('heading', { name: 'Demo orders' })).toBeVisible();
+  await expect(page.locator('.operations-transcript')).toContainText(CUSTOMER_NEED);
+  await expect(page.getByRole('link', {name:'Start customer voice demo'})).toHaveCount(0);
+  await page.getByRole('tab', {name:'Review',exact:true}).click();
   await expect(page.getByRole('button', { name: 'Start microphone' })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: 'Your reply' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Reject proposal', exact: true })).toBeDisabled();
@@ -185,17 +183,19 @@ test('operator sees the neighbour address and preserves untouched sources during
   expect(backend.allRequests.some(request => request.includes('/commit'))).toBe(false);
 });
 
-test('recipient edits clear only the edited customer-source attribution', async ({ page }) => {
+test('recipient changes require a fresh location and clear the previous attribution', async ({ page }) => {
   const backend = await operatorBackend(page, { neighbour: true });
   await page.goto('/dashboard'); await unlock(page);
   const decision = page.locator('.operator-plan');
   await decision.getByRole('button', { name: 'Revise proposal', exact: true }).click();
   await page.getByRole('textbox', { name: 'Primary plan recipient name' }).fill('Asha Devi');
+  await expect(page.getByRole('textbox',{name:'Primary plan recipient address'})).toHaveValue('');
+  await page.getByRole('textbox',{name:'Primary plan recipient address'}).fill('Flat 4B, Demo Lane');
   await page.getByRole('textbox', { name: 'Operator reason' }).fill('Clarify the recipient name.');
   await page.getByRole('button', { name: 'Submit revision for customer confirmation' }).click();
   await expect(page.getByText('Revision proposed. A fresh customer confirmation is required.')).toBeVisible();
   let primary = (backend.writes[0].body.proposal as Proposal).primary;
-  expect(primary).toMatchObject({ named_recipient: 'Asha Devi', recipient_source: null, recipient_address: 'Flat 4B, Demo Lane', recipient_address_source: { quote: 'at Flat 4B, Demo Lane' } });
+  expect(primary).toMatchObject({ named_recipient: 'Asha Devi', recipient_source: null, recipient_address: 'Flat 4B, Demo Lane', recipient_address_source: null });
   await decision.getByRole('button', { name: 'Revise proposal', exact: true }).click();
   await page.getByRole('textbox', { name: 'Primary plan recipient address' }).fill('Flat 5B, Demo Lane');
   await page.getByRole('textbox', { name: 'Operator reason' }).fill('Clarify the recipient address.');
@@ -212,7 +212,7 @@ test('transcript diagnostics keep review-needed non-terminal and language warnin
     wording_source: 'fallback', fallback_reason: 'structured_output',
   } });
   await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'The conversation', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute('aria-selected','true');
   await page.getByText('Response details', { exact: true }).click();
   const meta = page.locator('.turn-meta');
   await expect(meta.getByRole('status')).toHaveText('Review helpful · conversation can continue');
@@ -281,60 +281,38 @@ test('operator review controls and recorded conversation meet automated WCAG AA 
 });
 
 
-test('prepared PC session explains the next action and separates opening timings from reply timings', async ({ page }) => {
-  await mockApi(page, { state: 'CALLING' });
-  await page.route('**/api/orders', route => route.fulfill({ json: [{ ...order, requires_otp: false }] }));
+test('prepared conversations stay in SwiftCart and opening timings remain distinct', async ({ page }) => {
+  await mockApi(page, {state:'CALLING'});
+  await page.route('**/api/sessions/*/events', route => route.fulfill({json:[{id:1,event_type:'OPENING_LINE_SPOKEN',created_at:session.started_at,payload_json:JSON.stringify({first_audio_ms:650,tts_ms:1200})}]}));
   await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'Ready to start the voice demo' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('Confirm availability');
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('No OTP is required');
-  await expect(page.getByRole('link', { name: 'Start customer voice demo' })).toHaveAttribute('target', '_blank');
-  await page.getByText('Customer request & outcome', { exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText('The customer has not replied yet');
-  await page.getByRole('tab', { name: 'Performance' }).click();
-  await expect(page.getByRole('heading', { name: 'Start the PC voice demo to measure it.' })).toBeVisible();
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).not.toContainText('0 ms');
-  await page.route('**/api/sessions?**', route => route.fulfill({ json: [{ ...session, state: 'DISCOVERY' }] }));
-  await page.route('**/api/sessions/*/turns?**', route => route.fulfill({ json: Number(new URL(route.request().url()).searchParams.get('after_id')) ? [] : [{ id: 1, speaker: 'AGENT', text: 'Your SwiftCart delivery is scheduled today. Will you be available?', created_at: session.started_at, structured_payload: { opening: true } }] }));
-  await page.route('**/api/sessions/*/events', route => route.fulfill({ json: [{ id: 1, event_type: 'REALTIME_CONNECTED', payload_json: '{}', created_at: session.started_at }, { id: 2, event_type: 'OPENING_LINE_SPOKEN', payload_json: JSON.stringify({ first_audio_ms: 650, tts_ms: 1200 }), created_at: session.started_at }] }));
-  await page.getByRole('button', { name: /Updated/ }).click();
-  await expect(page.getByRole('heading', { name: 'Waiting for customer availability' })).toBeVisible();
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('650 ms');
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('1200 ms');
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('turn breakdown appears after the customer replies');
-  await page.getByRole('tab', { name: 'Transcript' }).click();
-  await expect(page.getByText('Your SwiftCart delivery is scheduled today. Will you be available?', { exact: true })).toBeVisible();
+  await expect(page.getByRole('status')).toContainText('Customer voice is ready');
+  await expect(page.getByRole('link',{name:'Start customer voice demo'})).toHaveCount(0);
+  await page.getByText('Performance and audit details',{exact:true}).click();
+  await expect(page.getByRole('tabpanel',{name:'Conversation'})).toContainText('650 ms');
+  await expect(page.getByRole('tabpanel',{name:'Conversation'})).toContainText('Not available');
 });
 
-test('a future ready delivery can explicitly open a PC rehearsal without a prepared session', async ({ page }) => {
-  const requests = await mockApi(page, { sessions: false });
-  await page.route('**/api/orders', route => route.fulfill({ json: [{ ...order, status: 'OUT_FOR_DELIVERY', window_start: '2026-11-03T10:00:00+05:30', window_end: '2026-11-03T12:00:00+05:30' }] }));
-  await page.route('**/api/dialer/status', route => route.fulfill({ json: { running: true, transport: 'browser', orders: [{ order_id: order.id, skip_reason: 'WINDOW_NOT_DUE' }] } }));
+test('future out-for-delivery orders require an authorized prepare action', async ({ page }) => {
+  const requests = await mockApi(page,{sessions:false});
+  await page.route('**/api/orders?**', route => route.fulfill({json:[{...order,status:'OUT_FOR_DELIVERY'}]}));
   await page.goto(`/dashboard?order_id=${order.id}`);
-  const launch = page.getByRole('link', { name: 'Start PC demo now' });
-  await expect(launch).toHaveAttribute('href', `/voice?order_id=${order.id}&pc_demo=1`);
-  await expect(launch).toHaveAttribute('target', '_blank');
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('automatic dispatch still follows the delivery window');
-  expect(requests.some(request => request.method === 'POST')).toBe(false);
+  const prepare = page.getByRole('button',{name:'Prepare customer conversation'});
+  await expect(prepare).toBeDisabled();
+  await unlock(page);
+  await expect(prepare).toBeEnabled();
+  expect(requests.some(request=>request.method==='POST')).toBe(false);
+  await prepare.click();
+  await expect.poll(()=>requests.filter(request=>request.path.endsWith('/call')).length).toBe(1);
 });
 
-test('choosing a pending order stays on that delivery across refresh without starting a call', async ({ page }) => {
+test('pending order selection survives refresh without starting a call', async ({ page }) => {
   const requests = await mockApi(page);
-  const pendingId = order.id + 1;
-  await page.route('**/api/orders', route => route.fulfill({ json: [order, { ...order, id: pendingId, status: 'PENDING' }] }));
-  let selectedReads = 0;
-  await page.route('**/api/sessions?**', route => {
-    const requested = new URL(route.request().url()).searchParams.get('order_id');
-    if (requested === String(pendingId)) selectedReads++;
-    return route.fulfill({ json: requested === String(pendingId) ? [] : [session] });
-  });
-  await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'The conversation', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: new RegExp(`#${pendingId}.*Pending`) }).click();
-  await expect(page.getByRole('link', { name: 'Start PC demo now' })).toHaveAttribute('href', `/voice?order_id=${pendingId}&pc_demo=1`);
-  await page.getByRole('button', { name: /Updated/ }).click();
-  await expect.poll(() => selectedReads).toBeGreaterThanOrEqual(2);
-  await expect(page.getByRole('heading', { name: 'Delivery ready for review' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText(`order #${pendingId}`);
-  expect(requests.some(request => request.method === 'POST')).toBe(false);
+  const pendingId=order.id+1;
+  await page.route('**/api/orders?**',route=>route.fulfill({json:[order,{...order,id:pendingId,status:'PENDING'}]}));
+  await page.goto(`/dashboard?order_id=${order.id}`);
+  await page.getByRole('button',{name:`Order #${pendingId}`,exact:true}).click();
+  await page.getByRole('button',{name:/Updated/}).click();
+  await expect(page.getByRole('heading',{name:'Awaiting dispatch.'})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Mark out for delivery'})).toBeDisabled();
+  expect(requests.some(request=>request.method==='POST')).toBe(false);
 });

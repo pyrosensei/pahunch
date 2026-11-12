@@ -15,6 +15,7 @@ from app.gnani import (
     Transcript,
 )
 from app.main import create_app
+from app.operator import require_operator_key
 from app.seed import seed_database
 from app.speech_text import spoken_text
 
@@ -83,6 +84,7 @@ def voice_client(
         speech_client=speech,
         max_audio_bytes=max_audio_bytes,
     )
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = override_session
     with TestClient(app) as client:
         yield client

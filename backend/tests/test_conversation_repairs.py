@@ -84,6 +84,7 @@ def test_neighbour_with_otp_requires_courier_verification_and_confirmation(db, s
     proposal = valid_proposal()
     proposal["primary"]["action"] = "LEAVE_WITH_NEIGHBOR"
     proposal["primary"]["named_recipient"] = name
+    proposal["primary"]["recipient_address"] = "404"
     llm = scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)])
     planner = PlannerService(db, llm)
     call = start_call(planner.calls)

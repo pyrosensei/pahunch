@@ -106,6 +106,7 @@ def test_otp_order_allows_named_neighbour_only_with_courier_arrival_call(positio
     neighbour = step(
         PlanAction.LEAVE_WITH_NEIGHBOR,
         named_recipient="Sharma ji",
+        recipient_address="Flat 403",
         call_on_arrival=True,
     )
     plan = proposal(neighbour) if position == "primary" else proposal(step(PlanAction.HAND_TO_CUSTOMER), neighbour)
@@ -123,7 +124,7 @@ def test_cod_order_rejects_neighbour_handoff():
         safe_drop_allowed=True,
         neighbour_drop_allowed=True,
     )
-    plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR, named_recipient="Sharma"))
+    plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR, named_recipient="Sharma", recipient_address="Flat 403"))
     verdict = validate_plan(plan, order, [make_slot()])
     assert ViolationCode.COD_REQUIRES_DIRECT_HANDOFF in codes(verdict)
 
@@ -147,9 +148,9 @@ def test_neighbour_drop_requires_permission_and_named_recipient():
     order = make_order(safe_drop_allowed=True, neighbour_drop_allowed=True)
     plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR))
     verdict = validate_plan(plan, order, [make_slot()])
-    assert codes(verdict) == {ViolationCode.NAMED_RECIPIENT_REQUIRED}
+    assert codes(verdict) == {ViolationCode.NAMED_RECIPIENT_REQUIRED, ViolationCode.RECIPIENT_LOCATION_REQUIRED}
 
-    valid_plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR, named_recipient="Sharma"))
+    valid_plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR, named_recipient="Sharma", recipient_address="Flat 403"))
     assert validate_plan(valid_plan, order, [make_slot()]).valid
 
 
@@ -202,3 +203,17 @@ def test_escalation_cannot_be_committed_as_a_delivery_plan():
     assert not verdict.valid
     assert codes(verdict) == {ViolationCode.ESCALATION_REQUIRED}
     assert verdict.allowed_alternatives == [PlanAction.ESCALATE_TO_HUMAN]
+
+
+@pytest.mark.parametrize('location',['nearby','next door','बगल में','bagal mein','पास में'])
+def test_vague_proximity_is_not_a_courier_location(location):
+    order = make_order(safe_drop_allowed=True, neighbour_drop_allowed=True)
+    plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR, named_recipient='Aviral',recipient_address=location))
+    assert ViolationCode.RECIPIENT_LOCATION_REQUIRED in codes(validate_plan(plan,order,[make_slot()]))
+
+
+@pytest.mark.parametrize('location',['Flat 403','Opposite the customer entrance, the house with the blue gate'])
+def test_specific_house_or_finding_instructions_are_accepted(location):
+    order = make_order(safe_drop_allowed=True, neighbour_drop_allowed=True)
+    plan = proposal(step(PlanAction.LEAVE_WITH_NEIGHBOR,named_recipient='Aviral',recipient_address=location))
+    assert validate_plan(plan,order,[make_slot()]).valid

@@ -95,6 +95,11 @@ _DELIVERY_COMMITMENT = re.compile(
     r"(?:दूँगा|दूंगा|देंगे|जाएगा|जायेगा|दिया जाएगा|दिया जायेगा|सकते हैं|सकती हैं)",
     re.IGNORECASE,
 )
+_HANDOFF_PERMISSION = re.compile(
+    r"\b(?:parcel|package|delivery)\b[^.?!।]{0,45}\b(?:de|bhej|deliver|handover)\s+sakt[aei]\b|"
+    r"(?:पार्सल|डिलीवरी)[^.?!।]{0,45}(?:दे|भेज|सौंप)\s*सकत[ाीे]",
+    re.IGNORECASE,
+)
 
 
 def response_language(text: str) -> str:
@@ -663,6 +668,8 @@ def wording_error(message: str, language: str, *, proposal: bool = False, respon
     checked = guarded
     if clarification:
         checked = re.sub(r"\{(?:order_window|recipient|recipient_address)\}", "", checked)
+        if _HANDOFF_PERMISSION.search(checked):
+            return "UNVALIDATED_HANDOFF_PERMISSION"
     if not proposal:
         facts = KnownFacts(
             order_ids=set(known_facts.order_ids) if known_facts else set(),

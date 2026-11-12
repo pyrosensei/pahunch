@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 from app.calls import utc_now
 from app.language import has_otp_disclosure, recipient_label
 from app.models import AuditEvent, CallSession, Order, PlanProposalRecord, Speaker, Turn
-from app.policy import IST, _utc
+from app.policy import IST, _allowed_alternatives, _utc, usable_recipient_location
 from app.schemas import (
     CustomerEvidence,
     PlanAction,
@@ -18,21 +18,43 @@ from app.schemas import (
 )
 
 
+class EvidenceError(ValueError):
+    def __init__(self, field: str, reason: str, reference_kind: str, current_match: bool):
+        prefix = {
+            "time_source": "TIME_SOURCE",
+            "recipient_source": "RECIPIENT_SOURCE",
+            "recipient_address_source": "RECIPIENT_ADDRESS_SOURCE",
+        }[field]
+        super().__init__(f"{prefix}_{reason}")
+        self.field = field
+        self.reference_kind = reference_kind
+        self.current_match = current_match
+
+
 def evidence_text(
-    db: Session, session_id: str, current_text: str, evidence: CustomerEvidence
+    db: Session, session_id: str, current_text: str, evidence: CustomerEvidence,
+    *, field: str = "recipient_source",
 ) -> str:
     source = current_text
+    reference_kind = "current"
+    current_match = evidence.quote in current_text
     # A verbatim quote in the current utterance is sufficient evidence even
     # when the model guessed a stale turn id. Bind it to the current turn.
-    if evidence.quote in current_text:
+    if current_match:
         evidence.turn_id = None
     elif evidence.turn_id is not None:
         turn = db.get(Turn, evidence.turn_id)
-        if turn is None or turn.session_id != session_id or turn.speaker != Speaker.CUSTOMER:
-            raise ValueError("RECIPIENT_SOURCE_NOT_CUSTOMER")
+        if turn is None:
+            reference_kind = "missing"
+        elif turn.session_id != session_id:
+            reference_kind = "foreign_session"
+        else:
+            reference_kind = turn.speaker.value.lower()
+        if reference_kind != "customer":
+            raise EvidenceError(field, "NOT_CUSTOMER", reference_kind, current_match)
         source = turn.text
     if evidence.quote not in source or has_otp_disclosure(evidence.quote):
-        raise ValueError("RECIPIENT_SOURCE_MISMATCH")
+        raise EvidenceError(field, "MISMATCH", reference_kind, current_match)
     return evidence.quote
 
 
@@ -63,10 +85,22 @@ def merge_details(db, session_id, text, old, new):
     result = old.model_copy(deep=True)
     call = db.get(CallSession, session_id)
     order = db.get(Order, call.order_id)
+    recipient_changed = (
+        new.recipient_source is not None
+        and old.recipient_source is not None
+        and new.recipient_source.quote.casefold() != old.recipient_source.quote.casefold()
+    )
+    if recipient_changed:
+        result.recipient_address_source = None
     for field in ("time_source", "recipient_source", "recipient_address_source"):
         evidence = getattr(new, field)
         if evidence is not None:
-            evidence_text(db, session_id, text, evidence)
+            if field == "recipient_address_source" and recipient_changed and evidence.quote not in text:
+                continue
+            evidence_text(db, session_id, text, evidence, field=field)
+            if field == "recipient_address_source" and not usable_recipient_location(evidence.quote):
+                result.recipient_address_source = None
+                continue
             setattr(result, field, evidence)
     if new.window_start is not None:
         if new.time_source is None and _utc(new.window_start) != _utc(order.window_start):
@@ -103,6 +137,9 @@ def ground_recipient(db, session_id, text, step, details):
         ("recipient_address", "recipient_address_source"),
     ):
         evidence = getattr(step, source_field) or getattr(details, source_field)
+        known = getattr(details, source_field)
+        if evidence is not None and known is not None and evidence.quote == known.quote and evidence.quote not in text:
+            evidence = known
         if (
             getattr(step, source_field) is None
             and evidence is not None
@@ -110,11 +147,11 @@ def ground_recipient(db, session_id, text, step, details):
             and getattr(step, field)
             and getattr(step, field).casefold() != evidence.quote.casefold()
         ):
-            raise ValueError("RECIPIENT_SOURCE_REQUIRED")
+            raise EvidenceError(source_field, "REQUIRED", "missing", False)
         if evidence is not None:
-            value = evidence_text(db, session_id, text, evidence)
+            value = evidence_text(db, session_id, text, evidence, field=source_field)
             if len(value) > 80:
-                raise ValueError("RECIPIENT_SOURCE_TOO_LONG")
+                raise EvidenceError(source_field, "TOO_LONG", "customer", value in text)
             setattr(step, field, recipient_label(field, value))
             setattr(step, source_field, evidence)
         elif getattr(step, field):
@@ -127,27 +164,49 @@ def ground_recipient(db, session_id, text, step, details):
             if not any(
                 getattr(step, field).casefold() in source.casefold() for source in [text, *sources]
             ):
-                raise ValueError("RECIPIENT_SOURCE_REQUIRED")
+                raise EvidenceError(source_field, "REQUIRED", "missing", False)
 
 
 def normalize_clarification(decision, details, order, slots):
     if decision.action != PlannerAction.ASK_CLARIFICATION or decision.request_details is None:
         return
     supplied = decision.request_details
-    # Policy needs a named recipient, never a house number, so an address can
-    # never be the fact a clarification waits on.
-    decision.missing_fields = [
-        field for field in decision.missing_fields if field != "recipient_address"
-    ]
+    if details.action == "LEAVE_WITH_NEIGHBOR":
+        if PlanAction.LEAVE_WITH_NEIGHBOR not in _allowed_alternatives(order):
+            decision.proposal = PlanProposal(primary=PlanStep(
+                action=PlanAction.LEAVE_WITH_NEIGHBOR,
+                window_start=details.window_start or order.window_start,
+                window_end=details.window_end or order.window_end,
+                call_on_arrival=details.call_on_arrival,
+                recipient_source=details.recipient_source,
+                recipient_address_source=details.recipient_address_source,
+            ))
+            decision.action = PlannerAction.PROPOSE_PLAN
+            decision.message = "{plan_summary} {confirmation_question}"
+            decision.missing_fields = []
+            decision.awaiting_continuation = False
+            return
+        missing = (
+            "recipient" if details.recipient_source is None else
+            "recipient_address" if details.recipient_address_source is None else None
+        )
+        if missing:
+            decision.missing_fields = [missing]
+            decision.awaiting_continuation = False
+            return
+        decision.missing_fields = [
+            field for field in decision.missing_fields if field not in {"recipient", "recipient_address"}
+        ]
     completing_time = supplied.window_start is not None or "end_time" in decision.missing_fields
     completing_recipient = (
-        supplied.recipient_source is not None and details.action == "LEAVE_WITH_NEIGHBOR"
+        (supplied.recipient_source is not None or supplied.recipient_address_source is not None)
+        and details.action == "LEAVE_WITH_NEIGHBOR"
     )
     if not (completing_time or completing_recipient):
         return
     if "continuation" in decision.missing_fields and "end_time" not in decision.missing_fields:
         return
-    if details.window_start is None or details.time_source is None:
+    if details.window_start is None:
         if not completing_recipient or {"time", "end_time"}.intersection(decision.missing_fields):
             return
         # A named handoff with no new time keeps the order's scheduled window.
@@ -236,9 +295,9 @@ def clarification_fallback(fields, language):
             "Parcel kise dena hai? Unka naam bataiye.",
         ),
         "recipient_address": (
-            "What is your neighbour's house number?",
-            "आपके पड़ोसी का हाउस नंबर क्या है?",
-            "Aapke padosi ka house number kya hai?",
+            "Where should the courier find your neighbour? Please give their house or flat number, or clear directions.",
+            "कूरियर आपके पड़ोसी को कहाँ मिलेगा? उनका मकान या फ्लैट नंबर, या स्पष्ट रास्ता बताइए।",
+            "Courier aapke padosi ko kahan milega? Unka house ya flat number, ya saaf directions bataiye.",
         ),
         "time": (
             "Which delivery time works for you?",

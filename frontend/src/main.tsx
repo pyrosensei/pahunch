@@ -10,5 +10,6 @@ import '@fontsource/manrope/latin-800.css';
 import './styles.css';
 import './workspace.css';
 import './friendly.css';
+import './demo-experiences.css';
 import App from './App';
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><BrowserRouter><MotionConfig reducedMotion="user"><App/></MotionConfig></BrowserRouter></React.StrictMode>);

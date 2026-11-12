@@ -2,6 +2,7 @@
 
 import json
 import secrets
+from datetime import UTC
 from typing import Annotated
 from uuid import uuid4
 
@@ -17,9 +18,11 @@ from app.language import redact_customer_text, redact_payload
 from app.models import (
     AuditEvent,
     CallRuntime,
+    CallSession,
     CallState,
     DeliveryCommit,
     DeliverySlot,
+    Order,
     PlanProposalRecord,
     PolicyDecisionRecord,
     Speaker,
@@ -43,6 +46,32 @@ def require_operator_key(
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_operator_key)])
 SessionDep = Annotated[Session, Depends(get_session)]
+
+
+@router.get("/operator/access")
+def access():
+    return {"authorized": True}
+
+
+@router.get("/orders/{order_id}/courier-instructions")
+def courier_instructions(order_id: int, db: SessionDep):
+    order = db.get(Order, order_id)
+    if order is None:
+        raise DomainError(404, "Order not found")
+    commit = db.exec(
+        select(DeliveryCommit).join(CallSession, DeliveryCommit.session_id == CallSession.id)
+        .where(CallSession.order_id == order_id)
+        .order_by(DeliveryCommit.committed_at.desc(), DeliveryCommit.id.desc())
+    ).first()
+    if commit is None:
+        return None
+    return {
+        "order_id": order_id, "session_id": commit.session_id,
+        "commit_id": commit.id, "committed_at": commit.committed_at.replace(tzinfo=UTC) if commit.committed_at.tzinfo is None else commit.committed_at,
+        "original_delivery_address": order.delivery_address_summary,
+        "contact": None,
+        "courier_card": redact_payload(json.loads(commit.courier_card_json)),
+    }
 
 
 class OperatorChange(BaseModel):
@@ -94,6 +123,7 @@ def _retain_verified_source(step: PlanStep | None, original: PlanStep | None) ->
         preserved = (
             source is not None
             and getattr(original, field) == getattr(step, field)
+            and (field != "recipient_address" or original.named_recipient == step.named_recipient)
         )
         data[source_field] = source.model_dump() if preserved else None
     return PlanStep.model_validate(data)

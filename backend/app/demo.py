@@ -27,6 +27,7 @@ from app.models import (
     Turn,
     TwilioBinding,
 )
+from app.operator import require_operator_key
 from app.policy import IST
 from app.state_machine import TERMINAL_STATES
 
@@ -108,7 +109,7 @@ def checkout(request: DemoOrderRequest, http_request: Request, db: SessionDep):
         return order
 
 
-@router.post("/orders/{order_id}/out-for-delivery", response_model=Order)
+@router.post("/orders/{order_id}/out-for-delivery", response_model=Order, dependencies=[Depends(require_operator_key)])
 def mark_ready(order_id: int, request: Request, db: SessionDep):
     with ADMISSION_LOCK:
         db.expire_all()

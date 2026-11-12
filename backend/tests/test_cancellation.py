@@ -24,10 +24,12 @@ class NoModel:
 
 
 def pending_call(db):
+    # Exercise cancellation of a pre-existing session after an order status update.
+    call = start_call(CallService(db))
     order = db.get(Order, 1042)
     order.status = OrderStatus.PENDING
     db.commit()
-    return start_call(CallService(db))
+    return call
 
 
 @pytest.mark.parametrize("text,language", [("Please cancel my order", "en-IN"), ("कोई नहीं मेरा ऑर्डर कैंसल कर दीजिए", "hi-IN"), ("कोई नहीं, मेरा order cancel कर दीजिए।", "hi-IN")])

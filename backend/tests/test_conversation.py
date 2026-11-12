@@ -476,7 +476,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
     proposal = valid_proposal()
     proposal["primary"].update(
         action="LEAVE_WITH_NEIGHBOR",
-        named_recipient="Sharma ji",
+        named_recipient="Sharma ji", recipient_address="403",
         window_start="2026-11-05T14:00:00+05:30",
         window_end="2026-11-05T16:00:00+05:30",
     )
@@ -487,7 +487,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
         ),
     )
     call = start_call(planner.calls, 1046)
-    result = run(planner, call.id, "Sharma ji ko parcel de dena")
+    result = run(planner, call.id, "Sharma ji ko 403 mein parcel de dena")
     assert result.turn.verdict.valid
     assert result.planner.wording_source == "model"
     assert "Sharma ji" in result.agent_message

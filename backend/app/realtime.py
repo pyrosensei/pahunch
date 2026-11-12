@@ -365,10 +365,10 @@ class _StreamingInput:
         self.byte_limit = sample_rate * 2
         self.audit = audit
         self.connected = False
-        self.closing = False
         self.capture: _Capture | None = None
         self.barrier: asyncio.Task | None = None
-        self.connection = asyncio.create_task(self._connect()) if stream is not None else None
+        # Opening a recognition stream occupies the provider key. Connect only
+        # when a capture begins so the greeting can use that key for speech.
 
     async def _connect(self):
         try:
@@ -398,9 +398,6 @@ class _StreamingInput:
         try:
             if previous is not None:
                 await asyncio.shield(previous)
-            if self.connection is not None:
-                await asyncio.shield(self.connection)
-                self.connection = None
             if not self.connected and not await self._connect():
                 capture.fallback_reason = "CONNECT_FAILED"
                 return None
@@ -463,28 +460,20 @@ class _StreamingInput:
                 raise
             result = None
         if capture.fallback_reason and not capture.discarded:
-            await self._discard(reconnect=capture.fallback_reason != "CONNECT_FAILED")
+            await self._discard()
             capture.discarded = True
         return result
 
-    async def _discard(self, *, reconnect=True):
-        connection, self.connection = self.connection, None
-        if connection is not None:
-            connection.cancel()
-            await asyncio.gather(connection, return_exceptions=True)
-        try:
-            await asyncio.wait_for(self.stream.cancel_utterance(), _STT_IO_TIMEOUT)
-        except (StreamingSTTError, TimeoutError, OSError, RuntimeError) as error:
-            self.audit(
-                "STREAMING_STT_FAILED",
-                {
-                    "phase": "cancel",
-                    "error_type": type(error).__name__,
-                },
-            )
+    async def _discard(self):
+        for phase, operation in (("cancel", self.stream.cancel_utterance), ("close", self.stream.close)):
+            try:
+                await asyncio.wait_for(operation(), _STT_IO_TIMEOUT)
+            except (StreamingSTTError, TimeoutError, OSError, RuntimeError) as error:
+                self.audit(
+                    "STREAMING_STT_FAILED",
+                    {"phase": phase, "error_type": type(error).__name__},
+                )
         self.connected = False
-        if reconnect and not self.closing:
-            self.connection = asyncio.create_task(self._connect())
 
     def abort(self):
         capture, self.capture = self.capture, None
@@ -502,17 +491,13 @@ class _StreamingInput:
                 await previous
             if needs_discard:
                 await asyncio.gather(capture.task, return_exceptions=True)
-                await self._discard(reconnect=capture.fallback_reason != "CONNECT_FAILED")
+                await self._discard()
                 capture.discarded = True
 
         self.barrier = asyncio.create_task(cleanup())
 
     async def close(self):
-        self.closing = True
         self.abort()
-        if self.connection is not None:
-            self.connection.cancel()
-            await asyncio.gather(self.connection, return_exceptions=True)
         await self.barrier
         if self.stream is not None:
             try:

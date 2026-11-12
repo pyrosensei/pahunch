@@ -131,3 +131,25 @@ def test_socket_records_proactive_opening_and_first_yes_only_proposes():
 def test_acknowledgement_does_not_claim_unspecified_checking(language):
     assert "check" not in phrase("ack", language).lower()
     assert "जाँच" not in phrase("ack", language)
+
+
+def test_opening_revalidates_a_historical_neighbour_plan_against_current_policy(db):
+    from app.models import PlanProposalRecord, PolicyDecisionRecord
+    from app.schemas import CustomerTurnRequest, PlanProposal
+    call = start_call(CallService(db),1046)
+    calls = CallService(db)
+    order = calls._order(1046)
+    old = PlanProposal.model_validate({'primary':{'action':'LEAVE_WITH_NEIGHBOR','named_recipient':'Aviral',
+        'window_start':order.window_start,'window_end':order.window_end}})
+    calls.submit_turn(call.id,CustomerTurnRequest(text='Aviral',proposal=old))
+    # Simulate an older policy decision retained in a saved database.
+    verdict = db.exec(select(PolicyDecisionRecord).where(PolicyDecisionRecord.proposal_id==call.current_proposal_id)).one()
+    verdict.valid=True
+    db.add(verdict)
+    db.commit()
+    assert db.get(PlanProposalRecord,call.current_proposal_id) is not None
+    message,meta=outbound_opening(db,call.id,'en-IN')
+    assert meta.action.value=='RESPOND'
+    assert 'Aviral' not in message
+    with pytest.raises(DomainError):
+        calls.submit_turn(call.id,CustomerTurnRequest(text='Yes',confirmation=True))

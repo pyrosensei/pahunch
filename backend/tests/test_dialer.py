@@ -8,6 +8,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.calls import CallService
 from app.errors import DomainError
 from app.models import CallOutcome, CallSession, CallState, Order
+from app.operator import require_operator_key
 from app.policy import _utc
 from app.seed import seed_database
 
@@ -303,6 +304,7 @@ def test_lifespan_starts_browser_attempt_without_operator_request(engine, dialer
         with Session(engine) as db:
             yield db
 
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = sessions
     with TestClient(app) as client:
         with Session(engine) as db:
@@ -489,6 +491,7 @@ def test_http_start_and_sweep_use_same_admission(engine, dialer, clock, monkeypa
         with Session(engine) as db:
             yield db
 
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = sessions
     barrier = Barrier(2)
 

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { ArrowRight, ArrowUpRight, Check, CheckCircle2, ChevronRight, Headphones, MapPin, Package, ShieldCheck, Truck } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { ArrowRight, Check, Package, ShieldCheck, Truck } from 'lucide-react';
 import { api, dateTime, label, terminal } from '../api';
 import type { Order, Call } from '../api';
-import './Shop.css';
+import { CustomerConversation } from '../components/CustomerConversation';
 
 type Product = { id: string; name: string; category: string; description: string; price_inr: number; art: string; direct_handoff_required: boolean };
 const money = (value: number) => `₹${value.toLocaleString('en-IN')}`;
@@ -16,43 +16,93 @@ function ProductArt({ kind }: { kind: string }) {
     : <><path d="M60 40h129c5 0 8 4 7 9l-16 99H46z" fill="currentColor"/><path d="M66 47h122l-15 93H53z" fill="#d3e4df"/><path d="m54 136 49-58 30 40 16-24 29 44" fill="#a3c2b3"/><path d="m103 78 23 31-18-9-12 8z" fill="#f8faf4"/><path d="M46 148h134l31 24c2 5-4 9-9 9H29c-5 0-9-4-5-9z" fill="#9baaa3"/><path d="M55 154h117l19 14H37z" fill="#41564e"/><path d="M67 157h91m-99 4h107m-113 4h120" stroke="#aebcb4" strokeWidth="1"/><path d="M92 171h49l6 6H87z" fill="#c7d0ca"/></>}
   </svg>;
 }
+
 export default function Shop() {
+  const [params, setParams] = useSearchParams();
+  const requested = params.get('order_id');
   const [products, setProducts] = useState<Product[]>([]);
   const [productId, setProductId] = useState('');
   const [payment, setPayment] = useState('COD');
   const [order, setOrder] = useState<Order | null>(null);
-  const [sessionLookupReady, setSessionLookupReady] = useState(false);
   const [call, setCall] = useState<Call | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [readyStatus, setReadyStatus] = useState('');
+  const [trackingError, setTrackingError] = useState('');
   const [reload, setReload] = useState(0);
   const product = products.find(item => item.id === productId);
-  useEffect(() => { const abort = new AbortController(); setLoading(true); setError('');
-    void api<Product[]>('/api/catalog', { signal: abort.signal }).then(items => { if (!abort.signal.aborted) { setProducts(items); setProductId(current => items.some(item => item.id === current) ? current : items[0]?.id || ''); } }).catch(e => { if (!abort.signal.aborted) setError((e as Error).message); }).finally(() => { if (!abort.signal.aborted) setLoading(false); });
+  useEffect(() => {
+    const abort = new AbortController(); setLoading(true); setError('');
+    void api<Product[]>('/api/catalog', { signal: abort.signal }).then(items => {
+      setProducts(items); setProductId(current => current || items[0]?.id || '');
+    }).catch(failure => { if (!abort.signal.aborted) setError((failure as Error).message); })
+      .finally(() => { if (!abort.signal.aborted) setLoading(false); });
     return () => abort.abort();
   }, [reload]);
-  useEffect(() => { if (!order || order.status === 'PENDING') return; setSessionLookupReady(false); let stopped = false; let timer: ReturnType<typeof setTimeout>; const controller = new AbortController();
-    const poll = async () => { try { const calls = await api<Call[]>(`/api/sessions?order_id=${order.id}&active=true&limit=1`, { signal: controller.signal }); if (stopped) return; setCall(calls[0] || null); setSessionLookupReady(true); setReadyStatus(calls[0]?.transport === 'twilio' ? 'A phone conversation is active. Open the monitor to follow this order.' : calls.length ? 'The delivery assistant is ready. Open the monitor to follow this order.' : 'Delivery is scheduled for a later window. Start a PC demo now, or follow this order in the monitor.'); } catch { if (!stopped) { setSessionLookupReady(false); setCall(null); setReadyStatus('Connection interrupted. Open the monitor to check this order.'); } } finally { if (!stopped) timer = setTimeout(poll, 2000); } }; void poll();
-    return () => { stopped = true; controller.abort(); clearTimeout(timer); };
-  }, [order]);
-  async function checkout() { if (busy || !product) return; setBusy(true); setError(''); try { setOrder(await api<Order>('/api/orders', { method: 'POST', body: JSON.stringify({ payment_mode: payment, product_id: product.id }) })); setCall(null); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }
-  async function ready() { if (!order || busy) return; setBusy(true); setError(''); try { setOrder(await api<Order>(`/api/orders/${order.id}/out-for-delivery`, { method: 'POST' })); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }
-  const canStartPcDemo = order && (order.status === 'PENDING' || (sessionLookupReady && (!call || (call.transport === 'browser' && !terminal.has(call.state)))));
-  return <main id="main" className="shop-page page catalog-shop"><div className="shop-banner"><span><span aria-hidden="true">✳</span> Selected for everyday life.</span><span>Fictional storefront · No real payment collected</span></div>
-    <div className="page-intro"><div><span className="eyebrow orange-text">SWIFTCART / THE DELIVERY EDIT</span><h1>{order ? 'One step closer.' : 'Something for your day.'}</h1><p>{order ? 'Your order is placed. Let’s arrange a delivery that works for you.' : 'Four useful things. One delivery conversation, built around you.'}</p></div><div className="shop-stamp"><Truck size={21}/><span>Delivery coordination<br/><strong>by Pahunch.</strong></span></div></div>
-    <ol className="shopping-progress" aria-label="Demo delivery steps">{['Choose your item', 'Prepare delivery', 'Follow the conversation'].map((step, index) => { const current = !order ? 0 : order.status === 'PENDING' ? 1 : 2; return <li key={step} className={index === current ? 'current' : index < current ? 'complete' : ''} aria-current={index === current ? 'step' : undefined}><span>{index < current ? <Check size={16}/> : index + 1}</span>{step}</li>; })}</ol>
-    {error && <div role="alert" className="notice error">{error}{!products.length && <button className="text-link" onClick={() => setReload(value => value + 1)}>Retry catalog</button>}</div>}
-    {!order ? <div className="checkout-layout"><section aria-label="Choose a product"><div className="section-label"><h2>The collection</h2><span>01 / CHOOSE YOUR PRODUCT</span></div>
-      {loading ? <p role="status" className="catalog-loading">Opening the collection…</p> : <div className="product-grid">{products.map(item => <button key={item.id} className={`product-card ${productId === item.id ? 'selected' : ''}`} aria-label={`Choose ${item.name}`} aria-pressed={productId === item.id} onClick={() => setProductId(item.id)}><div className={`product-art catalog-art-${item.art}`}><span className="product-tag">{item.category}</span><ProductArt kind={item.art}/><span className="product-select">{productId === item.id && <Check size={15}/>}</span><span className="product-art-caption">SWIFTCART COLLECTION / {item.id.toUpperCase()}</span></div><div className="product-info"><h3>{item.name}</h3><p>{item.description}</p><strong>{money(item.price_inr)}<span>Demo price</span></strong></div></button>)}</div>}
-      <div className="shop-reassurance"><ShieldCheck size={21}/><div><strong>The delivery rules are decided for you.</strong><p>Payment determines OTP verification. Valuable items still require a direct handoff, regardless of payment.</p></div></div></section>
-      <aside className="checkout-panel"><span className="eyebrow">02 / YOUR ORDER</span><h2>A few details.</h2>{product && <div className="checkout-product"><ProductArt kind={product.art}/><div><strong>{product.name}</strong><span>{money(product.price_inr)}</span></div></div>}
+  useEffect(() => {
+    if (!requested || !/^\d+$/.test(requested)) { setOrder(null); setCall(null); return; }
+    const abort = new AbortController();
+    setOrder(null); setCall(null);
+    void api<Order>(`/api/orders/${requested}`, { signal: abort.signal }).then(setOrder)
+      .catch(failure => { if (!abort.signal.aborted) setError((failure as Error).message); });
+    return () => abort.abort();
+  }, [requested]);
+  useEffect(() => {
+    if (!order) return;
+    const id = order.id;
+    const abort = new AbortController(); let timer: ReturnType<typeof setTimeout>;
+    async function refresh() {
+      try {
+        const [nextOrder, sessions] = await Promise.all([
+          api<Order>(`/api/orders/${id}`, { signal: abort.signal }),
+          api<Call[]>(`/api/sessions?order_id=${id}&limit=1`, { signal: abort.signal }),
+        ]);
+        if (abort.signal.aborted) return;
+        setOrder(nextOrder); setCall(sessions[0] || null); setTrackingError('');
+      } catch {
+        if (!abort.signal.aborted) setTrackingError('Tracking could not refresh. Displayed delivery details may be out of date.');
+      } finally { if (!abort.signal.aborted) timer = setTimeout(refresh, 2000); }
+    }
+    void refresh();
+    return () => { abort.abort(); clearTimeout(timer); };
+  }, [order?.id]);
+  async function checkout() {
+    if (busy || !product) return;
+    setBusy(true); setError('');
+    try {
+      const created = await api<Order>('/api/orders', { method: 'POST', body: JSON.stringify({ payment_mode: payment, product_id: product.id }) });
+      setParams({ order_id: String(created.id) });
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(false); }
+  }
+  const prepared = call?.transport === 'browser' && !terminal.has(call.state) && order?.status === 'OUT_FOR_DELIVERY';
+  return <main id="main" className="shop-page page catalog-shop">
+    {error && <div role="alert" className="notice error">{error}<button className="text-link" onClick={() => setReload(value => value + 1)}>Retry</button></div>}
+    {!order && requested ? <section className="shop-loading"><h1>Your order</h1><p role="status">{error ? 'Order details are unavailable.' : 'Loading your delivery…'}</p></section> : order ? <>
+      <div className="shop-order-title"><span className="eyebrow">YOUR SWIFTCART ORDER #{order.id}</span><h1>{call?.courier_card ? 'A delivery that works for you.' : 'Your parcel, on its way.'}</h1><p>Follow your delivery and speak with your delivery assistant here.</p></div>
+      <div className="customer-order-layout">
+        <section className="customer-order-summary" aria-label="Your order details"><Package size={31}/><h2>Order #{order.id}</h2><span className="order-status">{label(order.status)}</span>
+          <dl><dt>Delivery appointment</dt><dd>{dateTime(order.window_start)} – {dateTime(order.window_end)} IST</dd><dt>Delivery address</dt><dd>{order.delivery_address_summary}</dd><dt>Payment</dt><dd>{order.payment_mode === 'COD' ? 'Pay the courier on delivery' : 'Already paid'}</dd><dt>Verification at handoff</dt><dd>{order.requires_otp ? 'Share the OTP directly with the courier' : 'Standard handoff · no OTP'}</dd></dl>
+          <ol className="customer-order-progress"><li className="complete"><Check size={15}/>Order placed</li><li className={order.status !== 'PENDING' ? 'complete' : ''}><Truck size={15}/>Out for delivery</li><li className={call?.courier_card ? 'complete' : ''}><ShieldCheck size={15}/>Delivery instructions confirmed</li></ol>
+          <button className="text-link" onClick={() => { setParams({}); setOrder(null); setCall(null); setError(''); }}>Back to the collection</button>
+        </section>
+        <div className="customer-order-main">
+          {trackingError && <p className="notice error" role="status">{trackingError}</p>}
+          {call?.transport === 'browser' && (prepared || terminal.has(call.state)) ? <CustomerConversation key={call.id} sessionId={call.id} savedCard={call.courier_card} sessionState={call.state}/> : call?.courier_card ? <section className="customer-delivery-saved"><ShieldCheck size={35}/><h2>Your delivery instructions are saved.</h2><p>The courier has your confirmed arrangement.</p><ul>{call.courier_card.instructions?.map((instruction: string) => <li key={instruction}>{instruction}</li>)}</ul></section> : <section className="customer-awaiting"><div className="tracking-parcel"><Package size={65} strokeWidth={1}/></div><span className="eyebrow">{order.status === 'PENDING' ? 'ORDER RECEIVED' : 'DELIVERY UPDATE'}</span><h2>{order.status === 'PENDING' ? 'We’re getting your order ready.' : order.status === 'OUT_FOR_DELIVERY' ? 'Your delivery team is preparing the conversation.' : label(order.status)}</h2><p>{order.status === 'PENDING' ? 'Your delivery conversation becomes available when the delivery team dispatches your order.' : call && terminal.has(call.state) ? `The previous conversation ended with ${label(call.state).toLowerCase()}. The delivery team can review its recorded outcome.` : 'Your order status will update here. Keep this page open.'}</p></section>}
+        </div>
+      </div>
+    </> : <>
+      <div className="shop-hero"><div><span className="eyebrow">THE SWIFTCART EDIT</span><h1>Good things.<br/><em>Better arrivals.</em></h1><p>Everyday favourites, with a delivery conversation that fits your day.</p></div><div className="shop-hero-note"><Truck size={32} strokeWidth={1.3}/><strong>Your day has plans.<br/>Your delivery should too.</strong><span>Delivery coordination by Pahunch</span></div></div>
+      <div className="checkout-layout"><section aria-label="Choose a product"><div className="section-label"><h2>The collection</h2><span>SELECT YOUR ITEM</span></div>
+        {loading ? <p role="status">Opening the collection…</p> : <div className="product-grid">{products.map(item => <button key={item.id} className={`product-card ${productId === item.id ? 'selected' : ''}`} aria-label={`Choose ${item.name}`} aria-pressed={productId === item.id} onClick={() => setProductId(item.id)}><div className={`product-art catalog-art-${item.art}`}><span className="product-tag">{item.category}</span><ProductArt kind={item.art}/><span className="product-select">{productId === item.id && <Check size={16}/>}</span></div><div className="product-info"><h3>{item.name}</h3><p>{item.description}</p><strong>{money(item.price_inr)}</strong></div></button>)}</div>}
+      </section>
+      <aside className="checkout-panel"><span className="eyebrow">YOUR SELECTION</span><h2>Make it yours.</h2>{product && <div className="checkout-product"><ProductArt kind={product.art}/><div><strong>{product.name}</strong><span>{money(product.price_inr)}</span></div></div>}
         <form onSubmit={event => { event.preventDefault(); void checkout(); }}><fieldset><legend>Payment method</legend><div className="segmented"><button type="button" className={payment === 'COD' ? 'selected' : ''} aria-pressed={payment === 'COD'} onClick={() => setPayment('COD')}>Cash on delivery</button><button type="button" className={payment === 'PREPAID' ? 'selected' : ''} aria-pressed={payment === 'PREPAID'} onClick={() => setPayment('PREPAID')}>Prepaid</button></div></fieldset>
-        <div className="verification-rule" role="status"><ShieldCheck size={19}/><div><strong>{payment === 'PREPAID' ? 'OTP required at delivery' : 'No OTP required'}</strong><p>{payment === 'PREPAID' ? 'Your order is prepaid. Share the delivery OTP only with the courier when the parcel is handed over. Pahunch will never ask for the code.' : 'Pay the courier when your parcel arrives. Cash-on-delivery orders do not require a delivery OTP.'}</p></div><span>AUTO</span></div>
-        {product && product.direct_handoff_required && <p className="high-value-note">Extra care for this laptop: direct handoff to the customer is required. Leaving it with security or a neighbour is not allowed.</p>}
-        <div className="delivery-address"><MapPin size={18}/><div><strong>SwiftCart Test Block</strong><span>Demo Residence · Sample delivery address</span></div></div><p className="muted small-copy">Your first delivery appointment is tomorrow, 10 am to noon, Indian time. You can request another time between 8 am and 6 pm on an available delivery date. Start the PC conversation immediately to try it.</p>
-        <div className="checkout-total"><span>Order total</span><strong>{product ? money(product.price_inr) : '—'}</strong></div><button className="button orange full" disabled={busy || loading || !product}>{busy ? 'Placing your demo order…' : 'Place demo order'}<ArrowRight size={17}/></button><p className="checkout-note">Demo checkout. No payment or OTP is collected here.</p></form></aside></div>
-    : <div className="order-success-layout"><section className="panel order-success"><div className="success-icon"><CheckCircle2 size={31}/></div><span className="eyebrow">ORDER #{order.id}</span><h2>{product?.name || 'Your order'} is on the list.</h2><p>{order.status === 'PENDING' ? 'Mark this demo order out for delivery to start the coordination flow.' : 'Your delivery is ready. Open the monitor to start the conversation and follow the plan.'}</p><div className="order-facts"><div><small>ORDER STATUS</small><strong>{label(order.status)}</strong></div><div><small>PAYMENT</small><strong>{order.payment_mode === 'COD' ? 'Cash on delivery' : 'Prepaid'}</strong></div><div><small>DELIVERY VERIFICATION</small><strong>{order.requires_otp ? 'OTP required at handoff' : 'No delivery OTP required'}</strong></div><div><small>DELIVERY WINDOW · IST</small><strong>{dateTime(order.window_start)} – {dateTime(order.window_end)}</strong></div><div><small>DELIVERY ADDRESS</small><strong>{order.delivery_address_summary}</strong></div></div><div className="order-steps"><span className="done"><Check size={15}/>Order placed</span><ChevronRight size={16}/><span className={order.status !== 'PENDING' ? 'done' : ''}><Truck size={16}/>Out for delivery</span><ChevronRight size={16}/><span className={call ? 'done' : ''}><Headphones size={16}/>Assistant ready</span></div><div className="action-row">{order.status === 'PENDING' && <button className="button orange" onClick={() => void ready()} disabled={busy}>{busy ? 'Updating order…' : 'Mark out for delivery'}<ArrowRight size={17}/></button>}{canStartPcDemo && <Link className="text-link" target="_blank" rel="noopener noreferrer" to={`/voice?order_id=${order.id}${call ? `&session_id=${call.id}` : ''}&pc_demo=1`}>Start PC voice demo<Headphones size={17}/></Link>}<Link className={`button ${order.status === 'PENDING' ? 'secondary' : 'primary'}`} to={`/dashboard?order_id=${order.id}`}>Monitor delivery<ArrowUpRight size={17}/></Link></div><p className="muted" role="status">{readyStatus}</p></section><aside className="next-card"><Package size={45} strokeWidth={1}/><h3>First, a conversation.<br/>Then, a clear plan.</h3><p>The assistant explains your order and asks whether the scheduled delivery works. The monitor shows the actual conversation, decisions and confirmation.</p><span className="pill">PC voice demo · Separate operator monitor</span><button className="text-link" disabled={busy} onClick={() => { setOrder(null); setCall(null); setReadyStatus(''); }}>Create another demo order<ArrowRight size={15}/></button></aside></div>}
+          <div className="verification-rule" role="status"><ShieldCheck size={21}/><div><strong>{payment === 'PREPAID' ? 'OTP required at delivery' : 'No OTP required'}</strong><p>{payment === 'PREPAID' ? 'Share the delivery OTP only with the courier at handoff. The assistant never collects it.' : 'Pay the courier at handoff. Cash-on-delivery orders require direct handoff to you.'}</p></div></div>
+          {product?.direct_handoff_required && <p className="high-value-note">This laptop requires direct handoff to you. Neighbour and security drops are unavailable.</p>}
+          <p className="checkout-promise">Your first appointment is tomorrow, 10 am–noon IST. Available alternatives run from 10 am to 6 pm.</p><div className="checkout-total"><span>Total</span><strong>{product ? money(product.price_inr) : '—'}</strong></div><button className="button primary full" disabled={busy || loading || !product}>{busy ? 'Placing your order…' : 'Place demo order'}<ArrowRight size={17}/></button><p className="checkout-note">Fictional order. No payment is collected.</p>
+        </form>
+      </aside></div>
+    </>}
   </main>;
 }

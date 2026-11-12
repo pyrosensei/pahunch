@@ -16,6 +16,61 @@ from app.schemas import PlannerAction
 db = planner_database
 
 
+@pytest.mark.parametrize(("field", "missing", "prefix"), [
+    ("time_source", "time", "TIME_SOURCE"),
+    ("recipient_source", "recipient", "RECIPIENT_SOURCE"),
+    ("recipient_address_source", "recipient_address", "RECIPIENT_ADDRESS_SOURCE"),
+])
+def test_invalid_evidence_clarifies_the_actual_field(db, scripted_llm, field, missing, prefix):
+    daytime(db)
+    call = start_call(CallService(db))
+    agent = Turn(session_id=call.id, speaker=Speaker.AGENT, text="tomorrow", created_at=call.started_at)
+    db.add(agent)
+    db.commit()
+    item = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=valid_proposal())
+    item["request_details"] = {field: quote("tomorrow", agent.id)}
+    planner = PlannerService(db, scripted_llm([item]))
+    result = run(planner, call.id, "Please arrange another delivery day")
+    assert result.planner.missing_fields == [missing]
+    assert result.planner.fallback_reason == f"{prefix}_NOT_CUSTOMER"
+    assert planner.calls.get_call(call.id).current_proposal_id is None
+    event = db.exec(select(AuditEvent).where(
+        AuditEvent.session_id == call.id, AuditEvent.event_type == "GROUNDING_REJECTED",
+    )).one()
+    payload = json.loads(event.payload_json)
+    assert payload["field"] == field and payload["reference_kind"] == "agent"
+    assert payload["quote_matches_current"] is False
+    assert "tomorrow" not in event.payload_json
+
+
+def test_live_hindi_name_rebinds_an_agent_id_and_accepts_natural_confirmation(db, scripted_llm):
+    order = daytime(db)
+    call = start_call(CallService(db))
+    agent = Turn(session_id=call.id, speaker=Speaker.AGENT, text="previous reply", created_at=call.started_at)
+    db.add(agent)
+    db.commit()
+    proposal = valid_proposal()
+    proposal["primary"].update(
+        action="LEAVE_WITH_NEIGHBOR", named_recipient="Aviral Mishra",
+        window_start=order.window_start.isoformat(), window_end=order.window_end.isoformat(),
+        recipient_source=quote("अविरल मिश्रा", agent.id),
+        recipient_address_source=quote("403"),
+    )
+    llm = scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)])
+    planner = PlannerService(db, llm)
+    result = run(planner, call.id, "मैं घर पर नहीं हूँ। मेरे पड़ोसी अविरल मिश्रा, 403 को पार्सल दे सकते हैं?")
+    assert result.turn.verdict.valid
+    assert "अविरल मिश्रा" in result.agent_message
+    result = run(planner, call.id, "हाँ, इस प्लान को आगे बढ़ाइए।")
+    assert result.turn.customer_confirmed
+    assert result.planner.model == "rules:explicit-confirmation"
+    assert len(llm.requests) == 1
+    saved = planner.calls.commit_plan(call.id, "live-hindi-confirm")
+    assert saved.state == "COMMITTED"
+    assert saved.courier_card.named_recipient == "अविरल मिश्रा"
+    assert planner.calls.commit_plan(call.id, "live-hindi-confirm").reused
+
+
 @pytest.mark.parametrize("text", [
     "4 PM or 8 PM", "4pm or 8pm", "दोपहर चार बजे या रात आठ बजे",
 ])
@@ -272,7 +327,7 @@ def test_correction_replaces_verified_name_without_reusing_old_label(db, scripte
         request_details={"recipient_source": quote("शर्मा जी"), "action": "LEAVE_WITH_NEIGHBOR"},
     )
     second = decision(PlannerAction.ASK_CLARIFICATION, "Which delivery time?")
-    second.update(missing_fields=["time"], request_details={"recipient_source": quote("वर्मा जी")})
+    second.update(missing_fields=["time"], request_details={"recipient_source": quote("वर्मा जी"), "recipient_address_source": quote("404")})
     third = decision(PlannerAction.ASK_CLARIFICATION, "What ending time?")
     third.update(
         missing_fields=["end_time"],
@@ -284,7 +339,7 @@ def test_correction_replaces_verified_name_without_reusing_old_label(db, scripte
     planner = PlannerService(db, scripted_llm([first, second, third]))
     call = start_call(planner.calls)
     run(planner, call.id, "शर्मा जी को दे दीजिए")
-    run(planner, call.id, "शर्मा जी नहीं, वर्मा जी को देना")
+    run(planner, call.id, "शर्मा जी नहीं, वर्मा जी को 404 में देना")
     result = run(planner, call.id, "पाँच बजे")
     assert result.turn.verdict.valid
     assert "वर्मा जी" in result.agent_message and "शर्मा जी" not in result.agent_message
@@ -452,7 +507,7 @@ def test_repeated_recipient_quote_with_new_source_reference_is_not_progress(db, 
     assert references[0] != references[1]
 
 
-def test_neighbour_address_question_becomes_a_scheduled_window_proposal(db, scripted_llm):
+def test_neighbour_address_question_remains_until_location_is_supplied(db, scripted_llm):
     order = daytime(db)
     order.requires_otp = False
     order.declared_value_inr = 500
@@ -469,15 +524,125 @@ def test_neighbour_address_question_becomes_a_scheduled_window_proposal(db, scri
     planner = PlannerService(db, scripted_llm([item]))
     call = start_call(planner.calls)
     result = run(planner, call.id, "उनका नाम है अविरल मिश्रा।")
-    assert result.planner.action == PlannerAction.PROPOSE_PLAN
-    assert result.planner.missing_fields == []
-    assert result.turn.verdict.valid
-    proposal_id = planner.calls.get_call(call.id).current_proposal_id
-    assert proposal_id is not None
-    plan = json.loads(db.get(PlanProposalRecord, proposal_id).proposal_json)
-    assert plan["primary"]["action"] == "LEAVE_WITH_NEIGHBOR"
-    assert plan["primary"]["named_recipient"] == "अविरल मिश्रा"
-    assert plan["primary"]["recipient_address"] is None
-    assert "10:00" in plan["primary"]["window_start"]
-    assert "12:00" in plan["primary"]["window_end"]
+    assert result.planner.action == PlannerAction.ASK_CLARIFICATION
+    assert result.planner.missing_fields == ["recipient_address"]
     assert not result.turn.customer_confirmed
+    assert planner.calls.get_call(call.id).current_proposal_id is None
+
+
+def test_recipient_replacement_clears_location_until_new_customer_evidence(db, scripted_llm):
+    order = daytime(db)
+    first_plan = valid_proposal()
+    first_plan["primary"].update(
+        action="LEAVE_WITH_NEIGHBOR", window_start=order.window_start.isoformat(),
+        window_end=order.window_end.isoformat(), recipient_source=quote("Aviral Mishra"),
+        recipient_address_source=quote("403"), named_recipient="Aviral Mishra", recipient_address="403",
+    )
+    first = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=first_plan)
+    correction = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=first_plan)
+    correction["request_details"] = {"action": "LEAVE_WITH_NEIGHBOR", "recipient_source": quote("Sharma ji")}
+    location = decision(PlannerAction.ASK_CLARIFICATION, "Where should the courier find them?")
+    location.update(missing_fields=["recipient_address"], request_details={"recipient_address_source": quote("404")})
+    planner = PlannerService(db, scripted_llm([first, correction, location]))
+    call = start_call(planner.calls)
+    assert run(planner, call.id, "Give it to Aviral Mishra at 403").turn.verdict.valid
+    result = run(planner, call.id, "Sorry, not Aviral Mishra, give it to Sharma ji")
+    assert result.planner.missing_fields == ["recipient_address"]
+    assert planner.calls.get_call(call.id).current_proposal_id is None
+    assert not result.turn.customer_confirmed
+    result = run(planner, call.id, "He lives at 404")
+    assert result.turn.verdict.valid
+    record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
+    primary = json.loads(record.proposal_json)["primary"]
+    assert primary["named_recipient"] == "Sharma ji"
+    assert primary["recipient_address"] == "404"
+    assert "Aviral" not in result.agent_message and "403" not in result.agent_message
+    assert run(planner, call.id, "Yes").turn.customer_confirmed
+    saved = planner.calls.commit_plan(call.id, "corrected-neighbour")
+    assert saved.courier_card.named_recipient == "Sharma ji"
+    assert saved.courier_card.recipient_address == "404"
+
+
+@pytest.mark.parametrize("position", ["primary", "fallback"])
+def test_neighbour_location_is_required_at_policy_boundary(db, position):
+    from app.policy import validate_plan
+    from app.schemas import PlanProposal
+    order = daytime(db)
+    plan = valid_proposal()
+    neighbour = dict(plan["primary"], action="LEAVE_WITH_NEIGHBOR", named_recipient="Aviral Mishra")
+    plan[position] = neighbour
+    verdict = validate_plan(PlanProposal.model_validate(plan), order, [])
+    assert any(v.code.value == "RECIPIENT_LOCATION_REQUIRED" and v.path == position for v in verdict.violations)
+
+
+@pytest.mark.parametrize("message", [
+    "Main parcel de sakti hoon. Unka flat number kya hai?",
+    "मैं पार्सल दे सकती हूँ। उनका फ्लैट नंबर क्या है?",
+])
+def test_location_question_cannot_grant_handoff_permission_first(db, scripted_llm, message):
+    daytime(db)
+    item = decision(PlannerAction.ASK_CLARIFICATION, message)
+    item.update(missing_fields=["recipient_address"], request_details={
+        "action": "LEAVE_WITH_NEIGHBOR", "recipient_source": quote("अविरल मिश्रा"),
+    })
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "मेरे पड़ोसी अविरल मिश्रा को दे सकते हैं?")
+    assert result.planner.fallback_reason == "UNVALIDATED_HANDOFF_PERMISSION"
+    assert result.planner.wording_source == "template"
+    assert result.planner.missing_fields == ["recipient_address"]
+    assert not result.turn.customer_confirmed
+
+
+@pytest.mark.parametrize("restriction,code", [("COD", "COD_REQUIRES_DIRECT_HANDOFF"), ("HIGH_VALUE", "HIGH_VALUE_DIRECT_HANDOFF")])
+def test_ineligible_neighbour_handoff_explains_policy_before_asking_location(db, scripted_llm, restriction, code):
+    from app.models import PaymentMode
+    order = daytime(db)
+    if restriction == "COD":
+        order.payment_mode = PaymentMode.COD
+    else:
+        order.declared_value_inr = 35000
+    db.add(order)
+    db.commit()
+    item = decision(PlannerAction.ASK_CLARIFICATION, "Where should the courier find them?")
+    item.update(missing_fields=["recipient_address"], request_details={
+        "action": "LEAVE_WITH_NEIGHBOR", "recipient_source": quote("Aviral Mishra"),
+    })
+    planner = PlannerService(db, scripted_llm([item]))
+    call = start_call(planner.calls)
+    result = run(planner, call.id, "Give it to Aviral Mishra")
+    assert not result.turn.verdict.valid
+    assert any(v.code.value == code for v in result.turn.verdict.violations)
+    assert result.planner.missing_fields == []
+    assert result.planner.fallback_reason == "POLICY_REJECTED"
+    assert not result.turn.customer_confirmed
+
+
+def test_address_correction_preserves_recipient_and_requested_time(db, scripted_llm):
+    order = daytime(db)
+    plan = valid_proposal()
+    plan["primary"].update(action="LEAVE_WITH_NEIGHBOR", named_recipient="Aviral", recipient_address="403",
+        recipient_source=quote("Aviral"), recipient_address_source=quote("403"),
+        window_start="2026-11-05T17:00:00+05:30", window_end="2026-11-05T18:00:00+05:30")
+    first = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=plan)
+    first['request_details'] = {'action':'LEAVE_WITH_NEIGHBOR','window_start':'2026-11-05T17:00:00+05:30',
+        'window_end':'2026-11-05T18:00:00+05:30','time_source':quote('17:00'),
+        'recipient_source':quote('Aviral'),'recipient_address_source':quote('403')}
+    corrected = decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=plan)
+    corrected['request_details'] = {'recipient_address_source':quote('404')}
+    planner = PlannerService(db, scripted_llm([first, corrected]))
+    call = start_call(planner.calls)
+    assert run(planner, call.id, 'Give it to Aviral at 403 at 17:00').turn.verdict.valid
+    result = run(planner, call.id, 'Sorry, his house is 404')
+    assert result.turn.verdict.valid and not result.turn.customer_confirmed
+    saved = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
+    primary = json.loads(saved.proposal_json)['primary']
+    assert primary['named_recipient']=='Aviral' and primary['recipient_address']=='404'
+    assert datetime.fromisoformat(primary['window_start']).hour==17
+    assert run(planner, call.id, 'Yes').turn.customer_confirmed
+    saved = planner.calls.commit_plan(call.id, 'corrected-address-and-time')
+    db.refresh(order)
+    assert order.status.value == 'RESCHEDULED'
+    assert _utc(order.window_start) == _utc(saved.courier_card.window_start)
+    assert _utc(order.window_end) == _utc(saved.courier_card.window_end)
+    assert order.delivery_address_summary and order.delivery_address_summary != '404'
