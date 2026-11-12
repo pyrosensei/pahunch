@@ -4,13 +4,13 @@
 
 **A policy-bound voice agent that calls customers before risky deliveries — and refuses to break the courier's rules, even when the customer asks it to.**
 
-Prisma v3.0 streaming STT · Timbre v3.0 TTS · Google Gemini 3.1 Flash-Lite planner · FastAPI · SQLite · React 19
+Prisma v3.0 streaming STT · Timbre v3.0 TTS · Gemini 3.1 Flash-Lite planner · FastAPI · SQLite · React 19
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
-[![Gemini](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-4285F4.svg)](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite)
-[![Tests](https://img.shields.io/badge/tests-662%20passing-2ea44f.svg)](#test--evaluation-suites)
+![Planner](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-1A7CE7.svg)
+[![Tests](https://img.shields.io/badge/backend%20tests-696%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -57,7 +57,7 @@ This separation is the whole product.
 
 ```
 ┌──────────────────────────────┐
-│  LLM planner (Gemini)          │  ← may only PROPOSE. Never decides legality.
+│  LLM planner (OpenRouter)      │  ← may only PROPOSE. Never decides legality.
 └───────────────┬──────────────┘
                 │  PlanProposal (primary + fallback)
                 ▼
@@ -95,7 +95,7 @@ Consequences that matter in production:
        │                          │  │ Prisma v3.0 streaming STT (WS)     │  │
        │                          │  │  → text, detected language         │  │
        │                          │  ├────────────────────────────────────┤  │
-       │                          │  │ Planner (Gemini, JSON Schema)        │  │
+       │                          │  │ Planner (Gemini, JSON Schema)    │  │
        │                          │  ├────────────────────────────────────┤  │
        │                          │  │ Policy engine (deterministic)      │  │
        │                          │  ├────────────────────────────────────┤  │
@@ -165,8 +165,15 @@ The detector retains 200 ms before onset and sends that audio, including the
 candidate speech, to STT. Idle/calibration frames are not sent to STT. Short
 rejected utterances are audited, reset and reported to the page without a planner
 call. The utterance cap counts actual buffered samples, including pre-roll and
-pauses, and cannot overrun on a large frame. The existing 600 ms silence window
-remains unchanged.
+pauses, and cannot overrun on a large frame.
+
+**Two different silence defaults exist, and the probe below measures the smaller
+one.** The running server waits `REALTIME_SILENCE_MS = 1000` (and
+`REALTIME_QUIET_MS = 1000`) from `backend/app/config.py`, copied through
+`build_realtime_config()`. The `RealtimeConfig` dataclass in
+`backend/app/realtime.py` still defaults to `600`, and `scripts/vad_probe.py`
+constructs it directly, so the probe measures the 600 ms dataclass default —
+not the deployed 1000 ms window.
 
 The page displays server detection status beside its local microphone meter.
 Feedback is throttled to 250 ms. After five seconds without usable speech it
@@ -187,10 +194,12 @@ $env:PYTHONPATH = (Get-Location).Path
 .\.venv\Scripts\python.exe scripts/vad_probe.py
 ```
 
-This generates PCM, not speech recognition. After a one-second ambient prelude,
-the quiet, normal and steady-noise speech-level signals measured 100 ms onset
-and 600 ms endpoint delay. The steady-noise-only case had zero false onsets.
-These are audio-sample timing measurements, not microphone/provider latency.
+This generates PCM, not speech recognition. Re-run on 9 November 2026 at
+dataclass defaults: after a one-second ambient prelude, the quiet, normal and
+steady-noise speech-level cases all measured 100 ms onset, 600 ms endpoint
+delay and 0 false onsets; the steady-noise-only case produced no onset at all.
+These are audio-sample timing measurements at a 600 ms silence window, not
+microphone/provider latency and not the deployed 1000 ms window.
 Before/after results and remaining limits: [A2 review](A2_REVIEW.md).
 
 ### 4.2 Call state machine
@@ -279,7 +288,7 @@ existing clients. `VOICE_TURN` retains separate first-substantive-audio timings.
 Speech synthesis converts server-rendered date/time labels into natural spoken
 Hindi or English; stored timestamps and displayed plan facts stay exact.
 Empty or unavailable recognition resumes listening without a fabricated customer
-turn. See [the conversation repair review](CONVERSATION_REPAIR_REVIEW.md).
+turn. See the `CONVERSATION_REPAIR_REVIEW.md` notes in the author's working tree.
 
 Any non-confirmation customer turn clears previous confirmation. An intervening
 question or degraded reply requires a fresh plan offer before a later yes can
@@ -371,8 +380,9 @@ Set `DIALER_ENABLED=false` to stop automatic scheduling and timeout recovery.
 
 ### 4.7 SwiftCart shop and operator dashboard
 
-The root page `/` (also `/dashboard`) is now the operator dashboard. `/shop`
-creates fictional SwiftCart deliveries; `/index.html` retains browser voice.
+`/` is the React landing page; `/dashboard` is the operator dashboard. `/shop`
+creates fictional SwiftCart deliveries; `/voice` is the customer voice client
+(the original `/index.html` remains as a legacy fallback page).
 Checkout accepts a server-owned catalog product and payment mode. OTP verification
 is derived from payment: prepaid requires it, COD does not. Catalog price and
 synthetic delivery details are controlled by the server. No real payment or
@@ -471,21 +481,48 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **662 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **696 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **24 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
-| Frontend unit | `cd frontend && npm test` | none | **34 Vitest tests** for delivery progress, voice controller and selection state |
-| Frontend e2e | `cd frontend && npm run test:e2e` | none | **150 Playwright checks** across desktop, mobile and tablet for landing, shop, dashboard, voice and operator flows |
+| Frontend unit | `cd frontend && npm test` | none | **40 Vitest tests** for delivery progress, voice controller and selection state |
+| Frontend e2e | `cd frontend && npm run test:e2e` | none | **171 Playwright checks** (57 specs × desktop/mobile/tablet) for landing, shop, dashboard, voice and operator flows with mocked API, audio and WebSocket |
 | Frontend build | `cd frontend && npm run build` | none | TypeScript and Vite production build served by FastAPI |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
 | Live voice matrix | `cd backend && uv run python ../evals/matrix_runner.py` | Gnani + configured planner | The real WebSocket voice path, policy, commit and audit trail, T01–T22 |
+
+### Earlier local acceptance on 12 November 2026
+
+The complete backend suite passed 677 tests. Vitest passed 40 tests, Node passed
+24 regressions, deterministic scenarios passed 12/12, and the frontend build and
+Ruff checks passed. The full Edge browser run passed 167/168 checks. One tablet
+page failed to load its assets with `ERR_NETWORK_CHANGED`; that case then passed
+three consecutive isolated reruns. On this Windows host, Vite and Vitest used
+`--configLoader runner`, and Playwright used `PLAYWRIGHT_CHANNEL=msedge`.
+
+The local environment resolved to Gemini `gemini-3.1-flash-lite`. Two isolated
+browser conversations exercised real Gemini planning and Gnani speech output
+with typed customer input. A Hindi neighbour request retained the supplied name
+and committed after natural Hindi confirmation. A second conversation rejected
+an unavailable date, interpreted five o'clock as 17:00–18:00, revised the date
+after a qualified acknowledgement, and saved only after fresh confirmation.
+Each session produced one delivery commit. Courier instructions retained direct
+courier-to-customer OTP verification.
+
+The initial greeting failed after 33.92 seconds while recognition connected
+eagerly. After deferring recognition connection until capture, a fresh greeting
+streamed its first audio at 2.098 seconds. Model-backed reschedule replies started
+audio at 4.546 and 5.331 seconds. These are individual server measurements.
+Microphone recognition, acoustic quality, interruptions and handset calling still
+require live acceptance. The synthetic sessions used a disposable database with
+telephony disabled.
 
 ### Live voice matrix
 
 The matrix drives the actual server over HTTP and WebSocket: it synthesises every customer turn with Gnani Timbre, streams it as 16 kHz PCM over the voice socket, reads planner and policy decisions from SQLite, commits through the real endpoint, and writes a report.
 
 **Historical NVIDIA NIM run: 19 / 21 live scenarios pass.** These figures do not
-describe the current Gemini configuration. Current provider and microphone acceptance remain pending.
+describe the current OpenRouter configuration. Current provider and microphone
+acceptance remain pending.
 
 | Metric | Value |
 |---|---|
@@ -498,7 +535,10 @@ describe the current Gemini configuration. Current provider and microphone accep
 | Stage P50/P95 | STT 1.10/2.38 s · planner 1.72/12.11 s · TTS 2.08/3.86 s |
 | Degraded planner turns | 3 (`LLM_TIMEOUT`, provider stall) |
 
-The two failing scenarios (T01, T04) fail **only** because their first planner call hit the 12 s provider timeout and the safe fallback consumed the turn — the degradation is counted in the report rather than hidden. Both scenarios pass when the provider responds normally.
+The two failing scenarios (T01, T04) failed because their first planner call hit
+the 12 s provider timeout and the safe fallback consumed the turn — the
+degradation is counted in the report rather than hidden. They were **not**
+re-run on a healthy provider, so no claim is made that they pass.
 
 Full report: [`evals/reports/matrix-latest.md`](evals/reports/matrix-latest.md) · raw JSON with per-turn transcripts, policy verdicts, timings and full audit trails in `evals/reports/matrix-latest.json`.
 
@@ -535,7 +575,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 **9. Streaming STT state leaked between calls.** A new voice connection inherited the previous connection's queue, partials and error state. Each connection now gets its own client with an explicit reset, so a stale sentinel cannot poison the next call.
 
-**10. Our own harness can produce false failures.** One published-looking run failed T08 because it was launched from a branch that predated the scenario fix — the product was right, the expectation was stale. Lesson applied: published matrices are always run from merged `main`.
+**10. Our own harness can produce false failures.** One published-looking run failed T08 because it was launched from a branch that predated the scenario fix — the product was right, the expectation was stale. Lesson applied: published matrices should be run from a known, documented commit. The currently published report was **not** run from merged `main`, and says so.
 
 ---
 
@@ -545,7 +585,7 @@ These are the real engineering problems from building this, not a retrospective 
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- A Gnani API key (Prisma + Timbre) and a Google Gemini API key
+- A Gnani API key (Prisma + Timbre), a Gemini API key and a local operator token
 
 ### 1. Configure
 
@@ -560,7 +600,8 @@ Set the speech/planner credentials and planner connection in `.env`:
 GNANI_API_KEY=
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=
-# Empty base URL and model select the Gemini defaults below.
+OPERATOR_API_TOKEN=
+# Empty base URL and model select the Gemini defaults.
 LLM_BASE_URL=
 LLM_MODEL=
 LLM_THINKING_LEVEL=minimal
@@ -569,28 +610,16 @@ LLM_MAX_TOKENS=1024
 LLM_STRUCTURED_MODE=json_schema
 ```
 
-The planner calls Google's native `generateContent` endpoint at
-`https://generativelanguage.googleapis.com/v1beta` with
-`gemini-3.1-flash-lite`, JSON Schema output and minimal thinking. The
-output-token budget includes thinking tokens. The backend validates the
-response, delivery policy, wording and explicit confirmation before saving a
-delivery commitment.
+The default planner uses native Gemini with `gemini-3.1-flash-lite`.
+Set `GEMINI_API_KEY` in the local `backend/.env`, with `LLM_PROVIDER=gemini`.
+Empty `LLM_MODEL` and `LLM_BASE_URL` select the provider defaults. The backend
+validates structured output, source evidence, delivery policy and explicit
+customer confirmation before saving instructions.
 
-Set `GEMINI_API_KEY` in `backend/.env`. The connection uses the official Google
-HTTPS endpoint and authenticates with a header. A missing key leaves the planner
-unconfigured. Gnani handles speech recognition and synthesis.
-
-`LLM_PROVIDER` also accepts `ollama`, `groq` and `openrouter`; each reads only
-its own key (`GEMINI_API_KEY`, `OLLAMA_API_KEY`, `GROQ_API_KEY`,
-`OPENROUTER_API_KEY`) and its own default base URL and model. The generic
-`LLM_API_KEY` is not used. Switching provider is a one-line change, not a code
-change.
-
-Ollama Cloud remains selectable but is now a paid service: without a paid plan
-it answers HTTP 402, which the planner reports as `LLM_BILLING_REQUIRED`. Check
-the active Gemini project's token/minute, request/minute and daily quotas before
-a live demo. HTTP 429 is exposed as `LLM_RATE_LIMIT`. A provider failure
-preserves the delivery state and returns a service message.
+Optional adapters for OpenRouter, Groq and Ollama remain selectable. Each reads
+its own credential. HTTP 429, 402 and timeout responses have distinct recorded
+error categories and visible frontend feedback. Provider errors preserve the
+saved delivery arrangement. Gnani handles speech recognition and synthesis.
 
 `.env` is gitignored. Keys are never committed and never printed.
 
@@ -607,12 +636,9 @@ uv sync
 uv run uvicorn app.main:app --port 8000
 ```
 
-Open **http://127.0.0.1:8000** for the operator dashboard. Use **SwiftCart shop**
-to create a current-time synthetic order, then mark it out for delivery. Watch
-the scheduler create a local call session. **Browser voice fallback** opens
-`/index.html`, where selecting the order attaches to that session and enables
-microphone or typed turns. The guarded phone adapter remains disabled until its
-verification and per-session approval gates are met.
+Open `/shop` for the customer storefront and `/dashboard` for delivery
+operations in two deliberately opened tabs. Follow the deadline demo sequence
+below. The operator console owns dispatch and conversation preparation.
 
 The database is created and seeded automatically on startup (8 synthetic orders, ids `1042`–`1049`, covering OTP, COD, high-value, neighbour-drop, missing-metadata and already-delivered cases).
 
@@ -620,13 +646,13 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 662 tests, no external network required
+uv run pytest              # 696 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs  # 24 browser regressions
 
 cd ../frontend
 npm ci
-npm test                   # 34 frontend unit tests
-npm run test:e2e           # 150 Playwright checks (mocked API)
+npm test                   # 40 frontend unit tests
+npm run test:e2e           # 171 Playwright checks (mocked API)
 npm run build              # production build served by FastAPI
 ```
 
@@ -656,9 +682,9 @@ The matrix runner **deletes all rows** in the target database before it starts. 
 |---|---|---|
 | Speech-to-text | **Prisma v3.0** (`POST /stt/v3`, streaming WebSocket `/stt/v3/stream`) | `indic-auto` language detection, candidate languages `hi-IN,en-IN`, 16 kHz PCM16 |
 | Text-to-speech | **Timbre v3.0** (`POST /api/v1/tts/inference`) | Voice `Shivani`, per-turn `en-IN`, `hi-IN` or `hi-en` |
-| Planner | **Google Gemini** (`gemini-3.1-flash-lite`, `https://generativelanguage.googleapis.com/v1beta`) | Native JSON Schema output, minimal thinking, server-side validation. Ollama Cloud, Groq and OpenRouter remain selectable; Ollama Cloud is paid and returns `LLM_BILLING_REQUIRED` on HTTP 402 |
+| Planner | **Gemini** (`gemini-3.1-flash-lite`) | Native structured output with server-side source, policy and confirmation validation. Optional OpenRouter, Groq and Ollama adapters remain available. |
 | Backend | FastAPI, SQLModel (SQLAlchemy) on SQLite | WebSocket voice path, no external database service |
-| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; current Gemini live acceptance is pending |
+| Evaluation | Configured planner + Gnani Timbre + Prisma speech | Historical 21-case matrix used NIM; the 12 November video-demo replay uses native Gemini |
 
 Built directly on the Gnani **API platform** (`app.gnani.ai/voice`) — Prisma and Timbre are called from our own service code. No hosted agent orchestrator owns the conversation.
 
@@ -683,7 +709,7 @@ No real customer data, no real phone numbers, no OTP collection, and no imperson
 
 ## 10. Known limits
 
-- **Historical provider validation:** earlier Groq and NIM model/provider probes are not validation of the current Gemini configuration. Current automated tests use synthetic providers; headset audio, current live latency and telephony still require validation.
+- **Provider-specific validation.** The 12 November isolated acceptance used Gemini `gemini-3.1-flash-lite` and Gnani output with typed customer input. Gemini is the sample default. Historical Groq and NIM results describe their recorded configurations. Headset audio and telephony still require validation.
 - **Ollama Cloud is paid.** It remains selectable, but a key without an active paid plan returns HTTP 402; the planner reports `LLM_BILLING_REQUIRED` and preserves the delivery state. Gemini is the default.
 - **Latency remains open.** The historical live matrix measured P50 3.87 s / P95 13.47 s end-to-end. The additional synthetic checks measured `first_audio_ms` with real providers, with several responses taking multiple seconds. These measurements exclude endpoint detection, device playback and carrier delay; spoken acknowledgements are now disabled. The target remains sub-second time to first audio.
 - **A1/A2 validation is synthetic.** Detection now calibrates, retains onset audio and debounces barge-in, but energy alone cannot distinguish speech from every sudden noise or speaker echo. Keep quiet briefly during initial calibration. Quiet barge-in before calibration uses a provisional threshold and may be missed. Real provider tests now cover the repaired path, but real microphone and acoustic echo performance remain unmeasured; the matrix above is historical.
@@ -722,8 +748,10 @@ pahunch/
 │   ├── planner_runner.py       # live planner runner
 │   ├── matrix_runner.py        # live voice matrix runner
 │   └── reports/                # published matrix reports
-└── .github/            # (in progress)
+└── README.md
 ```
+
+There is no `.github/` directory and no committed CI configuration.
 
 Built with [FastAPI](https://fastapi.tiangolo.com/), [SQLModel](https://sqlmodel.tiangolo.com/), [httpx](https://www.python-httpx.org/), [uv](https://docs.astral.sh/uv/), and the [Gnani AI](https://app.gnani.ai/voice) API platform.
 
@@ -778,27 +806,76 @@ The original `/index.html`, `/dashboard.html`, `/shop.html`, `/worklet.js` and
 page paths retain their 404 responses rather than loading the React app.
 
 
-## Current deadline demo: PC voice + operator console
+## Current deadline demo — SwiftCart and Pahunch
 
-The customer speaks in a separate PC participant tab; the main dashboard is the
-operator monitor. Use SwiftCart checkout, mark the order out for delivery, choose
-**Monitor delivery**, then **Open customer PC voice** from its active session.
-The participant connects and enables the microphone explicitly. Confirmed plans
-save automatically in this PC-demo mode; keyboard input is a collapsed fallback.
+Use the installed local environment from Windows CMD.
 
-Operator review controls require `OPERATOR_API_TOKEN` from the local ignored
-`backend/.env`, entered into the dashboard operator-key form. It is held only for
-that tab. Rejection and policy-validated revision require a reason and current
-proposal version. Revisions require presentation and fresh customer consent.
+```bat
+cd /d "C:\Users\sweta\Desktop\Gnani AI\pahunch\frontend"
+npm.cmd run build -- --configLoader runner
+cd ..\backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
-See [PC_OPERATOR_DEMO_REVIEW.md](PC_OPERATOR_DEMO_REVIEW.md) for safeguards, tests
-and remaining validation. Phone integration is deferred; the current Twilio Trial
-account does not support the required streaming verb. Keep this app local.
+1. Open `http://127.0.0.1:8000/shop` as the customer. Select a product and
+   payment method, then place the demo order. Keep its order page open.
+2. Open `http://127.0.0.1:8000/dashboard` as the operator. Enter the existing
+   `OPERATOR_API_TOKEN` from the local `backend/.env` in the access form.
+   Select the order, mark it out for delivery, then prepare its conversation.
+3. Return to that SwiftCart order. Connect the conversation and enable the
+   microphone. Keyboard fallback is available for scripted rehearsal.
+4. Discuss the arrangement and explicitly confirm the final version. In the
+   console, open **Courier instructions** to inspect the saved commit, original
+   address, authorized recipient, handoff location, time and OTP instructions.
+
+The storefront uses the supplied pink, coral, near-black and white palette.
+The operations console uses near-black, blue, green and gray. Dispatch actions
+require operator access. Pending orders remain outside conversation admission.
+The console initially lists the 20 most recent catalog orders; history includes
+older records, and the selected order stays selected as new orders arrive.
+
+Neighbour handoffs require a name and a house/flat number or clear finding
+instructions. Bare proximity such as “बगल में” or “next door” prompts a location
+question. A replacement neighbour requires its own location and fresh
+confirmation. COD and high-value restrictions are checked before collecting an
+ineligible neighbour's location. Courier-to-customer OTP verification applies
+at handoff. The AI never collects the code.
+
+Commit updates the saved courier arrangement and any changed appointment
+atomically. The original delivery address remains the address of record.
+The courier view displays the authorized neighbour location separately and
+reports unavailable contact details explicitly. Refresh failures retain the
+last retrieved instructions with a stale-data warning.
+
+### Video-demo repair verification
+
+The backend suite passed **696 tests**, frontend unit checks passed **40**, Node
+browser/audio regressions passed **24**, deterministic scenarios passed **12/12**,
+and the responsive mocked browser suite passed **171 checks**. Build and static
+checks accompany these runs. Mocked tests cover role separation, protected
+dispatch, recipient correction, one commit, refresh recovery and accessibility.
+Real-provider rehearsal records are stored locally under ignored `.artifacts/`.
+A clean seven-turn replay passed against Gemini `gemini-3.1-flash-lite` and
+Gnani speech output using scripted customer input. It rejected vague proximity,
+requested a replacement neighbour's location, retained house 404 through time
+and date changes, and saved one idempotent commit. The order and courier card
+represent the same final appointment, with the original address retained.
+First substantive audio for model-backed turns ranged from **1.95–3.27 seconds**;
+the explicit-confirmation reply started at **250 ms**. Opening audio started at
+**1.924 seconds**. These server measurements exclude microphone endpointing and
+device playback. The replay recorded zero planner errors.
+Microphone acoustics, real interruption quality and handset delivery remain
+acceptance work. The approved courier delivery mechanism is the live console
+view. Telephony remains deferred.
+
+Operator rejection and revision require a reason and the current proposal
+version. Revisions require presentation and fresh customer consent. The operator
+key is held in that browser tab's session storage.
 
 ### Delivery availability and rescheduling
 
 Availability periods come from the backend, independently of the initial two-hour
-appointment. A 3 pm request within an 8 am–6 pm period can become a 3–5 pm proposal.
+appointment. A 3 pm request within a recorded 10 am–6 pm period can become a 3–5 pm proposal.
 A start-only request at 5 pm can use 5–6 pm; explicit endpoints are never silently
 shortened. Requests outside recorded days/hours are rejected with actual available
 periods, and availability questions bypass the model. Changes still require fresh
@@ -813,14 +890,14 @@ earliest stored date. Legacy seeded examples retain their recorded availability.
 
 ### Conversation recovery
 
-The current planner is Google Gemini 3.1 Flash-Lite with minimal thinking. Short
-acknowledgements preserve the conversation language; substantial Hindi/English
-mixing selects Hinglish. Server-known delivery windows are accepted in both
-24-hour and 12-hour forms (`18:00` and `6 PM`). Model replies may use up to three
-sentences, matching the server's own availability reply; four sentences still
-fall back to deterministic wording. The planner can mark an unfinished
-clarification with `awaiting_continuation`; voice output then waits up to two
-extra seconds, cancellable by resumed speech, without a second model request.
+The current default planner is Gemini `gemini-3.1-flash-lite`. Short acknowledgements preserve the conversation language;
+substantial Hindi/English mixing selects Hinglish. Server-known delivery windows
+are accepted in both 24-hour and 12-hour forms (`18:00` and `6 PM`). Model
+replies may use up to three sentences, matching the server's own availability
+reply; four sentences still fall back to deterministic wording. The planner can
+mark an unfinished clarification with `awaiting_continuation`; voice output then
+waits up to two extra seconds, cancellable by resumed speech, without a second
+model request.
 Complete delivery actions cannot use this flag. Noise calibration and browser
 noise suppression help capture but do not guarantee speech/noise separation.
 Human microphone validation is still required.
