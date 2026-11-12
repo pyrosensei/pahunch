@@ -194,7 +194,7 @@ def test_short_continuation_preserves_valid_original_utterance(scripted_llm):
             await ws.event("listening")
             ws.utterance()
             await asyncio.wait_for(llm.started.wait(), 1)
-            continued = b"".join([loud()] + [silence()] * 3)
+            continued = b"".join([loud()] * 2 + [silence()] * 3)
             for index in range(0, len(continued), len(loud())):
                 ws.audio(continued[index:index + len(loud())])
             await asyncio.wait_for(llm.cancelled.wait(), 1)
@@ -209,6 +209,79 @@ def test_short_continuation_preserves_valid_original_utterance(scripted_llm):
                 e.event_type == "VAD_SHORT_UTTERANCE"
                 for e in calls.list_events(session_id)
             )
+
+    asyncio.run(run())
+
+
+def test_short_processing_burst_does_not_cancel_held_planner(scripted_llm):
+    async def run():
+        llm = HeldPlanner(scripted_llm)
+        async with voice(llm) as (ws, _, calls, session_id):
+            ws.control("start")
+            await ws.event("listening")
+            ws.utterance()
+            await asyncio.wait_for(llm.started.wait(), 1)
+            ws.audio(loud())
+            ws.audio(silence())
+            await asyncio.sleep(0.1)
+            assert not llm.cancelled.is_set()
+            llm.release.set()
+            await ws.event("agent_audio_end")
+            calls.db.expire_all()
+            assert calls.get_call(session_id).turn_count == 1
+            assert not any(
+                e.event_type == "REALTIME_OUTPUT_CANCELLED"
+                for e in calls.list_events(session_id)
+            )
+
+    asyncio.run(run())
+
+
+def test_quiet_processing_continuation_cancels_and_keeps_audio(scripted_llm):
+    async def run():
+        llm = HeldPlanner(scripted_llm, outcomes=2)
+        config = replace(
+            FAST_CONFIG,
+            adaptive_vad=True,
+            vad_floor=120,
+            vad_ceiling=12_000,
+            noise_ratio=3.0,
+            silence_ms=300,
+            quiet_ms=300,
+            min_speech_ms=100,
+            pre_roll_ms=0,
+            speech_start_ms=100,
+            barge_in_ms=160,
+            processing_confirm_ms=400,
+        )
+        async with voice(llm, config=config) as (ws, _, calls, session_id):
+            ws.control("start")
+            await ws.event("listening")
+            for _ in range(20):
+                ws.audio(silence())
+            ws.utterance()
+            await asyncio.wait_for(llm.started.wait(), 1)
+            ws.audio(pcm_frame(300, ms=400))
+            await asyncio.wait_for(llm.cancelled.wait(), 1)
+            await asyncio.sleep(0.05)
+            resumed = [
+                json.loads(e.payload_json)
+                for e in calls.list_events(session_id)
+                if e.event_type == "CUSTOMER_SPEECH_RESUMED"
+            ]
+            assert resumed == [{"continued_turn": True}]
+            cancelled = [
+                json.loads(e.payload_json)
+                for e in calls.list_events(session_id)
+                if e.event_type == "REALTIME_OUTPUT_CANCELLED"
+            ]
+            assert cancelled and cancelled[-1]["onset"] == "quiet"
+            llm.release.set()
+            for _ in range(3):
+                ws.audio(silence())
+            await ws.event("agent_audio_end", timeout=2)
+            calls.db.expire_all()
+            assert calls.get_call(session_id).turn_count == 1
 
     asyncio.run(run())
 
@@ -481,6 +554,7 @@ def test_barge_in_after_completed_commit_reuses_clean_stt_connection(scripted_ll
         async with voice(scripted_llm([proposal_decision()]), streaming=stream) as (ws, _, _, _):
             ws.control("config", playback_tracking=True)
             opening = await ws.event("agent_audio_end")
+            assert stream.connect_attempts == 0
             ws.control("playback_done", generation_id=opening["generation_id"])
             ws.control("start")
             await ws.event("listening")
@@ -641,15 +715,20 @@ def test_failed_stt_capture_is_discarded_once_and_reconnects_before_next_capture
     async def run():
         stream = Stream()
         stt = _StreamingInput(stream, 16000, lambda *args: None)
+        await asyncio.sleep(0)
+        assert stream.connects == 0
         capture = stt.begin()
         assert await stt.finish(capture) is None
-        await stt.connection
-        assert stream.connects == 2
+        assert stream.connects == 1
         stt.abort()
         await stt.barrier
         assert stream.cancels == 1
+        capture = stt.begin()
+        assert await stt.finish(capture) is None
+        assert stream.connects == 2
+        assert stream.cancels == 2
         await stt.close()
-        assert stream.cancels == 1
+        assert stream.cancels == 2
     asyncio.run(run())
 
 

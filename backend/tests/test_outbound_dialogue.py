@@ -7,7 +7,7 @@ from test_planner import db as planner_database
 from test_planner import start_call
 from test_realtime_a1 import voice
 
-from app.calls import CallService
+from app.calls import CallService, utc_now
 from app.errors import DomainError
 from app.language import phrase
 from app.models import AuditEvent, Speaker, Turn
@@ -28,7 +28,8 @@ def test_opening_contains_the_actual_order_window_and_relevant_payment_rule(db):
     call = start_call(CallService(db), 1043)
     message, meta = outbound_opening(db, call.id, "en-IN")
     assert "SwiftCart" in message and "1043" in message
-    assert "05 November 12:00-15:00 IST" in message
+    assert "05 November, 12 PM-3 PM" in message
+    assert "IST" not in message
     assert "Payment is due to the courier" in message
     assert "Will you be available" in message
     assert "How can I help" not in message
@@ -47,6 +48,34 @@ def test_call_purpose_is_answered_with_delivery_context_not_generic_help(db, utt
     assert planner.calls.get_call(call.id).current_proposal_id is None
     assert "checking" not in result.agent_message
     assert "जाँच कर रही" not in result.agent_message
+
+
+def record_opening(db, session_id):
+    db.add(
+        Turn(
+            session_id=session_id,
+            speaker=Speaker.AGENT,
+            text="opening",
+            structured_payload_json=json.dumps({"opening": True}),
+            created_at=utc_now(),
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["आपको मेरी आवाज़ आ रही?", "Hello, आपको मेरी आवाज़ आ रही है?"],
+)
+def test_audibility_question_uses_heard_and_delivery_purpose(db, utterance):
+    planner = PlannerService(db, NoModel())
+    call = start_call(planner.calls, 1042)
+    record_opening(db, call.id)
+    result = asyncio.run(planner.handle_turn(call.id, AgentTurnRequest(text=utterance)))
+    assert result.planner.fallback_reason == "OUTBOUND_DELIVERY_PURPOSE"
+    assert result.agent_message.startswith("हाँ, आपकी आवाज सुनाई दे रही है।")
+    assert "1042" in result.agent_message
+    assert not result.turn.customer_confirmed
 
 
 def test_prepaid_opening_explains_courier_otp_without_collecting_it(db):
@@ -76,7 +105,8 @@ def test_socket_records_proactive_opening_and_first_yes_only_proposes():
             purpose = await socket.event("turn")
             assert purpose["planner"]["fallback_reason"] == "OUTBOUND_DELIVERY_PURPOSE"
             assert "1042" in purpose["agent_message"]
-            assert "क्या आप उस समय" in purpose["agent_message"]
+            assert "available hain" in purpose["agent_message"]
+            assert "IST" not in purpose["agent_message"]
             assert not purpose["turn"]["customer_confirmed"]
             purpose_end = await socket.event("agent_audio_end")
             socket.control("playback_done", generation_id=purpose_end["generation_id"])
@@ -101,3 +131,25 @@ def test_socket_records_proactive_opening_and_first_yes_only_proposes():
 def test_acknowledgement_does_not_claim_unspecified_checking(language):
     assert "check" not in phrase("ack", language).lower()
     assert "जाँच" not in phrase("ack", language)
+
+
+def test_opening_revalidates_a_historical_neighbour_plan_against_current_policy(db):
+    from app.models import PlanProposalRecord, PolicyDecisionRecord
+    from app.schemas import CustomerTurnRequest, PlanProposal
+    call = start_call(CallService(db),1046)
+    calls = CallService(db)
+    order = calls._order(1046)
+    old = PlanProposal.model_validate({'primary':{'action':'LEAVE_WITH_NEIGHBOR','named_recipient':'Aviral',
+        'window_start':order.window_start,'window_end':order.window_end}})
+    calls.submit_turn(call.id,CustomerTurnRequest(text='Aviral',proposal=old))
+    # Simulate an older policy decision retained in a saved database.
+    verdict = db.exec(select(PolicyDecisionRecord).where(PolicyDecisionRecord.proposal_id==call.current_proposal_id)).one()
+    verdict.valid=True
+    db.add(verdict)
+    db.commit()
+    assert db.get(PlanProposalRecord,call.current_proposal_id) is not None
+    message,meta=outbound_opening(db,call.id,'en-IN')
+    assert meta.action.value=='RESPOND'
+    assert 'Aviral' not in message
+    with pytest.raises(DomainError):
+        calls.submit_turn(call.id,CustomerTurnRequest(text='Yes',confirmation=True))

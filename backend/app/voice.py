@@ -360,6 +360,10 @@ class VoiceTurnService:
             response.timings.first_audio_ms = round(
                 (first_audio_at - turn_reference) * 1_000
             )
+        if first_response_audio_at is not None:
+            response.timings.first_response_audio_ms = round(
+                (first_response_audio_at - turn_reference) * 1_000
+            )
 
         response.audio_base64 = audio_base64
         response.audio_content_type = audio_type

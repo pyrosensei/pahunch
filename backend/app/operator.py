@@ -2,6 +2,7 @@
 
 import json
 import secrets
+from datetime import UTC
 from typing import Annotated
 from uuid import uuid4
 
@@ -17,9 +18,11 @@ from app.language import redact_customer_text, redact_payload
 from app.models import (
     AuditEvent,
     CallRuntime,
+    CallSession,
     CallState,
     DeliveryCommit,
     DeliverySlot,
+    Order,
     PlanProposalRecord,
     PolicyDecisionRecord,
     Speaker,
@@ -27,7 +30,7 @@ from app.models import (
     TwilioBinding,
 )
 from app.policy import validate_plan
-from app.schemas import PlanProposal
+from app.schemas import PlanProposal, PlanStep
 from app.state_machine import TERMINAL_STATES
 
 
@@ -43,6 +46,32 @@ def require_operator_key(
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_operator_key)])
 SessionDep = Annotated[Session, Depends(get_session)]
+
+
+@router.get("/operator/access")
+def access():
+    return {"authorized": True}
+
+
+@router.get("/orders/{order_id}/courier-instructions")
+def courier_instructions(order_id: int, db: SessionDep):
+    order = db.get(Order, order_id)
+    if order is None:
+        raise DomainError(404, "Order not found")
+    commit = db.exec(
+        select(DeliveryCommit).join(CallSession, DeliveryCommit.session_id == CallSession.id)
+        .where(CallSession.order_id == order_id)
+        .order_by(DeliveryCommit.committed_at.desc(), DeliveryCommit.id.desc())
+    ).first()
+    if commit is None:
+        return None
+    return {
+        "order_id": order_id, "session_id": commit.session_id,
+        "commit_id": commit.id, "committed_at": commit.committed_at.replace(tzinfo=UTC) if commit.committed_at.tzinfo is None else commit.committed_at,
+        "original_delivery_address": order.delivery_address_summary,
+        "contact": None,
+        "courier_card": redact_payload(json.loads(commit.courier_card_json)),
+    }
 
 
 class OperatorChange(BaseModel):
@@ -76,6 +105,39 @@ def _facts(proposal: PlanProposal) -> dict:
         if isinstance(data[key], dict):
             data[key].pop("notes", None)
     return redact_payload(data)
+
+
+_VERIFIED_SOURCE_FIELDS = (
+    ("named_recipient", "recipient_source"),
+    ("recipient_address", "recipient_address_source"),
+)
+
+
+def _retain_verified_source(step: PlanStep | None, original: PlanStep | None) -> PlanStep | None:
+    if step is None:
+        return None
+    data = step.model_dump()
+    same_action = original is not None and original.action == step.action
+    for field, source_field in _VERIFIED_SOURCE_FIELDS:
+        source = getattr(original, source_field, None) if same_action else None
+        preserved = (
+            source is not None
+            and getattr(original, field) == getattr(step, field)
+            and (field != "recipient_address" or original.named_recipient == step.named_recipient)
+        )
+        data[source_field] = source.model_dump() if preserved else None
+    return PlanStep.model_validate(data)
+
+
+def _operator_facts(proposal: PlanProposal, original: PlanProposal | None) -> PlanProposal:
+    reconciled = PlanProposal(
+        primary=_retain_verified_source(proposal.primary, original.primary if original else None),
+        fallback=_retain_verified_source(proposal.fallback, original.fallback if original else None),
+        customer_statements=[],
+        notes=proposal.notes,
+        confidence={},
+    )
+    return PlanProposal.model_validate(_facts(reconciled))
 
 
 def operator_summary(db: Session, session_id: str) -> dict:
@@ -205,7 +267,13 @@ def revise(session_id: str, request: OperatorRevision, db: SessionDep):
         db.expire_all()
         calls = CallService(db)
         call = _pending(calls, session_id, request.expected_proposal_id)
-        proposal = PlanProposal.model_validate(_facts(request.proposal))
+        original_record = db.get(PlanProposalRecord, call.current_proposal_id)
+        original = (
+            PlanProposal.model_validate_json(original_record.proposal_json)
+            if original_record
+            else None
+        )
+        proposal = _operator_facts(request.proposal, original)
         order = calls._order(call.order_id)
         slots = db.exec(select(DeliverySlot).where(DeliverySlot.order_id == order.id)).all()
         verdict = validate_plan(proposal, order, list(slots))

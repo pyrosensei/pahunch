@@ -35,6 +35,7 @@ export const planner = {
   model: 'mock-planner', action: 'RESPOND', confidence: 0.95, latency_ms: 20,
   prompt_tokens: 100, completion_tokens: 10, degraded: false, error_code: null,
   response_language: 'en-IN', wording_source: 'model', fallback_reason: null,
+  review_needed: false, missing_fields: [], language_warning: null, awaiting_continuation: false,
 };
 
 export async function mockApi(page: Page, options: {
@@ -53,6 +54,8 @@ export async function mockApi(page: Page, options: {
     requests.push({ method, path, body });
     const fulfill = (json: unknown, status = 200) => route.fulfill({ status, json });
     if (options.failure) return fulfill({ detail: 'Demo backend unavailable' }, 503);
+    if (path === '/api/operator/access') return fulfill({ authorized: true });
+    if (path.endsWith('/courier-instructions')) return fulfill(null);
     if (path === '/api/catalog') return fulfill(catalog);
     if (path === '/api/orders' && method === 'POST') {
       const input = body as { payment_mode: string; product_id?: string; parcel_type?: string };

@@ -1,3 +1,4 @@
+import unicodedata
 from datetime import UTC, datetime, time, timedelta, timezone
 
 from app.models import DeliverySlot, Order, PaymentMode
@@ -14,6 +15,20 @@ from app.schemas import (
 HIGH_VALUE_THRESHOLD_INR = 25_000
 IST = timezone(timedelta(hours=5, minutes=30))
 THIRD_PARTY_ACTIONS = {PlanAction.LEAVE_WITH_SECURITY, PlanAction.LEAVE_WITH_NEIGHBOR}
+
+# Bare proximity does not identify premises. This validates an extracted
+# location; the planner still interprets the customer's full instructions.
+_VAGUE_LOCATIONS = {
+    "nearby", "near", "next door", "nextdoor", "beside me", "next to me",
+    "near my house", "same building", "neighbour", "neighbor", "not known", "unknown",
+    "बगल में", "बगल वाले", "पास में", "पास ही", "पास", "मेरे बगल में",
+    "bagal mein", "bagal me", "bagal wale", "paas mein", "paas me", "paas hi",
+}
+
+
+def usable_recipient_location(value: str | None) -> bool:
+    normalized = " ".join(unicodedata.normalize("NFKC", value or "").casefold().split()).strip(" .,!?;।")
+    return bool(normalized) and normalized not in _VAGUE_LOCATIONS
 
 
 def _utc(value: datetime) -> datetime:
@@ -171,6 +186,12 @@ def validate_plan(
                         path=path,
                     )
                 )
+            if not usable_recipient_location(step.recipient_address):
+                violations.append(PolicyViolation(
+                    code=ViolationCode.RECIPIENT_LOCATION_REQUIRED,
+                    message="A neighbour handoff requires a house/flat number or clear finding instructions.",
+                    path=path,
+                ))
 
     return PolicyVerdict(
         valid=not violations,

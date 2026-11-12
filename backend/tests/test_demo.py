@@ -8,6 +8,7 @@ from app.db import get_session
 from app.dialer import Dialer
 from app.main import create_app
 from app.models import DialerEvent, Order
+from app.operator import require_operator_key
 from app.seed import seed_database
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
@@ -46,6 +47,7 @@ def demo(tmp_path, scripted_llm):
         with Session(engine) as db:
             yield db
 
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = sessions
     with TestClient(app) as client:
         yield client, dialer, engine
@@ -210,3 +212,38 @@ def test_dashboard_redacts_legacy_transcript_and_supports_cursor(demo):
     assert "[redacted]" in response.text
     cursor = response.json()[0]["id"]
     assert client.get(f"/api/sessions/{sid}/turns?after_id={cursor}").json() == []
+
+
+def test_dispatch_requires_operator_access_and_out_for_delivery(demo, monkeypatch):
+    from types import SimpleNamespace
+
+    from app import operator
+    client, _, _ = demo
+    client.app.dependency_overrides.pop(require_operator_key)
+    monkeypatch.setattr(operator, "settings", SimpleNamespace(operator_api_token="demo-test-key"))
+    order = client.post("/api/orders", json={"product_id": "backpack", "payment_mode": "PREPAID"}).json()
+    ready = f"/api/orders/{order['id']}/out-for-delivery"
+    prepare = f"/api/orders/{order['id']}/call"
+    assert client.post(ready).status_code == 401
+    assert client.post(prepare).status_code == 401
+    headers = {"X-Operator-Token": "demo-test-key"}
+    assert client.post(prepare, headers=headers).status_code == 409
+    assert client.post(ready, headers=headers).status_code == 200
+    assert client.post(prepare, headers=headers).status_code == 201
+    assert client.post(prepare, headers=headers).status_code == 409
+    assert client.get(f"/api/orders/{order['id']}/courier-instructions").status_code == 401
+    assert client.get(f"/api/orders/{order['id']}/courier-instructions", headers=headers).json() is None
+    listed = client.get('/api/orders?catalog_only=true').json()
+    assert [item['id'] for item in listed] == [order['id']]
+
+
+def test_recent_order_limit_preserves_the_legacy_unbounded_listing(demo):
+    client, _, _ = demo
+    first = client.post('/api/orders',json={'product_id':'backpack','payment_mode':'PREPAID'}).json()
+    second = client.post('/api/orders',json={'product_id':'watch','payment_mode':'PREPAID'}).json()
+    limited = client.get('/api/orders?catalog_only=true&limit=1').json()
+    assert [item['id'] for item in limited]==[second['id']]
+    all_orders = client.get('/api/orders').json()
+    assert first['id'] in [item['id'] for item in all_orders]
+    assert all_orders[0]['id'] < all_orders[-1]['id']
+    assert client.get('/api/orders?limit=0').status_code==422

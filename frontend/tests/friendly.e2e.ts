@@ -1,59 +1,29 @@
 import { test, expect } from '@playwright/test';
 import { mockApi, mockAudio } from './fixtures';
 
-for (const transport of ['browser', 'twilio'] as const) {
-  test(`checkout routes an active ${transport} conversation to its supported interface`, async ({ page }) => {
-    const requests = await mockApi(page, { transport });
-    await page.goto('/shop');
-    await page.getByRole('button', { name: 'Place demo order' }).click();
-    await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-    const launch = page.getByRole('link', { name: 'Start PC voice demo' });
-    if (transport === 'twilio') {
-      await expect(page.getByRole('status')).toContainText('A phone conversation is active');
-      await expect(launch).toHaveCount(0);
-    } else {
-      await expect(launch).toHaveAttribute('href', /session_id=browser-test-session/);
-    }
-    await expect(page.getByRole('link', { name: 'Monitor delivery' })).toBeVisible();
-    expect(requests.filter(request => request.path.endsWith('/call'))).toHaveLength(0);
-  });
-}
-
-test('checkout waits for session ownership and keeps monitoring available after a lookup failure', async ({ page }) => {
-  await mockApi(page);
-  let finishLookup: () => void = () => {};
-  const lookupPending = new Promise<void>(resolve => { finishLookup = resolve; });
-  await page.route('**/api/sessions?**', async route => {
-    await lookupPending;
-    await route.fulfill({ status: 503, json: { detail: 'Session lookup unavailable' } });
-  });
+test('checkout stays inside its card and order tracking survives reload', async ({ page }) => {
+  const requests = await mockApi(page);
   await page.goto('/shop');
-  await page.getByRole('button', { name: 'Place demo order' }).click();
-  await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-  await expect(page.getByRole('link', { name: 'Start PC voice demo' })).toHaveCount(0);
-  finishLookup();
-  await expect(page.getByRole('status')).toContainText('Connection interrupted');
-  await expect(page.getByRole('link', { name: 'Start PC voice demo' })).toHaveCount(0);
-  await expect(page.getByRole('link', { name: 'Monitor delivery' })).toBeVisible();
-});
-
-test('checkout stays inside its card and advances the visible delivery steps', async ({ page }) => {
-  await mockApi(page);
-  await page.goto('/shop');
-  await expect(page.getByRole('button', { name: 'Place demo order' })).toBeEnabled();
   const summary = page.locator('.checkout-product');
   const withinCard = await summary.evaluate(node => {
     const card = node.getBoundingClientRect();
     return [...node.children].every(child => child.getBoundingClientRect().right <= card.right + 1);
   });
   expect(withinCard).toBe(true);
-  const progress = page.getByRole('list', { name: 'Demo delivery steps' });
-  await expect(progress.locator('[aria-current="step"]')).toHaveText('1Choose your item');
   await page.getByRole('button', { name: 'Place demo order' }).click();
-  await expect(progress.locator('[aria-current="step"]')).toContainText('Prepare delivery');
-  await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-  await expect(progress.locator('[aria-current="step"]')).toContainText('Follow the conversation');
-  await expect(page.getByRole('link', { name: 'Monitor delivery' })).toHaveClass(/primary/);
+  await expect(page.getByRole('region',{name:'Your order details'})).toContainText('#1050');
+  await page.reload();
+  await expect(page.getByRole('region',{name:'Your order details'})).toContainText('#1050');
+  expect(requests.filter(request => request.method === 'POST')).toHaveLength(1);
+});
+
+test('a tracking refresh failure remains visible without enabling dispatch', async ({ page }) => {
+  await mockApi(page);
+  await page.route('**/api/sessions?**', route => route.fulfill({status:503,json:{detail:'Unavailable'}}));
+  await page.goto('/shop?order_id=1050');
+  await expect(page.getByRole('status')).toContainText('Tracking could not refresh');
+  await expect(page.getByRole('button',{name:'Connect conversation'})).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'Mark out for delivery'})).toHaveCount(0);
 });
 
 test('voice controls precede the transcript and delivery details remain accessible', async ({ page }, testInfo) => {

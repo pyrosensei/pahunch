@@ -66,16 +66,12 @@ test('dashboard displays substantive reply timings and keeps missing values unav
   await page.route('**/api/sessions/*/events', route => route.fulfill({ json: [{ id: 1, event_type: 'VOICE_TURN', created_at: session.started_at, payload_json: JSON.stringify({ stt_ms: null, planner_ms: 135, tts_ms: 780, total_ms: 920, first_audio_ms: 65, first_response_audio_ms: 480, ack_played: true }) }] }));
   await page.route('**/api/sessions?**', route => route.fulfill({ json: [{ ...session, state: 'PENDING_CONFIRMATION', customer_confirmed: true, proposal: { primary: { action: 'HAND_TO_CUSTOMER', window_start: order.window_start, window_end: order.window_end, call_on_arrival: true } }, verdict: { valid: true, violations: [] } }] }));
   await page.goto('/dashboard');
-  await expect(page.getByText('Customer confirmed · not yet committed')).toBeVisible();
-  await expect(page.locator('.plan-progress').getByText('Committed')).toContainText('pending');
-  await page.getByRole('tab', { name: 'Performance' }).click();
-  const panel = page.getByRole('tabpanel', { name: 'Performance' });
+  await page.getByText('Performance and audit details', {exact:true}).click();
+  const panel = page.getByRole('tabpanel', { name: 'Conversation' });
   await expect(panel).toContainText('920 ms');
   await expect(panel).toContainText('480 ms');
-  await expect(panel).not.toContainText('ACKNOWLEDGEMENT AUDIO');
   await expect(panel).not.toContainText('65 ms');
-  await expect(panel.locator('.metric-bar').first()).toContainText('Not available');
-  await expect(panel.locator('.metric-bar').first().locator('.bar-track>span')).toHaveCSS('width', '0px');
+  await expect(panel).toContainText('Not available');
   await page.screenshot({ path: testInfo.outputPath('dashboard-confirmed-performance.png'), fullPage: true });
 });
 

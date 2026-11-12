@@ -34,6 +34,13 @@ async function mockConversation(page: Page) {
   return { sent, connections: () => connected, closed: () => closed };
 }
 
+async function openKeyboardFallback(page: Page) {
+  const details = page.locator('details.voice-keyboard-fallback');
+  if (!(await details.evaluate(node => node.hasAttribute('open')))) {
+    await details.locator('summary').click();
+  }
+}
+
 test('landing works without WebGL, respects reduced motion, and exposes keyboard navigation', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.addInitScript(() => {
@@ -44,7 +51,7 @@ test('landing works without WebGL, respects reduced motion, and exposes keyboard
     } as typeof original;
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('Your delivery.');
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('A delivery conversation.');
   await expect(page.getByRole('link', { name: 'Try a delivery' }).first()).toBeVisible();
   await expect(page.locator('canvas')).toHaveCount(0);
   await expect(page.getByLabel('Parcel illustration')).toBeVisible();
@@ -89,6 +96,7 @@ test('voice connects only on request and saves a plan only after backend confirm
     tts_sample_rate: 16000, playback_tracking: true, audio_feedback: true,
   });
   await expect(page.locator('canvas')).toHaveCount(0);
+  await openKeyboardFallback(page);
   await page.getByRole('textbox', { name: 'Your reply' }).fill('Please hand the parcel directly to me.');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect(page.getByRole('log')).toContainText('May I take this plan forward?');
@@ -119,37 +127,22 @@ test('SwiftCart product selection derives delivery verification from payment wit
   await page.getByRole('button', { name: 'Cash on delivery', exact: true }).click();
   await expect(page.getByText('No OTP required', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Choose Airbook 14 Laptop' }).click();
-  await expect(page.getByText(/Extra care for this laptop: direct handoff/)).toBeVisible();
+  await expect(page.getByText(/This laptop requires direct handoff/)).toBeVisible();
 });
 
-test('SwiftCart creates only fixed demo choices and readiness leads to the selected conversation', async ({ page }) => {
+test('SwiftCart checkout keeps dispatch and operator controls out of the customer page', async ({ page }) => {
   const requests = await mockApi(page);
-  await mockAudio(page);
-  const wire = await mockConversation(page);
   await page.goto('/shop');
   await page.getByRole('button', { name: 'Choose Airbook 14 Laptop' }).click();
   await page.getByRole('button', { name: 'Prepaid', exact: true }).click();
-  await expect(page.getByRole('checkbox')).toHaveCount(0);
-  await expect(page.getByText('OTP required at delivery',{exact:true})).toBeVisible();
   await page.getByRole('button', { name: 'Place demo order' }).click();
-  await expect(page.getByRole('heading', { name: 'One step closer.' })).toBeVisible();
-  expect(requests.filter(request => request.path.endsWith('/out-for-delivery'))).toHaveLength(0);
-  expect(requests.find(request => request.path === '/api/orders' && request.method === 'POST')?.body).toEqual({
-    payment_mode: 'PREPAID', product_id: 'laptop',
-  });
-  await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-  await expect(page.getByRole('link', { name: 'Open conversation' })).toHaveCount(0);
-  await page.getByRole('link', { name: 'Monitor delivery' }).click();
-  await expect(page).toHaveURL(new RegExp(`/dashboard\\?order_id=${order.id}$`));
-  await expect(page.getByRole('heading', { level: 1 })).toContainText('Delivery operations');
-  const customerLink = page.getByRole('link', { name: 'Start customer voice demo', exact: true });
-  await expect(customerLink).toHaveAttribute('target', '_blank');
-  await page.goto((await customerLink.getAttribute('href'))!);
-  await expect(page).toHaveURL(new RegExp(`/voice\\?session_id=${session.id}&order_id=${order.id}&pc_demo=1$`));
-  expect(wire.connections()).toBe(0);
-  await page.getByRole('button', { name: 'Connect conversation' }).click();
-  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
-  expect(wire.connections()).toBe(1);
+  await expect(page).toHaveURL(new RegExp(`/shop\\?order_id=${order.id}$`));
+  await expect(page.getByRole('heading', { name: 'We’re getting your order ready.' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Mark out for delivery' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Connect conversation' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Dashboard', exact: true })).toHaveCount(0);
+  expect(requests.find(request => request.path === '/api/orders' && request.method === 'POST')?.body).toEqual({payment_mode:'PREPAID',product_id:'laptop'});
+  expect(requests.some(request => request.path.endsWith('/call') || request.path.endsWith('/out-for-delivery'))).toBe(false);
 });
 
 test('checkout failure has an actionable error without order success', async ({ page }) => {
@@ -162,29 +155,27 @@ test('checkout failure has an actionable error without order success', async ({ 
   await expect(page.getByRole('button', { name: 'Mark out for delivery' })).toHaveCount(0);
 });
 
-test('a phone-owned ready session stays on the dashboard instead of offering browser voice', async ({ page }) => {
+test('a phone-owned session never opens a browser customer socket', async ({ page }) => {
   await mockApi(page, { transport: 'twilio' });
   await page.goto('/shop');
   await page.getByRole('button', { name: 'Place demo order' }).click();
-  await page.getByRole('button', { name: 'Mark out for delivery' }).click();
-  await expect(page.getByRole('status')).toContainText('A phone conversation is active');
+  await expect(page.getByRole('button', { name: 'Connect conversation' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Start PC voice demo' })).toHaveCount(0);
-  await expect(page.getByRole('link', { name: 'Monitor delivery' })).toBeVisible();
 });
 
 test('dashboard escapes transcript markup and preserves data with a stale warning on refresh failure', async ({ page }) => {
   const options = { failure: false, transcript: '<img src=x onerror="alert(1)"> A safe text transcript.' };
   await mockApi(page, options);
   await page.goto('/dashboard');
-  const transcript = page.getByRole('tabpanel', { name: 'Transcript', exact: true });
+  const transcript = page.getByRole('tabpanel', { name: 'Conversation', exact: true });
   await expect(transcript).toContainText(options.transcript);
   await expect(transcript.locator('img')).toHaveCount(0);
   await transcript.getByText('Response details').click();
-  await expect(transcript).toContainText('Wording: model');
+  await expect(transcript).toContainText('Wording: Model');
   options.failure = true;
   await page.getByRole('button', { name: /^Updated / }).click();
   await expect(page.getByRole('alert')).toContainText(/stale/i);
-  await expect(page.getByRole('heading', { name: 'Delivery operations.' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   await expect(page.getByRole('button', { name: /Order #1050/ })).toBeVisible();
   await expect(transcript).toContainText(options.transcript);
 });
@@ -202,6 +193,7 @@ test('denied microphone keeps typed replies available and never displays unredac
   await page.getByRole('button', { name: 'Connect conversation' }).click();
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect(page.getByRole('alert')).toContainText(/microphone access is unavailable/i);
+  await openKeyboardFallback(page);
   await page.getByRole('textbox', { name: 'Your reply' }).fill('My OTP is 123456');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect(page.getByRole('textbox', { name: 'Your reply' })).toHaveValue('');
@@ -228,7 +220,7 @@ test('leaving the voice route closes the socket and releases microphone tracks',
   await page.getByRole('button', { name: 'Start microphone' }).click();
   await expect(page.getByRole('button', { name: 'Stop microphone' })).toBeVisible();
   await expect(page.locator('canvas')).toHaveCount(0);
-  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('link', { name: 'Dashboard', exact: true }).click();
+  await page.getByRole('link', { name: 'SwiftCart shop', exact: true }).click();
   await expect.poll(() => wire.closed()).toBe(1);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __micCounters: { stops: number } }).__micCounters.stops)).toBe(1);
 });

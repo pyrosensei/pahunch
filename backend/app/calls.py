@@ -29,6 +29,7 @@ from app.models import (
 )
 from app.policy import HIGH_VALUE_THRESHOLD_INR, _utc, validate_plan
 from app.schemas import (
+    SLOT_ACTIONS,
     CommitResult,
     CourierCard,
     CustomerTurnRequest,
@@ -161,9 +162,9 @@ class CallService:
             < CALL_COOLDOWN
         ):
             return "COOLDOWN"
+        if order.status != OrderStatus.OUT_FOR_DELIVERY:
+            return "NOT_OUT_FOR_DELIVERY"
         if automatic:
-            if order.status != OrderStatus.OUT_FOR_DELIVERY:
-                return "NOT_OUT_FOR_DELIVERY"
             if self._trigger_reason(order) == "DELIVERY_CONFIRMATION":
                 return "NO_RISK_TRIGGER"
             if _utc(order.window_end) <= _utc(order.window_start):
@@ -213,6 +214,7 @@ class CallService:
                     "ATTEMPT_LIMIT": "Call attempt limit reached",
                     "COOLDOWN": "Call cooldown is active",
                     "CAPACITY": "Demo call capacity is occupied",
+                    "NOT_OUT_FOR_DELIVERY": "An operator must mark this order out for delivery before preparing a conversation",
                 }.get(reason, reason)
                 raise DomainError(409, detail)
             now = self.clock()
@@ -348,7 +350,7 @@ class CallService:
 
     @_call_mutation
     def submit_turn(
-        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False
+        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False, clarification_key: str = "other"
     ) -> TurnResult:
         call = self.get_call(session_id)
         if call.state in TERMINAL_STATES:
@@ -388,10 +390,16 @@ class CallService:
             self._escalate(call, request.escalation_reason)
         else:
             if clarification:
+                previous = self.db.exec(select(AuditEvent).where(
+                    AuditEvent.session_id == call.id,
+                    AuditEvent.event_type == "CLARIFICATION_REQUESTED",
+                ).order_by(AuditEvent.id.desc())).first()
+                if previous and json.loads(previous.payload_json).get("key", "other") != clarification_key:
+                    call.clarification_count = 0
                 call.clarification_count += 1
-                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count})
+                self._audit(call.id, "CLARIFICATION_REQUESTED", {"count": call.clarification_count, "key": clarification_key})
                 if call.clarification_count > MAX_CLARIFICATIONS:
-                    self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
+                    self._audit(call.id, "CLARIFICATION_REVIEW_NEEDED", {"count": call.clarification_count, "key": clarification_key})
             if request.proposal is not None:
                 require_tool(call.state, ToolName.PROPOSE_PLAN)
                 order = self._order(call.order_id)
@@ -401,11 +409,18 @@ class CallService:
                     ).all()
                 )
                 verdict = validate_plan(request.proposal, order, slots)
+                source_ids = {turn.id}
+                for step in (request.proposal.primary, request.proposal.fallback):
+                    if step is None:
+                        continue
+                    for evidence in (step.recipient_source, step.recipient_address_source):
+                        if evidence is not None and evidence.turn_id is not None:
+                            source_ids.add(evidence.turn_id)
                 proposal_record = PlanProposalRecord(
                     id=uuid4().hex,
                     session_id=call.id,
                     proposal_json=request.proposal.model_dump_json(),
-                    source_turn_ids_json=json.dumps([turn.id]),
+                    source_turn_ids_json=json.dumps(sorted(source_ids)),
                     created_at=self.clock(),
                 )
                 self.db.add(proposal_record)
@@ -433,13 +448,14 @@ class CallService:
                 )
 
                 if verdict.valid:
+                    call.clarification_count = 0
                     if call.state != CallState.PENDING_CONFIRMATION:
                         self._transition(call, CallState.PENDING_CONFIRMATION)
                 else:
                     call.clarification_count += 1
                     if call.clarification_count > MAX_CLARIFICATIONS:
-                        self._escalate(call, "CLARIFICATION_LIMIT_EXCEEDED")
-                    elif call.state != CallState.NEGOTIATION:
+                        self._audit(call.id, "CLARIFICATION_REVIEW_NEEDED", {"count": call.clarification_count})
+                    if call.state != CallState.NEGOTIATION:
                         self._transition(call, CallState.NEGOTIATION)
 
             if request.confirmation:
@@ -447,6 +463,11 @@ class CallService:
                     raise DomainError(409, "No valid plan is awaiting confirmation")
                 if not self._decision(call.current_proposal_id).valid:
                     raise DomainError(409, "An invalid plan cannot be confirmed")
+                record = self.db.get(PlanProposalRecord, call.current_proposal_id)
+                order = self._order(call.order_id)
+                slots = list(self.db.exec(select(DeliverySlot).where(DeliverySlot.order_id == order.id)).all())
+                if record is None or not validate_plan(PlanProposal.model_validate_json(record.proposal_json), order, slots).valid:
+                    raise DomainError(409, "The current plan needs updated delivery details before confirmation")
                 call.customer_confirmed = True
                 self._audit(call.id, "CUSTOMER_CONFIRMED")
 
@@ -521,7 +542,12 @@ class CallService:
             committed_at=now,
         )
         self.db.add(commit)
-        if proposal.primary.action == PlanAction.RESCHEDULE:
+        primary = proposal.primary
+        if primary.action in SLOT_ACTIONS and (
+            primary.action == PlanAction.RESCHEDULE
+            or _utc(primary.window_start) != _utc(order.window_start)
+            or _utc(primary.window_end) != _utc(order.window_end)
+        ):
             order.status = OrderStatus.RESCHEDULED
             order.window_start = proposal.primary.window_start
             order.window_end = proposal.primary.window_end
@@ -548,7 +574,7 @@ class CallService:
         instructions = {
             PlanAction.HAND_TO_CUSTOMER: "Direct handoff to customer",
             PlanAction.LEAVE_WITH_SECURITY: "Leave with building security",
-            PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {primary.named_recipient}",
+            PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {primary.named_recipient}" + (f", {primary.recipient_address}" if primary.recipient_address else ""),
             PlanAction.RESCHEDULE: "Delivery rescheduled to the confirmed window",
             PlanAction.RETRY_AFTER_DELAY: "Retry after the confirmed delay",
             PlanAction.ESCALATE_TO_HUMAN: "Human review required",
@@ -571,7 +597,7 @@ class CallService:
                 fallback_instruction = {
                     PlanAction.HAND_TO_CUSTOMER: "Direct handoff to customer",
                     PlanAction.LEAVE_WITH_SECURITY: "Leave with building security",
-                    PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {fallback.named_recipient}",
+                    PlanAction.LEAVE_WITH_NEIGHBOR: f"Leave with neighbour: {fallback.named_recipient}" + (f", {fallback.recipient_address}" if fallback.recipient_address else ""),
                     PlanAction.RESCHEDULE: "Deliver in the confirmed fallback window",
                     PlanAction.ESCALATE_TO_HUMAN: "Human review required",
                 }[fallback.action]
@@ -584,6 +610,8 @@ class CallService:
             window_start=primary.window_start,
             window_end=primary.window_end,
             call_on_arrival=primary.call_on_arrival,
+            named_recipient=primary.named_recipient,
+            recipient_address=primary.recipient_address,
             instructions=lines,
             generated_at=now,
         )

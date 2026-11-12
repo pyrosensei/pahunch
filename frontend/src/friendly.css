@@ -155,9 +155,22 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .transcript-turn.agent>p { background:#e4f2e7; }
 #root .conversation-empty p { font-size:15px; }
 #root .conversation-empty>span:last-child { font-size:12px; }
+#root .turn-meta { font-size:12px; line-height:1.7; }
+#root .turn-meta>summary { cursor:pointer; min-height:44px; padding:10px 0; font-weight:600; }
+#root .turn-meta span { display:block; overflow-wrap:anywhere; }
+#root .turn-meta code { font-family:var(--mono); font-size:11px; }
+#root .review-needed { color:#275b42; font-weight:700; }
+#root .turn-error { color:#934321; }
+#root .language-warning { color:var(--muted); }
 #root :where(.operator-actions button,.operator-policy,.operator-policy p,.operator-decision-status,.operator-consent-note,.operator-action-note,.operator-empty-copy,.operator-edit-form>p,.operator-edit-form>.button,.operator-step-fields select,.operator-checkbox) { font-size:13px!important; line-height:1.7; }
 #root .operator-actions button { border-radius:12px; min-height:44px; }
 #root :where(.operator-facts dt,.operator-facts dd,.readable-plan dt,.readable-plan dd,.readable-plan h3,.readable-plan ul,.plan-details dt,.plan-details dd) { font-size:14px; }
+#root .plan-source { margin:12px 0; color:var(--muted); }
+#root .plan-source>summary { cursor:pointer; min-height:44px; padding:10px 0; font-size:13px; font-weight:700; color:#46634f; }
+#root .plan-source dl { margin:8px 0 0; padding:12px 14px; background:#f6f7f1; border:1px solid var(--line); border-radius:8px; }
+#root .plan-source dt { margin:0 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+#root .plan-source dd { margin:0 0 10px; font-size:13px; line-height:1.7; color:var(--ink); overflow-wrap:anywhere; }
+#root .plan-source dd:last-child { margin-bottom:0; }
 #root .plan-progress { gap:8px; }
 #root .operator-outcomes>.panel { padding:22px; }
 #root .operator-outcomes>.panel:first-child { background:#e4f2e7; border-top:5px solid #86b69b; }
@@ -379,6 +392,7 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .editorial-platform h2 { color: #f6f4eb; }
 #root .editorial-platform .platform-copy > p { color: #d1dfd4; }
 #root .editorial-platform .eyebrow, #root .editorial-platform .text-link { color: #edd5b1; }
+#root .editorial-platform .serif-word { color: #edd5b1; }
 #root .dispatch-preview { border-radius:12px; overflow:hidden; background: #fff; color: var(--ink); box-shadow: 0 12px 40px #0002; }
 #root .dispatch-header h1 { font-size:36px; font-weight:700; font-weight: 700; letter-spacing: -.045em; }
 #root .dispatch-ledger { padding:16px 20px; border:0; border-radius:18px; background:#e6f1e5; gap:16px; background: #193b32; color: #f6f4eb; border: 0; border-radius: 10px; padding: 20px 24px; }

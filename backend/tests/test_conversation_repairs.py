@@ -33,7 +33,8 @@ def test_spoken_english_clock_uses_full_month_and_twelve_hour_time(source):
     result = spoken_text(source, "en-IN")
     assert "two November" in result
     assert "six fifty two in the evening to eight fifty two in the evening" in result
-    assert "Indian Standard Time" in result
+    assert "Indian Standard Time" not in result
+    assert "IST" not in result
 
 
 def test_spoken_dates_do_not_rewrite_house_or_order_identifiers():
@@ -83,6 +84,7 @@ def test_neighbour_with_otp_requires_courier_verification_and_confirmation(db, s
     proposal = valid_proposal()
     proposal["primary"]["action"] = "LEAVE_WITH_NEIGHBOR"
     proposal["primary"]["named_recipient"] = name
+    proposal["primary"]["recipient_address"] = "404"
     llm = scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)])
     planner = PlannerService(db, llm)
     call = start_call(planner.calls)
@@ -100,8 +102,9 @@ def test_order_and_delivery_date_question_uses_actual_creation_record(db):
     db.add(DialerEvent(order_id=1042, event_type="ORDER_CREATED", reason="Demo order", payload_json="{}", created_at=datetime(2026, 11, 2, 12, 0, tzinfo=UTC)))
     db.commit()
     result = run(planner, call.id, "मैंने अभी order किया, order और delivery date अलग होगी ना?")
-    assert "02 November 17:30 IST" in result.agent_message
-    assert "05 November" in result.agent_message
+    assert "02 November, 5:30 PM" in result.agent_message
+    assert "05 November, 6 PM-8 PM" in result.agent_message
+    assert "IST" not in result.agent_message
     assert "alag hain" in result.agent_message
     assert result.planner.response_language == "hi-en"
     assert result.planner.fallback_reason == "ORDER_DATE_QUESTION"
@@ -111,7 +114,7 @@ def test_combined_date_and_time_question_returns_both_without_generic_apology(db
     planner = PlannerService(db, NoModel())
     call = start_call(planner.calls)
     result = run(planner, call.id, "मुझे मेरा date बताइए time")
-    assert "5 नवंबर" in result.agent_message and "18:00-20:00" in result.agent_message
+    assert "5 नवंबर" in result.agent_message and "शाम 6" in result.agent_message and "रात 8" in result.agent_message
     assert "क्षमा" not in result.agent_message
 
 
@@ -121,7 +124,7 @@ def test_valid_model_wrapper_does_not_emit_understanding_filler(db, scripted_llm
     result = run(planner, call.id, "Please hand the parcel directly to me")
     assert result.turn.verdict.valid
     assert "Understood" not in result.agent_message
-    assert "18:00" in result.agent_message
+    assert "6 PM" in result.agent_message and "8 PM" in result.agent_message
 
 
 def test_new_order_tomorrow_is_relative_to_actual_call_day_not_delivery_day(db):
@@ -148,8 +151,8 @@ def test_translated_neighbour_address_still_explains_otp_policy_without_saving_n
     call = start_call(planner.calls)
     result = run(planner, call.id, "मेरे पड़ोसी शर्मा जी house number चार सौ चार में रहते हैं। उन्हें दे दीजिए। OTP चाहिए तो मुझे call कर दीजिए।")
     assert result.planner.error_code == "UNGROUNDED_PLAN_TEXT"
-    assert result.planner.fallback_reason == "UNGROUNDED_PLAN_TEXT"
-    assert result.planner.action == PlannerAction.RESPOND
+    assert result.planner.fallback_reason == "RECIPIENT_SOURCE_REQUIRED"
+    assert result.planner.action == PlannerAction.ASK_CLARIFICATION
     assert "404" not in result.agent_message
     assert result.turn.verdict is None
     assert not planner.calls.get_call(call.id).current_proposal_id
@@ -167,7 +170,7 @@ def test_ungrounded_recipient_never_becomes_a_plan_when_neighbour_drop_is_allowe
     planner = PlannerService(db, scripted_llm([decision(PlannerAction.PROPOSE_PLAN, "{plan_summary} {confirmation_question}", proposal=proposal)]))
     call = start_call(planner.calls)
     result = run(planner, call.id, "मेरे पड़ोसी को दे दीजिए")
-    assert result.planner.fallback_reason == "UNGROUNDED_PLAN_TEXT"
+    assert result.planner.fallback_reason == "RECIPIENT_SOURCE_REQUIRED"
     assert result.turn.verdict is None
     assert not planner.calls.get_call(call.id).current_proposal_id
     assert "invented" not in result.agent_message

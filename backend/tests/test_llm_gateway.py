@@ -11,15 +11,17 @@ from test_planner import start_call, valid_proposal
 from app.config import Settings
 from app.errors import DomainError
 from app.llm import (
+    GeminiClient,
     LLMGatewayError,
     LLMResponseError,
+    LLMStructuredOutputError,
     LLMTimeoutError,
     OpenAICompatibleClient,
     build_llm_client,
     make_strict_json_schema,
 )
 from app.models import Order
-from app.planner import PlannerService, _planner_schema
+from app.planner import PLANNER_OUTPUT_SHAPE, PlannerService, _planner_schema
 from app.schemas import AgentTurnRequest, PlannerDecision
 
 db = planner_database
@@ -158,6 +160,137 @@ def test_http_and_malformed_provider_errors_are_mapped():
         )
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "expected_type", "expected_category"),
+    [
+        (400, "json_validate_failed", LLMStructuredOutputError, "structured_output"),
+        (400, "invalid_request_error", LLMResponseError, "invalid_request"),
+        (401, "authentication_error", LLMResponseError, "access"),
+        (403, "permission_error", LLMResponseError, "access"),
+        (402, "payment_required", LLMResponseError, "billing"),
+        (429, "rate_limit_exceeded", LLMResponseError, "rate_limit"),
+        (503, "service_unavailable", LLMResponseError, "provider"),
+    ],
+)
+def test_provider_http_failures_are_classified(status, code, expected_type, expected_category):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"code": code, "message": "synthetic failure"}})
+
+    client = make_client(handler)
+    with pytest.raises(expected_type) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    assert raised.value.status_code == status
+    assert raised.value.category == expected_category
+    if expected_type is not LLMStructuredOutputError:
+        assert not isinstance(raised.value, LLMStructuredOutputError)
+
+
+def test_json_validate_failed_detail_is_bounded_and_sanitized():
+    raw = (
+        "Generated JSON does not match the expected schema. See 'failed_generation' for details. "
+        "Error: jsonschema: '' does not validate with /required: missing properties: "
+        "'awaiting_continuation', 'request_details', 'missing_fields'. "
+        "Untrusted diagnostic: <script>alert('x')</script>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"code": "json_validate_failed", "message": raw}})
+
+    client = make_client(handler)
+    with pytest.raises(LLMStructuredOutputError) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    detail = raised.value.detail
+    assert detail == "missing required fields: awaiting_continuation, request_details, missing_fields"
+    assert "failed_generation" not in detail
+    assert "script" not in detail
+    assert len(detail) <= 300
+
+
+def test_large_json_validate_failed_body_keeps_the_repair_category():
+    payload = {
+        "error": {
+            "code": "json_validate_failed",
+            "message": (
+                "Error: jsonschema: '' does not validate with /required: missing properties: "
+                "'awaiting_continuation', 'request_details'. " + "diagnostic padding " * 300
+            ),
+            "failed_generation": "untrusted generation " * 300,
+        }
+    }
+    assert len(json.dumps(payload)) > 2_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json=payload)
+
+    client = make_client(handler)
+    with pytest.raises(LLMStructuredOutputError) as raised:
+        asyncio.run(
+            client.complete_json(
+                system_prompt="system",
+                user_prompt="user",
+                schema_name="planner_decision",
+                schema={"type": "object"},
+            )
+        )
+    assert raised.value.category == "structured_output"
+    assert raised.value.detail == "missing required fields: awaiting_continuation, request_details"
+    assert "padding" not in raised.value.detail
+    assert "untrusted" not in raised.value.detail
+
+
+def test_prompt_examples_and_output_shape_match_provider_schema(db, scripted_llm):
+    planner = PlannerService(db, scripted_llm([]))
+    call = start_call(planner.calls)
+    order = planner._order(call.order_id)
+    slots = planner._slots(order.id)
+    schema = _planner_schema()
+    context = json.loads(planner._user_prompt(call, order, slots, AgentTurnRequest(text="Hello")))
+    required = set(schema["required"])
+    assert required == {
+        "action",
+        "awaiting_continuation",
+        "request_details",
+        "missing_fields",
+        "message",
+        "proposal",
+        "escalation_reason",
+        "confidence",
+    }
+    for field in required:
+        assert field in PLANNER_OUTPUT_SHAPE
+
+    proposal_schema = schema["$defs"]["PlanProposal"]["properties"]
+    step_schema = schema["$defs"]["PlanStep"]["properties"]
+    for example in context["decision_examples"]:
+        decision = example["decision"]
+        assert set(decision) == required
+        assert PlannerDecision.model_validate(decision)
+        proposal = decision.get("proposal")
+        if proposal is None:
+            continue
+        assert set(proposal) == set(proposal_schema)
+        for step in (proposal["primary"], proposal.get("fallback")):
+            if isinstance(step, dict):
+                assert set(step) == set(step_schema)
+                for field in ("window_start", "window_end"):
+                    if isinstance(step.get(field), str):
+                        assert step[field].endswith("+05:30")
+
+
 def test_strict_schema_requires_every_object_property():
     schema = make_strict_json_schema(PlannerDecision)
 
@@ -227,22 +360,60 @@ def test_groq_uses_low_reasoning_and_keeps_complete_plan_schema():
     asyncio.run(run())
 
 
-def test_builder_uses_only_groq_credentials():
+def test_openrouter_sends_the_free_gemma_model_with_strict_json_schema():
+    schema = _planner_schema()
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+        assert payload["model"] == "google/gemma-4-31b-it:free"
+        assert "reasoning_effort" not in payload
+        assert "max_completion_tokens" not in payload
+        assert payload["max_tokens"] == 1024
+        assert payload["response_format"]["json_schema"]["schema"] == schema
+        assert payload["response_format"]["json_schema"]["strict"] is True
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps({
+                "action": "RESPOND", "message": "Hello, how can I help?",
+                "proposal": None, "escalation_reason": None, "confidence": 0.95,
+            })}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30},
+        })
+
+    async def run():
+        client = OpenAICompatibleClient(
+            base_url="https://openrouter.ai/api/v1/",
+            api_key="test-or-key", model="google/gemma-4-31b-it:free",
+            provider="openrouter",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            result = await client.complete_json(system_prompt="system", user_prompt="Hello", schema_name="planner_decision", schema=schema)
+            assert PlannerDecision.model_validate_json(result.text).action.value == "RESPOND"
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_builder_uses_only_google_credentials():
     config = Settings(
-        _env_file=None, groq_api_key="test-groq-key", llm_api_key="test-old-key",
-        gemini_api_key="test-old-key",
+        _env_file=None, llm_provider="gemini", gemini_api_key="test-google-key",
+        llm_api_key="test-old-key", groq_api_key="test-old-key",
     )
     client = build_llm_client(config)
     assert client is not None
-    assert "test-groq-key" not in repr(config)
+    assert isinstance(client, GeminiClient)
+    assert "test-google-key" not in repr(config)
 
     def handler(request):
-        assert request.headers["authorization"] == "Bearer test-groq-key"
+        assert request.headers["x-goog-api-key"] == "test-google-key"
         payload = json.loads(request.content)
-        assert payload["reasoning_effort"] == "low"
-        assert payload["include_reasoning"] is False
-        assert "chat_template_kwargs" not in payload
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+        assert payload["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "minimal"
+        assert "reasoning_effort" not in payload
+        return httpx.Response(200, json={"candidates": [{
+            "finishReason": "STOP", "content": {"parts": [{"text": "{}"}]},
+        }]})
 
     client._pool._transport = httpx.MockTransport(handler)
 
@@ -255,32 +426,90 @@ def test_builder_uses_only_groq_credentials():
     asyncio.run(run())
 
 
-def test_missing_groq_key_does_not_fall_back_to_removed_credentials():
+def test_missing_google_key_does_not_fall_back_to_removed_credentials():
     config = Settings(
-        _env_file=None, groq_api_key="", llm_api_key="test-old-key",
-        gemini_api_key="test-old-key", nvidia_api_key="test-old-key",
+        _env_file=None, gemini_api_key="", llm_api_key="test-old-key",
+        groq_api_key="test-old-key", nvidia_api_key="test-old-key",
     )
     assert build_llm_client(config) is None
 
 
-@pytest.mark.parametrize("provider", ["nim", "gemini"])
+@pytest.mark.parametrize("provider", ["nim", "vertex", "local"])
 def test_removed_providers_are_rejected(provider):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, llm_provider=provider)
 
 
+@pytest.mark.parametrize("provider", ["groq", "openrouter", "ollama", "gemini"])
+def test_supported_providers_are_accepted(provider):
+    assert Settings(_env_file=None, llm_provider=provider).llm_provider == provider
+
+
+def test_each_provider_uses_only_its_own_key():
+    groq = Settings(_env_file=None, llm_provider="groq", groq_api_key="groq-key",
+                    gemini_api_key="google-key")
+    client = build_llm_client(groq)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._api_key == "groq-key"
+    assert Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key").llm_provider == "groq"
+
+
+def test_default_provider_is_gemini_with_its_own_defaults():
+    config = Settings(_env_file=None, gemini_api_key="google-key", openrouter_api_key="or-key")
+    assert config.llm_provider == "gemini"
+    client = build_llm_client(config)
+    assert isinstance(client, GeminiClient)
+    assert client._base_url == "https://generativelanguage.googleapis.com/v1beta"
+    assert client._model == "gemini-3.1-flash-lite"
+    assert client._api_key == "google-key"
+
+
+def test_openrouter_remains_selectable_with_its_own_defaults():
+    config = Settings(
+        _env_file=None,
+        llm_provider="openrouter",
+        openrouter_api_key="or-key",
+        gemini_api_key="google-key",
+    )
+    client = build_llm_client(config)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._base_url == "https://openrouter.ai/api/v1"
+    assert client._model == "google/gemma-4-31b-it:free"
+    assert client._api_key == "or-key"
+
+
+def test_ollama_remains_selectable_with_its_own_defaults():
+    config = Settings(
+        _env_file=None,
+        llm_provider="ollama",
+        ollama_api_key="ollama-key",
+        gemini_api_key="google-key",
+    )
+    client = build_llm_client(config)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client._base_url == "https://ollama.com/v1"
+    assert client._model == "gpt-oss:120b"
+    assert client._api_key == "ollama-key"
+    assert client._inline_refs
+
+
+def test_provider_without_its_own_key_disables_the_planner():
+    config = Settings(_env_file=None, llm_provider="groq", gemini_api_key="google-key")
+    assert build_llm_client(config) is None
+
+
 @pytest.mark.parametrize("url", [
     "https://integrate.api.nvidia.com/v1",
-    "https://generativelanguage.googleapis.com/v1beta/openai",
-    "http://api.groq.com/openai/v1",
-    "https://api.groq.com.example/openai/v1",
+    "https://api.groq.com/openai/v1",
+    "http://generativelanguage.googleapis.com/v1beta",
+    "https://generativelanguage.googleapis.com.example/v1beta",
 ])
-def test_groq_key_cannot_be_sent_to_another_provider(url):
+def test_google_key_cannot_be_sent_to_another_provider(url):
     config = Settings(
-        _env_file=None, llm_provider="groq", groq_api_key="test-groq-key",
-        llm_base_url=url, llm_model="openai/gpt-oss-120b",
+        _env_file=None, llm_provider="gemini", gemini_api_key="test-google-key",
+        llm_base_url=url, llm_model="gemini-3.1-flash-lite",
     )
-    with pytest.raises(ValueError, match="Groq base URL"):
+    with pytest.raises(ValueError, match="Gemini base URL"):
         build_llm_client(config)
 
 
@@ -330,7 +559,7 @@ def test_groq_plan_still_requires_policy_and_explicit_confirmation(db, unsafe):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("status", [402, 429, 503])
 def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
     requests = []
 
@@ -348,7 +577,10 @@ def test_groq_busy_response_falls_back_without_retry_or_commit(db, status):
             planner = PlannerService(db, llm)
             call = start_call(planner.calls, 1043)
             result = await planner.handle_turn(call.id, AgentTurnRequest(text="Please hand it to me"))
-            assert result.planner.error_code == "LLM_UNAVAILABLE"
+            assert result.planner.error_code == {
+                402: "LLM_BILLING_REQUIRED",
+                429: "LLM_RATE_LIMIT",
+            }.get(status, "LLM_UNAVAILABLE")
             assert result.planner.wording_source == "template"
             assert not result.turn.customer_confirmed
             assert planner.calls.get_call(call.id).current_proposal_id is None

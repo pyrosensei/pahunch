@@ -6,8 +6,8 @@
     "proposal": {
       "primary": {
         "action": "HAND_TO_CUSTOMER",
-        "window_start": "2026-11-05T18:00:00+05:30",
-        "window_end": "2026-11-05T20:00:00+05:30"
+        "window_start": "2026-11-05T10:00:00+05:30",
+        "window_end": "2026-11-05T12:00:00+05:30"
       }
     }
   },
@@ -30,13 +30,13 @@
     "proposal": {
       "primary": {
         "action": "HAND_TO_CUSTOMER",
-        "window_start": "2026-11-05T18:00:00+05:30",
-        "window_end": "2026-11-05T20:00:00+05:30"
+        "window_start": "2026-11-05T10:00:00+05:30",
+        "window_end": "2026-11-05T12:00:00+05:30"
       },
       "fallback": {
         "action": "LEAVE_WITH_SECURITY",
-        "window_start": "2026-11-05T18:00:00+05:30",
-        "window_end": "2026-11-05T20:00:00+05:30"
+        "window_start": "2026-11-05T10:00:00+05:30",
+        "window_end": "2026-11-05T12:00:00+05:30"
       }
     }
   },
@@ -141,9 +141,10 @@
     "proposal": {
       "primary": {
         "action": "LEAVE_WITH_NEIGHBOR",
-        "window_start": "2026-11-05T18:00:00+05:30",
-        "window_end": "2026-11-05T20:00:00+05:30",
-        "named_recipient": "Sharma"
+        "window_start": "2026-11-05T14:00:00+05:30",
+        "window_end": "2026-11-05T16:00:00+05:30",
+        "named_recipient": "Sharma",
+        "recipient_address": "House 403"
       }
     }
   },

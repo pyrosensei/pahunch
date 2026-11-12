@@ -15,6 +15,20 @@ def feed(buffer, rms, ms, *, noise=False):
     return starts
 
 
+def feed_processing(buffer, rms, ms, *, noise=False, offset=0):
+    starts = []
+    for index in range(ms // FRAME_MS):
+        if buffer.add(
+            frame(rms, noise=noise, index=index),
+            calibrate=False,
+            start_ms=160,
+            minimum_threshold=500,
+            quiet_start_ms=400,
+        ):
+            starts.append(offset + (index + 1) * FRAME_MS)
+    return starts
+
+
 def calibrated(noise_rms=20, **kwargs):
     buffer = UtteranceBuffer(RealtimeConfig(**kwargs))
     assert not feed(buffer, noise_rms, 500, noise=True)
@@ -71,6 +85,32 @@ def test_short_spike_does_not_start_speech():
     assert feed(buffer, 20, 800, noise=True) == []
     assert not buffer.has_utterance
     assert len(buffer.pcm) == 0
+
+
+def test_processing_onset_ignores_a_short_loud_burst():
+    buffer = calibrated()
+    assert feed_processing(buffer, 3000, 100) == []
+    assert not buffer.has_utterance
+    assert feed_processing(buffer, 20, 200, noise=True) == []
+    assert not buffer.has_utterance
+
+
+def test_processing_onset_confirms_quiet_speech_after_longer_window():
+    buffer = calibrated()
+    assert feed_processing(buffer, 220, 380) == []
+    assert feed_processing(buffer, 220, 20, offset=380) == [400]
+    assert buffer.has_utterance
+    assert buffer.onset_mode == "quiet"
+    assert buffer._speech_threshold == buffer.threshold
+
+
+def test_processing_onset_still_accepts_strong_speech_quickly():
+    buffer = calibrated()
+    assert feed_processing(buffer, 3000, 140) == []
+    assert feed_processing(buffer, 3000, 20, offset=140) == [160]
+    assert buffer._saw_speech
+    assert buffer.speech_ms == 160
+    assert buffer.onset_mode == "strong"
 
 
 def test_pre_roll_preserves_first_syllable_and_is_bounded():
@@ -140,6 +180,8 @@ def test_fixed_threshold_mode_remains_explicitly_testable():
         ("noise_ratio", 1),
         ("speech_start_ms", 0),
         ("barge_in_ms", 0),
+        ("processing_confirm_ms", 0),
+        ("processing_confirm_ms", 100),
         ("pre_roll_ms", -1),
         ("no_speech_ms", 0),
     ],
@@ -159,6 +201,7 @@ def test_environment_settings_reach_realtime_detector():
         realtime_calibration_ms=400,
         realtime_speech_start_ms=120,
         realtime_barge_in_ms=200,
+        realtime_processing_confirm_ms=500,
         realtime_pre_roll_ms=240,
         realtime_no_speech_ms=6000,
     )
@@ -166,7 +209,7 @@ def test_environment_settings_reach_realtime_detector():
     assert not config.adaptive_vad
     assert (config.vad_floor, config.vad_ceiling, config.noise_ratio) == (150, 9000, 2.5)
     assert (config.calibration_ms, config.speech_start_ms, config.barge_in_ms) == (400, 120, 200)
-    assert (config.pre_roll_ms, config.no_speech_ms) == (240, 6000)
+    assert (config.processing_confirm_ms, config.pre_roll_ms, config.no_speech_ms) == (500, 240, 6000)
 
 
 def test_audio_spool_copy_never_uses_unbounded_reads():

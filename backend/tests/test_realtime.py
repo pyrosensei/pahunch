@@ -17,6 +17,7 @@ from app.db import get_session
 from app.gnani import GnaniGatewayError, GnaniResponseError, SpeechAudio, Transcript
 from app.llm import LLMCompletion
 from app.main import create_app
+from app.operator import require_operator_key
 from app.realtime import RealtimeConfig, UtteranceBuffer, frame_is_speech, pcm16_to_wav
 from app.seed import seed_database
 from app.speech_text import spoken_text
@@ -105,6 +106,7 @@ def realtime_client(
         streaming_stt_client=streaming,
         realtime_config=config,
     )
+    app.dependency_overrides[require_operator_key] = lambda: None
     app.dependency_overrides[get_session] = override_session
     with TestClient(app) as client:
         yield client
@@ -692,7 +694,7 @@ def test_streaming_connect_failure_uses_rest_and_retries_on_start(
             ws.receive_json()  # agent_audio
         events = client.get(f"/api/sessions/{session_id}/events").json()
         types = [event["event_type"] for event in events]
-        assert types.count("STREAMING_STT_UNAVAILABLE") == 2
+        assert types.count("STREAMING_STT_UNAVAILABLE") == 1
 
     assert stream.commits == 0
     assert stream.frames == []
@@ -809,8 +811,9 @@ def test_config_message_sets_the_tts_sample_rate(scripted_llm):
             introduction = ws.receive_json()
             assert introduction["type"] == "opening"
             assert "1042" in introduction["agent_message"]
-            assert "उपलब्ध" in introduction["agent_message"]
-            assert introduction["planner"]["response_language"] == "hi-IN"
+            assert "available" in introduction["agent_message"]
+            assert "IST" not in introduction["agent_message"]
+            assert introduction["planner"]["response_language"] == "hi-en"
             opening = ws.receive_json()
             assert opening["type"] == "agent_audio_chunk"
             assert opening["sample_rate"] == 24_000

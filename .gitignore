@@ -16,6 +16,7 @@ node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+frontend/test-run-*.txt
 *.tsbuildinfo
 
 # Keep local review and instruction documents out of Git.

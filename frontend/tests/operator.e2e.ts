@@ -6,6 +6,7 @@ import type { OperatorSummary, Proposal } from '../src/pages/operator-types';
 
 const TOKEN = 'synthetic-operator-access';
 const CUSTOMER_NEED = 'Please hand the parcel directly to me in the scheduled window.';
+const NEIGHBOUR_NEED = 'Please leave it with Asha at Flat 4B, Demo Lane.';
 const SYSTEM_NOTE = 'Operator reviewed the proposed delivery window.';
 
 test('PC participant keeps typing optional and automatically saves only the confirmed plan', async ({ page }) => {
@@ -42,15 +43,21 @@ test('PC participant keeps typing optional and automatically saves only the conf
   await expect(page.getByText('Plan saved',{exact:true})).toBeVisible();
   expect(requests.filter(r=>r.path.endsWith('/commit'))).toHaveLength(1);
 });
-async function operatorBackend(page: Page, options: { confirmed?: boolean; policyFailure?: boolean } = {}) {
+async function operatorBackend(page: Page, options: { confirmed?: boolean; policyFailure?: boolean; neighbour?: boolean; turnPlanner?: Partial<typeof planner> } = {}) {
   await mockApi(page);
+  const customerNeed = options.neighbour ? NEIGHBOUR_NEED : CUSTOMER_NEED;
   let summary: OperatorSummary = {
     session_id: session.id, order_id: order.id, state: 'PENDING_CONFIRMATION', outcome: null,
     transport: 'browser', dispatch_state: null, phone_consent: false,
-    customer_requests: [{ turn_id: 1, text: CUSTOMER_NEED, created_at: session.started_at }],
+    customer_requests: [{ turn_id: 1, text: customerNeed, created_at: session.started_at }],
     proposal: { id: 'proposal-one', source: 'customer', customer_confirmed: !!options.confirmed,
-      plan: { primary: { action: 'HAND_TO_CUSTOMER', window_start: order.window_start, window_end: order.window_end, call_on_arrival: true, named_recipient: null, delay_minutes: null, max_retries: 0 }, fallback: { action: 'RETRY_AFTER_DELAY', delay_minutes: 15, max_retries: 1, call_on_arrival: true } },
-      policy: { valid: true, violations: [], allowed_alternatives: ['HAND_TO_CUSTOMER', 'RESCHEDULE'] } },
+      plan: { primary: options.neighbour ? {
+        action: 'LEAVE_WITH_NEIGHBOR', window_start: order.window_start, window_end: order.window_end, call_on_arrival: true,
+        named_recipient: 'Asha', recipient_address: 'Flat 4B, Demo Lane', delay_minutes: null, max_retries: 0,
+        recipient_source: { turn_id: 1, quote: 'Please leave it with Asha' },
+        recipient_address_source: { turn_id: 1, quote: 'at Flat 4B, Demo Lane' },
+      } : { action: 'HAND_TO_CUSTOMER', window_start: order.window_start, window_end: order.window_end, call_on_arrival: true, named_recipient: null, delay_minutes: null, max_retries: 0 }, fallback: { action: 'RETRY_AFTER_DELAY', delay_minutes: 15, max_retries: 1, call_on_arrival: true } },
+      policy: { valid: true, violations: [], allowed_alternatives: options.neighbour ? ['LEAVE_WITH_NEIGHBOR', 'HAND_TO_CUSTOMER', 'RESCHEDULE'] : ['HAND_TO_CUSTOMER', 'RESCHEDULE'] } },
     courier_card: null, operator_actions: { can_reject: true, can_revise: true, reason: null },
     operator_events: [], summary: { status: options.confirmed ? 'CONFIRMED' : 'PENDING_CONFIRMATION', text: options.confirmed ? 'The customer confirmed the current plan. It has not been committed.' : 'The current proposal has not been confirmed by the customer or committed.' },
     confirmation: { confirmed: !!options.confirmed, requires_fresh_confirmation: !options.confirmed, presentation_pending: false },
@@ -61,12 +68,13 @@ async function operatorBackend(page: Page, options: { confirmed?: boolean; polic
     const request = route.request(); const url = new URL(request.url()); const path = url.pathname;
     allRequests.push(`${request.method()} ${path}`);
     const fulfill = (json: unknown, status = 200) => route.fulfill({ json, status });
+    if (path === '/api/operator/access') return fulfill(request.headers()['x-operator-token'] === TOKEN ? {authorized:true} : {detail:'A valid operator token is required'}, request.headers()['x-operator-token'] === TOKEN ? 200 : 401);
     if (path === '/api/sessions') return fulfill([{ ...session, state: summary.state, current_proposal_id: summary.proposal?.id || null, customer_confirmed: summary.confirmation.confirmed, proposal: summary.proposal?.plan || null, verdict: summary.proposal?.policy || null }]);
     if (path.endsWith('/turns')) {
       const after = Number(url.searchParams.get('after_id'));
       return fulfill([
-        { id: 1, speaker: 'CUSTOMER', text: CUSTOMER_NEED, created_at: session.started_at, structured_payload: {} },
-        { id: 2, speaker: 'AGENT', text: 'May I take this plan forward?', created_at: session.started_at, structured_payload: { planner } },
+        { id: 1, speaker: 'CUSTOMER', text: customerNeed, created_at: session.started_at, structured_payload: {} },
+        { id: 2, speaker: 'AGENT', text: 'May I take this plan forward?', created_at: session.started_at, structured_payload: { planner: { ...planner, ...options.turnPlanner } } },
         { id: 3, speaker: 'SYSTEM', text: SYSTEM_NOTE, created_at: session.started_at, structured_payload: { operator: { action: 'REVIEW' } } },
       ].filter(turn => turn.id > after));
     }
@@ -100,19 +108,16 @@ async function unlock(page: Page, value = TOKEN) {
   await page.getByRole('button', { name: /Enter operator key|Change operator key/ }).click();
   await page.getByLabel('Operator key', { exact: true }).fill(value);
   await page.getByRole('button', { name: 'Use operator key' }).click();
+  await page.getByRole('tab', {name:'Review',exact:true}).click();
 }
 
 test('operator monitor is separate from customer PC voice and uses tab-only authenticated access', async ({ page }, testInfo) => {
   const backend = await operatorBackend(page); const sockets: string[] = []; page.on('websocket', socket => { if (socket.url().includes('/ws/sessions/')) sockets.push(socket.url()); });
   await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'Agent activity' })).toBeVisible();
-  await page.getByText('Customer request & outcome', { exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText(CUSTOMER_NEED);
-  await expect(page.getByRole('region', { name: 'Customer needs' })).not.toContainText(SYSTEM_NOTE);
-  const pc = page.getByRole('link', { name: 'Start customer voice demo' });
-  await expect(pc).toHaveAttribute('target', '_blank');
-  await expect(pc).toHaveAttribute('href', `/voice?session_id=${session.id}&order_id=${order.id}&pc_demo=1`);
-  await expect(pc).toHaveAttribute('rel', /noopener/);
+  await expect(page.getByRole('heading', { name: 'Demo orders' })).toBeVisible();
+  await expect(page.locator('.operations-transcript')).toContainText(CUSTOMER_NEED);
+  await expect(page.getByRole('link', {name:'Start customer voice demo'})).toHaveCount(0);
+  await page.getByRole('tab', {name:'Review',exact:true}).click();
   await expect(page.getByRole('button', { name: 'Start microphone' })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: 'Your reply' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Reject proposal', exact: true })).toBeDisabled();
@@ -148,6 +153,101 @@ test('operator revision sends the current version and requires fresh customer co
   await expect(page.getByRole('button', { name: 'Save delivery plan' })).toHaveCount(0);
 });
 
+test('operator sees the neighbour address and preserves untouched sources during a window revision', async ({ page }) => {
+  const backend = await operatorBackend(page, { neighbour: true, confirmed: true });
+  await page.goto('/dashboard'); await unlock(page);
+  const decision = page.locator('.operator-plan');
+  await expect(decision).toContainText('Asha');
+  await expect(decision).toContainText('Flat 4B, Demo Lane');
+  await decision.getByText('Customer source', { exact: true }).click();
+  await expect(decision).toContainText('Please leave it with Asha');
+  await expect(decision).toContainText('at Flat 4B, Demo Lane');
+  await decision.getByRole('button', { name: 'Revise proposal', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Primary plan recipient name' })).toHaveValue('Asha');
+  await expect(page.getByRole('textbox', { name: 'Primary plan recipient address' })).toHaveValue('Flat 4B, Demo Lane');
+  const windowSelect = page.getByRole('combobox', { name: 'Primary plan delivery window' });
+  await expect(windowSelect).toHaveValue('0');
+  await windowSelect.selectOption('1');
+  await page.getByRole('textbox', { name: 'Operator reason' }).fill('Move the handoff to the next recorded availability.');
+  await page.getByRole('button', { name: 'Submit revision for customer confirmation' }).click();
+  await expect(page.getByText('Revision proposed. A fresh customer confirmation is required.')).toBeVisible();
+  expect(backend.writes).toHaveLength(1);
+  const primary = (backend.writes[0].body.proposal as Proposal).primary;
+  expect(primary).toMatchObject({
+    action: 'LEAVE_WITH_NEIGHBOR', named_recipient: 'Asha', recipient_address: 'Flat 4B, Demo Lane',
+    window_start: '2026-11-02T12:15:00Z', window_end: '2026-11-02T14:15:00Z',
+    recipient_source: { turn_id: 1, quote: 'Please leave it with Asha' },
+    recipient_address_source: { turn_id: 1, quote: 'at Flat 4B, Demo Lane' },
+  });
+  await expect(decision).toContainText('Flat 4B, Demo Lane');
+  expect(backend.allRequests.some(request => request.includes('/commit'))).toBe(false);
+});
+
+test('recipient changes require a fresh location and clear the previous attribution', async ({ page }) => {
+  const backend = await operatorBackend(page, { neighbour: true });
+  await page.goto('/dashboard'); await unlock(page);
+  const decision = page.locator('.operator-plan');
+  await decision.getByRole('button', { name: 'Revise proposal', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Primary plan recipient name' }).fill('Asha Devi');
+  await expect(page.getByRole('textbox',{name:'Primary plan recipient address'})).toHaveValue('');
+  await page.getByRole('textbox',{name:'Primary plan recipient address'}).fill('Flat 4B, Demo Lane');
+  await page.getByRole('textbox', { name: 'Operator reason' }).fill('Clarify the recipient name.');
+  await page.getByRole('button', { name: 'Submit revision for customer confirmation' }).click();
+  await expect(page.getByText('Revision proposed. A fresh customer confirmation is required.')).toBeVisible();
+  let primary = (backend.writes[0].body.proposal as Proposal).primary;
+  expect(primary).toMatchObject({ named_recipient: 'Asha Devi', recipient_source: null, recipient_address: 'Flat 4B, Demo Lane', recipient_address_source: null });
+  await decision.getByRole('button', { name: 'Revise proposal', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Primary plan recipient address' }).fill('Flat 5B, Demo Lane');
+  await page.getByRole('textbox', { name: 'Operator reason' }).fill('Clarify the recipient address.');
+  await page.getByRole('button', { name: 'Submit revision for customer confirmation' }).click();
+  await expect.poll(() => backend.writes.length).toBe(2);
+  primary = (backend.writes[1].body.proposal as Proposal).primary;
+  expect(primary).toMatchObject({ named_recipient: 'Asha Devi', recipient_source: null, recipient_address: 'Flat 5B, Demo Lane', recipient_address_source: null });
+});
+
+test('transcript diagnostics keep review-needed non-terminal and language warnings secondary', async ({ page }) => {
+  await operatorBackend(page, { turnPlanner: {
+    action: 'ASK_CLARIFICATION', review_needed: true, missing_fields: ['recipient_address'],
+    language_warning: 'LOW_CONFIDENCE', error_code: 'LLM_STRUCTURED_OUTPUT',
+    wording_source: 'fallback', fallback_reason: 'structured_output',
+  } });
+  await page.goto('/dashboard');
+  await expect(page.getByRole('tab', { name: 'Conversation', exact: true })).toHaveAttribute('aria-selected','true');
+  await page.getByText('Response details', { exact: true }).click();
+  const meta = page.locator('.turn-meta');
+  await expect(meta.getByRole('status')).toHaveText('Review helpful · conversation can continue');
+  await expect(meta).toContainText('Missing: Recipient address');
+  await expect(meta.locator('.language-warning code')).toHaveText('LOW_CONFIDENCE');
+  await expect(meta.locator('.turn-error code')).toHaveText('LLM_STRUCTURED_OUTPUT');
+  await expect(page.getByRole('button', { name: 'Start microphone' })).toHaveCount(0);
+});
+
+test('customer plan shows the recipient address and source without operator controls', async ({ page }) => {
+  const prepared = { ...session, state: 'PENDING_CONFIRMATION', verdict: { valid: true, violations: [] }, proposal: {
+    primary: { action: 'LEAVE_WITH_NEIGHBOR', window_start: order.window_start, window_end: order.window_end, call_on_arrival: true,
+      named_recipient: 'Asha', recipient_address: 'Flat 4B, Demo Lane',
+      recipient_source: { turn_id: 1, quote: 'Please leave it with Asha' },
+      recipient_address_source: { turn_id: 1, quote: 'at Flat 4B, Demo Lane' } },
+    fallback: null,
+  } };
+  await mockApi(page); await mockAudio(page);
+  await page.route('**/api/sessions?**', route => route.fulfill({ json: [prepared] }));
+  await page.route(`**/api/sessions/${session.id}`, route => route.fulfill({ json: prepared }));
+  await page.routeWebSocket('**/ws/sessions/**/voice', socket => {
+    setTimeout(() => socket.send(JSON.stringify({ type: 'ready', state: 'PENDING_CONFIRMATION' })), 20);
+  });
+  await page.goto(`/voice?session_id=${session.id}&order_id=${order.id}`);
+  await page.getByRole('button', { name: 'Connect conversation' }).click();
+  const plan = page.getByRole('region', { name: 'Your delivery plan' });
+  await expect(plan).toContainText('Asha');
+  await expect(plan).toContainText('Flat 4B, Demo Lane');
+  await plan.getByText('Customer source', { exact: true }).click();
+  await expect(plan).toContainText('Please leave it with Asha');
+  await expect(plan).toContainText('at Flat 4B, Demo Lane');
+  await expect(plan.getByRole('button', { name: 'Save delivery plan' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Reject proposal', exact: true })).toHaveCount(0);
+});
+
 test('rejecting a proposal records the reason and clears the displayed plan', async ({ page }) => {
   const backend = await operatorBackend(page, { confirmed: true });
   await page.goto('/dashboard'); await unlock(page);
@@ -181,60 +281,38 @@ test('operator review controls and recorded conversation meet automated WCAG AA 
 });
 
 
-test('prepared PC session explains the next action and separates opening timings from reply timings', async ({ page }) => {
-  await mockApi(page, { state: 'CALLING' });
-  await page.route('**/api/orders', route => route.fulfill({ json: [{ ...order, requires_otp: false }] }));
+test('prepared conversations stay in SwiftCart and opening timings remain distinct', async ({ page }) => {
+  await mockApi(page, {state:'CALLING'});
+  await page.route('**/api/sessions/*/events', route => route.fulfill({json:[{id:1,event_type:'OPENING_LINE_SPOKEN',created_at:session.started_at,payload_json:JSON.stringify({first_audio_ms:650,tts_ms:1200})}]}));
   await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'Ready to start the voice demo' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('Confirm availability');
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('No OTP is required');
-  await expect(page.getByRole('link', { name: 'Start customer voice demo' })).toHaveAttribute('target', '_blank');
-  await page.getByText('Customer request & outcome', { exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Customer needs' })).toContainText('The customer has not replied yet');
-  await page.getByRole('tab', { name: 'Performance' }).click();
-  await expect(page.getByRole('heading', { name: 'Start the PC voice demo to measure it.' })).toBeVisible();
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).not.toContainText('0 ms');
-  await page.route('**/api/sessions?**', route => route.fulfill({ json: [{ ...session, state: 'DISCOVERY' }] }));
-  await page.route('**/api/sessions/*/turns?**', route => route.fulfill({ json: Number(new URL(route.request().url()).searchParams.get('after_id')) ? [] : [{ id: 1, speaker: 'AGENT', text: 'Your SwiftCart delivery is scheduled today. Will you be available?', created_at: session.started_at, structured_payload: { opening: true } }] }));
-  await page.route('**/api/sessions/*/events', route => route.fulfill({ json: [{ id: 1, event_type: 'REALTIME_CONNECTED', payload_json: '{}', created_at: session.started_at }, { id: 2, event_type: 'OPENING_LINE_SPOKEN', payload_json: JSON.stringify({ first_audio_ms: 650, tts_ms: 1200 }), created_at: session.started_at }] }));
-  await page.getByRole('button', { name: /Updated/ }).click();
-  await expect(page.getByRole('heading', { name: 'Waiting for customer availability' })).toBeVisible();
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('650 ms');
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('1200 ms');
-  await expect(page.getByRole('tabpanel', { name: 'Performance' })).toContainText('turn breakdown appears after the customer replies');
-  await page.getByRole('tab', { name: 'Transcript' }).click();
-  await expect(page.getByText('Your SwiftCart delivery is scheduled today. Will you be available?', { exact: true })).toBeVisible();
+  await expect(page.getByRole('status')).toContainText('Customer voice is ready');
+  await expect(page.getByRole('link',{name:'Start customer voice demo'})).toHaveCount(0);
+  await page.getByText('Performance and audit details',{exact:true}).click();
+  await expect(page.getByRole('tabpanel',{name:'Conversation'})).toContainText('650 ms');
+  await expect(page.getByRole('tabpanel',{name:'Conversation'})).toContainText('Not available');
 });
 
-test('a future ready delivery can explicitly open a PC rehearsal without a prepared session', async ({ page }) => {
-  const requests = await mockApi(page, { sessions: false });
-  await page.route('**/api/orders', route => route.fulfill({ json: [{ ...order, status: 'OUT_FOR_DELIVERY', window_start: '2026-11-03T10:00:00+05:30', window_end: '2026-11-03T12:00:00+05:30' }] }));
-  await page.route('**/api/dialer/status', route => route.fulfill({ json: { running: true, transport: 'browser', orders: [{ order_id: order.id, skip_reason: 'WINDOW_NOT_DUE' }] } }));
+test('future out-for-delivery orders require an authorized prepare action', async ({ page }) => {
+  const requests = await mockApi(page,{sessions:false});
+  await page.route('**/api/orders?**', route => route.fulfill({json:[{...order,status:'OUT_FOR_DELIVERY'}]}));
   await page.goto(`/dashboard?order_id=${order.id}`);
-  const launch = page.getByRole('link', { name: 'Start PC demo now' });
-  await expect(launch).toHaveAttribute('href', `/voice?order_id=${order.id}&pc_demo=1`);
-  await expect(launch).toHaveAttribute('target', '_blank');
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText('automatic dispatch still follows the delivery window');
-  expect(requests.some(request => request.method === 'POST')).toBe(false);
+  const prepare = page.getByRole('button',{name:'Prepare customer conversation'});
+  await expect(prepare).toBeDisabled();
+  await unlock(page);
+  await expect(prepare).toBeEnabled();
+  expect(requests.some(request=>request.method==='POST')).toBe(false);
+  await prepare.click();
+  await expect.poll(()=>requests.filter(request=>request.path.endsWith('/call')).length).toBe(1);
 });
 
-test('choosing a pending order stays on that delivery across refresh without starting a call', async ({ page }) => {
+test('pending order selection survives refresh without starting a call', async ({ page }) => {
   const requests = await mockApi(page);
-  const pendingId = order.id + 1;
-  await page.route('**/api/orders', route => route.fulfill({ json: [order, { ...order, id: pendingId, status: 'PENDING' }] }));
-  let selectedReads = 0;
-  await page.route('**/api/sessions?**', route => {
-    const requested = new URL(route.request().url()).searchParams.get('order_id');
-    if (requested === String(pendingId)) selectedReads++;
-    return route.fulfill({ json: requested === String(pendingId) ? [] : [session] });
-  });
-  await page.goto('/dashboard');
-  await expect(page.getByRole('heading', { name: 'The conversation', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: new RegExp(`#${pendingId}.*Pending`) }).click();
-  await expect(page.getByRole('link', { name: 'Start PC demo now' })).toHaveAttribute('href', `/voice?order_id=${pendingId}&pc_demo=1`);
-  await page.getByRole('button', { name: /Updated/ }).click();
-  await expect.poll(() => selectedReads).toBeGreaterThanOrEqual(2);
-  await expect(page.getByRole('heading', { name: 'Delivery ready for review' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Reason for this conversation' })).toContainText(`order #${pendingId}`);
-  expect(requests.some(request => request.method === 'POST')).toBe(false);
+  const pendingId=order.id+1;
+  await page.route('**/api/orders?**',route=>route.fulfill({json:[order,{...order,id:pendingId,status:'PENDING'}]}));
+  await page.goto(`/dashboard?order_id=${order.id}`);
+  await page.getByRole('button',{name:`Order #${pendingId}`,exact:true}).click();
+  await page.getByRole('button',{name:/Updated/}).click();
+  await expect(page.getByRole('heading',{name:'Awaiting dispatch.'})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Mark out for delivery'})).toBeDisabled();
+  expect(requests.some(request=>request.method==='POST')).toBe(false);
 });

@@ -12,22 +12,32 @@ const actions = ['HAND_TO_CUSTOMER', 'LEAVE_WITH_SECURITY', 'LEAVE_WITH_NEIGHBOR
 function PlanFacts({ plan }: { plan: Proposal | null }) {
   if (!plan) return <p className="operator-empty-copy">No delivery plan has been proposed.</p>;
   const step = plan.primary;
-  return <dl className="operator-facts"><dt>Proposed action</dt><dd>{label(step.action)}</dd><dt>Recipient</dt><dd>{step.named_recipient || (step.action === 'HAND_TO_CUSTOMER' ? 'Customer' : 'Not specified')}</dd>
+  const recipientSource = step.recipient_source?.quote;
+  const addressSource = step.recipient_address_source?.quote;
+  return <><dl className="operator-facts"><dt>Proposed action</dt><dd>{label(step.action)}</dd><dt>Recipient</dt><dd>{step.named_recipient || (step.action === 'HAND_TO_CUSTOMER' ? 'Customer' : 'Not specified')}</dd>
+    {step.recipient_address && <><dt>Recipient address</dt><dd>{step.recipient_address}</dd></>}
     {scheduled.has(step.action) && <><dt>Delivery window · IST</dt><dd>{dateTime(step.window_start || undefined)} – {dateTime(step.window_end || undefined)}</dd></>}
     <dt>Call on arrival</dt><dd>{step.call_on_arrival === false ? 'No' : 'Yes'}</dd>{step.delay_minutes != null && <><dt>Retry delay</dt><dd>{step.delay_minutes} minutes · {step.max_retries || 0} retries</dd></>}
-    {plan.fallback && <><dt>If the primary plan cannot happen</dt><dd>{label(plan.fallback.action)}{plan.fallback.delay_minutes != null ? ` · After ${plan.fallback.delay_minutes} minutes` : ''}{plan.fallback.max_retries != null ? ` · ${plan.fallback.max_retries} retries` : ''}{plan.fallback.named_recipient ? ` · ${plan.fallback.named_recipient}` : ''}</dd></>}
-  </dl>;
+    {plan.fallback && <><dt>If the primary plan cannot happen</dt><dd>{label(plan.fallback.action)}{plan.fallback.delay_minutes != null ? ` · After ${plan.fallback.delay_minutes} minutes` : ''}{plan.fallback.max_retries != null ? ` · ${plan.fallback.max_retries} retries` : ''}{plan.fallback.named_recipient ? ` · ${plan.fallback.named_recipient}` : ''}{plan.fallback.recipient_address ? ` · ${plan.fallback.recipient_address}` : ''}</dd></>}
+  </dl>{(recipientSource || addressSource) && <details className="plan-source"><summary>Customer source</summary><dl>
+    {recipientSource && <><dt>Recipient</dt><dd>{recipientSource}</dd></>}
+    {addressSource && <><dt>Address</dt><dd>{addressSource}</dd></>}
+  </dl></details>}</>;
 }
 function StepFields({ title, step, change, slots, order }: { title: string; step: PlanStep; change: (value: PlanStep) => void; slots: Slot[]; order?: Order }) {
   const slotIndex = slots.findIndex(slot => new Date(slot.start_at).getTime() === new Date(step.window_start || '').getTime() && new Date(slot.end_at).getTime() === new Date(step.window_end || '').getTime());
+  const thirdParty = step.action === 'LEAVE_WITH_NEIGHBOR' || step.action === 'LEAVE_WITH_SECURITY';
   return <fieldset className="operator-step-fields"><legend>{title}</legend><label>Delivery action<select aria-label={`${title} action`} value={step.action} onChange={event => {
     const action = event.target.value;
+    const keepsRecipient = action === 'LEAVE_WITH_NEIGHBOR' || action === 'LEAVE_WITH_SECURITY';
     change({ ...step, action, window_start: scheduled.has(action) ? step.window_start || order?.window_start || null : null, window_end: scheduled.has(action) ? step.window_end || order?.window_end || null : null,
       delay_minutes: action === 'RETRY_AFTER_DELAY' ? step.delay_minutes || 15 : null, max_retries: action === 'RETRY_AFTER_DELAY' ? step.max_retries || 1 : 0,
-      named_recipient: action === 'LEAVE_WITH_NEIGHBOR' || action === 'LEAVE_WITH_SECURITY' ? step.named_recipient || null : null });
+      named_recipient: keepsRecipient ? step.named_recipient || null : null, recipient_address: keepsRecipient ? step.recipient_address || null : null,
+      recipient_source: null, recipient_address_source: null });
   }}>{actions.map(action => <option key={action} value={action}>{label(action)}</option>)}</select></label>
     {scheduled.has(step.action) && <label>Delivery window · IST<select aria-label={`${title} delivery window`} value={slotIndex < 0 ? 'current' : String(slotIndex)} onChange={event => { const slot = slots[Number(event.target.value)]; if (slot) change({ ...step, window_start: slot.start_at, window_end: slot.end_at }); }}><option value="current">Current proposal: {dateTime(step.window_start || undefined)} – {dateTime(step.window_end || undefined)}</option>{slots.map((slot, index) => <option key={slot.id} value={index}>{dateTime(slot.start_at)} – {dateTime(slot.end_at)}</option>)}</select></label>}
-    {(step.action === 'LEAVE_WITH_NEIGHBOR' || step.action === 'LEAVE_WITH_SECURITY') && <label>Recipient name<input aria-label={`${title} recipient name`} maxLength={80} value={step.named_recipient || ''} onChange={event => change({ ...step, named_recipient: event.target.value || null })}/></label>}
+    {thirdParty && <label>Recipient name<input aria-label={`${title} recipient name`} maxLength={80} value={step.named_recipient || ''} onChange={event => change({ ...step, named_recipient: event.target.value || null, recipient_source: null, recipient_address: null, recipient_address_source: null })}/></label>}
+    {thirdParty && <label>Recipient address<input aria-label={`${title} recipient address`} maxLength={80} value={step.recipient_address || ''} onChange={event => change({ ...step, recipient_address: event.target.value || null, recipient_address_source: null })}/></label>}
     {step.action === 'RETRY_AFTER_DELAY' && <div className="operator-field-pair"><label>Delay in minutes<input aria-label={`${title} delay minutes`} type="number" min={1} max={120} value={step.delay_minutes || 15} onChange={event => change({ ...step, delay_minutes: Number(event.target.value) })}/></label><label>Maximum retries<input aria-label={`${title} maximum retries`} type="number" min={1} max={2} value={step.max_retries || 1} onChange={event => change({ ...step, max_retries: Number(event.target.value) })}/></label></div>}
     <label className="operator-checkbox"><input type="checkbox" checked={step.call_on_arrival !== false} onChange={event => change({ ...step, call_on_arrival: event.target.checked })}/>Call the customer on arrival</label>
   </fieldset>;

@@ -30,6 +30,29 @@ SLOT_ACTIONS = {
 }
 
 
+class CustomerEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    turn_id: int | None = Field(
+        default=None,
+        description="Use null for the current customer utterance. Historical IDs must identify a CUSTOMER turn in this session, never an agent or system turn.",
+    )
+    quote: str = Field(
+        min_length=1, max_length=2_000,
+        description="Exact verbatim substring of that customer turn in its original script. Preserve spelling. Use null for unused evidence fields, never invent or translate a quote.",
+    )
+
+
+class RequestDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    time_source: CustomerEvidence | None = None
+    recipient_source: CustomerEvidence | None = None
+    recipient_address_source: CustomerEvidence | None = None
+    action: Literal["UNSPECIFIED", "HAND_TO_CUSTOMER", "LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY", "RESCHEDULE"] = "UNSPECIFIED"
+    call_on_arrival: bool = True
+
+
 class PlanStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -40,6 +63,9 @@ class PlanStep(BaseModel):
     delay_minutes: int | None = Field(default=None, ge=1, le=120)
     max_retries: int = Field(default=0, ge=0, le=2)
     named_recipient: str | None = Field(default=None, max_length=80)
+    recipient_address: str | None = Field(default=None, max_length=80)
+    recipient_source: CustomerEvidence | None = None
+    recipient_address_source: CustomerEvidence | None = None
     notes: str | None = Field(default=None, max_length=300)
 
     @model_validator(mode="after")
@@ -73,6 +99,8 @@ class PlannerDecision(BaseModel):
 
     action: PlannerAction
     awaiting_continuation: bool = False
+    request_details: RequestDetails | None = None
+    missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "other"]] = Field(default_factory=list, max_length=6)
     message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
@@ -105,6 +133,7 @@ class ViolationCode(str, Enum):
     SECURITY_DROP_NOT_ALLOWED = "SECURITY_DROP_NOT_ALLOWED"
     NEIGHBOUR_DROP_NOT_ALLOWED = "NEIGHBOUR_DROP_NOT_ALLOWED"
     NAMED_RECIPIENT_REQUIRED = "NAMED_RECIPIENT_REQUIRED"
+    RECIPIENT_LOCATION_REQUIRED = "RECIPIENT_LOCATION_REQUIRED"
     MISSING_ORDER_METADATA = "MISSING_ORDER_METADATA"
     ESCALATION_REQUIRED = "ESCALATION_REQUIRED"
 
@@ -146,6 +175,9 @@ class AgentTurnRequest(BaseModel):
 
 
 class PlannerMeta(BaseModel):
+    language_warning: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    review_needed: bool = False
     awaiting_continuation: bool = False
     model: str
     action: PlannerAction | None = None
@@ -175,6 +207,7 @@ class VoiceTimings(BaseModel):
     tts_ms: int = 0
     total_ms: int = 0
     first_audio_ms: int = 0
+    first_response_audio_ms: int | None = None
 
 
 class VoiceTurnResponse(BaseModel):
@@ -204,6 +237,8 @@ class CourierCard(BaseModel):
     window_start: datetime | None
     window_end: datetime | None
     call_on_arrival: bool
+    named_recipient: str | None = None
+    recipient_address: str | None = None
     instructions: list[str]
     generated_at: datetime
 

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, cast
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
@@ -17,7 +17,16 @@ from app.dialer import Dialer
 from app.errors import DomainError
 from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
 from app.llm import StructuredLLM, build_llm_client
-from app.models import AuditEvent, CallRuntime, CallSession, DeliverySlot, DialerOrderState, Order
+from app.models import (
+    AuditEvent,
+    CallRuntime,
+    CallSession,
+    DeliverySlot,
+    DemoOrderProduct,
+    DialerOrderState,
+    Order,
+)
+from app.operator import require_operator_key
 from app.operator import router as operator_router
 from app.phone_control import router as phone_control_router
 from app.phone_media import router as phone_media_router
@@ -149,8 +158,14 @@ def create_app(
         }
 
     @app.get("/api/orders", response_model=list[Order])
-    def list_orders(session: SessionDep) -> list[Order]:
-        return list(session.exec(select(Order).order_by(Order.id)).all())
+    def list_orders(session: SessionDep, catalog_only: bool = False, limit: int | None = Query(default=None, ge=1, le=200)) -> list[Order]:
+        query = select(Order)
+        if catalog_only:
+            query = query.join(DemoOrderProduct, DemoOrderProduct.order_id == Order.id)
+        query = query.order_by(Order.id.desc() if limit is not None else Order.id)
+        if limit is not None:
+            query = query.limit(limit)
+        return list(session.exec(query).all())
 
     @app.get("/api/orders/{order_id}", response_model=Order)
     def get_order(order_id: int, session: SessionDep) -> Order:
@@ -180,7 +195,7 @@ def create_app(
         )
         return validate_plan(request.proposal, order, slots)
 
-    @app.post("/api/orders/{order_id}/call", response_model=CallSession, status_code=201)
+    @app.post("/api/orders/{order_id}/call", response_model=CallSession, status_code=201, dependencies=[Depends(require_operator_key)])
     def create_call(order_id: int, session: SessionDep) -> CallSession:
         return CallService(session).create_call(order_id)
 

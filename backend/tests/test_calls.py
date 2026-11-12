@@ -155,7 +155,7 @@ def test_turn_budget_is_enforced(db):
     assert result.turn_count == MAX_TURNS + 1
 
 
-def test_repeated_invalid_plans_escalate_after_clarification_limit(db):
+def test_repeated_invalid_plans_remain_recoverable_after_clarification_limit(db):
     service = CallService(db)
     call = start_call(service)
     security = PlanStep(
@@ -167,7 +167,7 @@ def test_repeated_invalid_plans_escalate_after_clarification_limit(db):
     for _ in range(MAX_CLARIFICATIONS + 1):
         result = submit_plan(service, call.id, plan(fallback=security))
     assert result is not None
-    assert result.state == CallState.ESCALATED.value
+    assert result.state == CallState.NEGOTIATION.value
     assert result.clarification_count == MAX_CLARIFICATIONS + 1
 
 

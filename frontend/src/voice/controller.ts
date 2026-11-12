@@ -15,13 +15,14 @@ export interface VoiceSnapshot {
   microphone: boolean; listening: boolean; speaking: boolean; level: number;
   autoListen: boolean; hint: string; error: string | null;
   lines: VoiceLine[]; timings: Record<string, number>; wording: string | null;
-  commitBusy: boolean;
+  commitBusy: boolean; processing: boolean;
+  plannerModel: string | null; plannerError: string | null;
 }
 interface WireEvent extends JsonObject {
   type: string; generation_id?: number; state?: string; transcript?: string;
   agent_message?: string; chunk_base64?: string; audio_base64?: string;
   turn?: { customer_confirmed?: boolean; verdict?: VoiceSession['verdict']; proposal?: JsonObject };
-  planner?: { response_language?: string; wording_source?: string; fallback_reason?: string };
+  planner?: { response_language?: string; wording_source?: string; fallback_reason?: string; model?: string | null; error_code?: string | null; degraded?: boolean };
   timings?: Record<string, number>; detail?: string; reason?: string;
 }
 export interface VoiceEnvironment {
@@ -51,7 +52,8 @@ export class VoiceController {
     connected: false, connecting: false, session: null, microphone: false,
     listening: false, speaking: false, level: 0, autoListen: true,
     hint: 'Choose an order, then connect when you are ready.', error: null,
-    lines: [], timings: {}, wording: null, commitBusy: false,
+    lines: [], timings: {}, wording: null, commitBusy: false, processing: false,
+    plannerModel: null, plannerError: null,
   };
   private listeners = new Set<() => void>();
   private env: VoiceEnvironment;
@@ -96,6 +98,10 @@ export class VoiceController {
     this.update({ lines: [...this.snapshot.lines, { id: ++this.lineId, speaker, text }].slice(-150) });
   }
   private fail(error: unknown) { this.update({ error: message(error) }); }
+  private prepareReply() {
+    this.update({ processing: true, listening: false, error: null, hint: 'Preparing your reply…',
+      session: this.snapshot.session ? { ...this.snapshot.session, customer_confirmed: false } : null });
+  }
   private async api<T>(path: string, options?: RequestInit): Promise<T> {
     const response = await this.env.fetch(path, { ...options, signal: this.request?.signal });
     const body = await response.json();
@@ -108,7 +114,7 @@ export class VoiceController {
     if (this.snapshot.connecting || this.snapshot.connected) return;
     const epoch = ++this.actionEpoch;
     this.request?.abort(); this.request = new AbortController();
-    this.update({ connecting: true, error: null, hint: 'Preparing your conversation…' });
+    this.update({ connecting: true, processing: false, plannerModel: null, plannerError: null, error: null, hint: 'Preparing your conversation…' });
     try {
       let call: VoiceSession;
       if (selection.sessionId) {
@@ -161,11 +167,11 @@ export class VoiceController {
         try { void this.handle(JSON.parse(event.data) as WireEvent, ws).catch(error => { if (this.ws === ws) this.fail(error); }); }
         catch { this.fail(new Error('An unreadable voice event was received. Reconnect to try again.')); }
       };
-      ws.onerror = () => { if (this.ws === ws) this.fail(new Error('The voice connection failed. Please reconnect.')); };
+      ws.onerror = () => { if (this.ws === ws) this.update({ processing: false, error: 'The voice connection failed. Please reconnect.' }); };
       ws.onclose = () => {
         if (this.ws !== ws) return;
         this.ws = null; this.stopPlayback(); this.releaseMic();
-        this.update({ connected: false, connecting: false, listening: false, hint: 'Disconnected. Reconnect when you are ready.' });
+        this.update({ connected: false, connecting: false, listening: false, processing: false, hint: 'Disconnected. Reconnect when you are ready.' });
       };
     } catch (error) { if (epoch === this.actionEpoch) { this.fail(error); this.update({ connecting: false }); } }
   }
@@ -183,14 +189,15 @@ export class VoiceController {
         if (event.speech || (this.micHintReason === 'NO_AUDIO_FRAMES' && Number(event.received_frames) > 0)) this.micHintReason = null;
         this.update({ hint: this.micHintReason ? noSpeechHints[this.micHintReason] : event.calibrating ? 'Adjusting to the room. Stay quiet briefly.' : event.noise_limited ? 'Try a quieter spot for clearer audio.' : event.speech ? 'Heard you' : 'Listening to you' });
         break;
-      case 'no_speech': this.micHintReason = event.reason || 'NO_SPEECH_DETECTED'; this.update({ hint: noSpeechHints[this.micHintReason] || noSpeechHints.NO_SPEECH_DETECTED }); break;
-      case 'speech_start': this.micHintReason = null; this.update({ hint: 'Heard you' }); break;
-      case 'speech_end': this.update({ listening: false, hint: 'Preparing your reply…' }); break;
-      case 'stop_speaking': if (event.generation_id === this.generation) { this.stopPlayback(); this.update({ hint: 'Go ahead, I’m listening.' }); } break;
+      case 'no_speech': this.micHintReason = event.reason || 'NO_SPEECH_DETECTED'; this.update({ processing: false, hint: noSpeechHints[this.micHintReason] || noSpeechHints.NO_SPEECH_DETECTED }); break;
+      case 'speech_start': this.micHintReason = null; this.update({ processing: false, hint: 'Heard you', session: this.snapshot.session ? { ...this.snapshot.session, customer_confirmed: false } : null }); break;
+      case 'speech_end': this.prepareReply(); break;
+      case 'stop_speaking': if (event.generation_id === this.generation) { this.stopPlayback(); this.update({ processing: false, hint: 'Go ahead, I’m listening.' }); } break;
       case 'opening': {
         if (!this.acceptGeneration(event.generation_id)) break;
         if (event.agent_message) this.line('agent', event.agent_message);
-        this.update({ hint: 'The agent is explaining your delivery. Listen, then answer its question.' });
+        this.update({ processing: false, plannerModel: event.planner?.model || null, plannerError: event.planner?.error_code || null,
+          hint: 'The agent is explaining your delivery. Listen, then answer its question.' });
         break;
       }
       case 'turn': {
@@ -200,6 +207,7 @@ export class VoiceController {
         if (event.agent_message) this.line('agent', event.agent_message);
         const current = this.snapshot.session;
         this.update({ session: current ? { ...current, state: event.state || current.state, customer_confirmed: !!event.turn?.customer_confirmed, verdict: event.turn?.verdict || current.verdict } : null,
+          processing: false, plannerModel: event.planner?.model || null, plannerError: event.planner?.error_code || null,
           timings: event.timings || this.snapshot.timings,
           wording: event.planner ? `${event.planner.response_language || ''} · ${event.planner.wording_source || 'model'}${event.planner.fallback_reason ? ` · ${event.planner.fallback_reason}` : ''}` : null });
         if (event.state && !conversational.has(event.state)) this.releaseMic();
@@ -227,7 +235,7 @@ export class VoiceController {
           this.player.port.postMessage({ type: 'end', generation_id: event.generation_id, connection_id: this.connectionId });
         } else this.finishPlayback(event.generation_id!, ws);
         break;
-      case 'error': this.fail(new Error(event.detail || 'The voice request could not be completed.')); break;
+      case 'error': this.update({ processing: false, error: event.detail || 'The voice request could not be completed.' }); break;
     }
   }
 
@@ -235,9 +243,10 @@ export class VoiceController {
   setAutoListen(value: boolean) { this.update({ autoListen: value }); }
   setAutoCommit(value: boolean) { this.autoCommit = value; }
   sendText(text: string) {
-    if (!text.trim() || this.ws?.readyState !== 1 || !this.snapshot.connected || !conversational.has(this.snapshot.session?.state || '')) return false;
+    if (!text.trim() || this.ws?.readyState !== 1 || !this.snapshot.connected || this.snapshot.processing || this.snapshot.commitBusy || !conversational.has(this.snapshot.session?.state || '')) return false;
     this.capturing = false;
-    this.update({ autoListen: false, listening: false, error: null, hint: 'Preparing your reply…' });
+    this.prepareReply();
+    this.update({ autoListen: false });
     this.stopPlayback(); this.send({ type: 'reset' }); this.send({ type: 'scripted_turn', text: text.trim() });
     return true;
   }
@@ -253,10 +262,15 @@ export class VoiceController {
     try {
       await this.ensureMic();
       if (!this.pttHeld || !this.snapshot.connected) return;
-      this.stopPlayback(); this.send({ type: 'reset' }); this.startListening();
+      this.stopPlayback(); this.update({ processing: false }); this.send({ type: 'reset' }); this.startListening();
     } catch { this.pttHeld = false; this.fail(new Error('Microphone access is unavailable. You can type your reply instead.')); }
   }
-  endPushToTalk() { if (!this.pttHeld) return; this.pttHeld = false; this.capturing = false; this.send({ type: 'stop' }); this.update({ listening: false, hint: 'Preparing your reply…' }); }
+  endPushToTalk() {
+    if (!this.pttHeld) return;
+    this.pttHeld = false;
+    if (!this.capturing) return;
+    this.capturing = false; this.prepareReply(); this.send({ type: 'stop' });
+  }
 
   private async refreshPlan(ws: WebSocket) {
     const session = this.snapshot.session;
@@ -282,9 +296,6 @@ export class VoiceController {
         if (epoch !== this.actionEpoch) { await context.close(); return; }
         const player = this.env.worklet(context, 'pcm-player'); this.player = player;
         player.port.onmessage = event => {
-          if (event.data.type === 'underrun' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
-            this.send({ type: 'playback_underrun', generation_id: this.generation });
-          }
           if (event.data.type === 'underrun' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
             this.send({ type: 'playback_underrun', generation_id: this.generation });
           }
@@ -376,7 +387,7 @@ export class VoiceController {
 
   async commit() {
     const session = this.snapshot.session;
-    if (!session || !this.snapshot.connected || !session.customer_confirmed || this.snapshot.commitBusy) return;
+    if (!session || !this.snapshot.connected || !session.customer_confirmed || this.snapshot.processing || this.snapshot.commitBusy) return;
     const epoch = this.actionEpoch;
     this.update({ commitBusy: true, error: null });
     try {
@@ -395,10 +406,10 @@ export class VoiceController {
     if (this.player) { this.player.port.onmessage = null; this.player.disconnect(); this.player = null; }
     const context = this.context; this.context = null;
     if (context && context.state !== 'closed') void context.close().catch(() => {});
-    this.update({ connected: false, connecting: false, commitBusy: false, hint: wasActive ? 'Disconnected. Reconnect when you are ready.' : 'Choose an order, then connect when you are ready.' });
+    this.update({ connected: false, connecting: false, commitBusy: false, processing: false, hint: wasActive ? 'Disconnected. Reconnect when you are ready.' : 'Choose an order, then connect when you are ready.' });
   }
   resetSelection() {
     this.disconnect(); this.detailRevision++;
-    this.update({ session: null, error: null, lines: [], timings: {}, wording: null, hint: 'Choose an order, then connect when you are ready.' });
+    this.update({ session: null, error: null, lines: [], timings: {}, wording: null, plannerModel: null, plannerError: null, hint: 'Choose an order, then connect when you are ready.' });
   }
 }

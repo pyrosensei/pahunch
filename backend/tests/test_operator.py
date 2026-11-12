@@ -19,7 +19,7 @@ from app import operator
 from app.calls import CallService, acknowledge_operator_revision, pending_operator_revision
 from app.db import get_session
 from app.errors import DomainError
-from app.llm import LLMCompletion
+from app.llm import LLMCompletion, LLMStructuredOutputError
 from app.models import (
     CallSession,
     DeliveryCommit,
@@ -76,6 +76,48 @@ def test_inflight_completion_cannot_confirm_or_replace_a_revised_plan_even_after
             assert not call.customer_confirmed
             fresh = await PlannerService(db, Never()).handle_turn(review.sid, AgentTurnRequest(text="Yes please go ahead"))
             assert fresh.turn.customer_confirmed
+    asyncio.run(run())
+
+
+def test_structured_output_repair_rejects_operator_revision(review):
+    class StructuredThenHeld:
+        model_name = "structured-repair-double"
+
+        def __init__(self):
+            self.requests = 0
+            self.repair_entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def complete_json(self, **kwargs):
+            self.requests += 1
+            if self.requests == 1:
+                raise LLMStructuredOutputError(
+                    "provider rejected output",
+                    detail="missing required fields: awaiting_continuation",
+                )
+            self.repair_entered.set()
+            await self.release.wait()
+            return LLMCompletion(text="{}", model=self.model_name, latency_ms=1)
+
+    async def run():
+        llm = StructuredThenHeld()
+        with Session(review.engine) as db:
+            task = asyncio.create_task(
+                PlannerService(db, llm).handle_turn(review.sid, AgentTurnRequest(text="Yes please go ahead"))
+            )
+            await asyncio.wait_for(llm.repair_entered.wait(), timeout=2)
+            changed = review.client.post(f"{review.base}/revise", headers=HEADERS, json=revision(review))
+            assert changed.status_code == 200
+            revised_id = changed.json()["proposal"]["id"]
+            llm.release.set()
+            with pytest.raises(DomainError, match="changed while processing"):
+                await task
+        with Session(review.engine) as db:
+            call = CallService(db).get_call(review.sid)
+            assert llm.requests == 2
+            assert call.current_proposal_id == revised_id
+            assert not call.customer_confirmed
+
     asyncio.run(run())
 
 
@@ -231,6 +273,46 @@ def test_committed_plan_is_immutable(review, action):
     assert not result["operator_actions"]["can_reject"] and result["operator_events"] == []
 
 
+def test_operator_facts_preserve_untouched_sources_and_clear_edited_attribution():
+    original = PlanProposal.model_validate(
+        {
+            "primary": {
+                "action": "LEAVE_WITH_NEIGHBOR",
+                "window_start": "2026-11-05T12:00:00+05:30",
+                "window_end": "2026-11-05T15:00:00+05:30",
+                "call_on_arrival": True,
+                "named_recipient": "शर्मा जी",
+                "recipient_address": "हाउस नंबर 403",
+                "recipient_source": {"turn_id": 7, "quote": "शर्मा जी"},
+                "recipient_address_source": {"turn_id": 7, "quote": "हाउस नंबर 403"},
+            },
+            "fallback": None,
+        }
+    )
+
+    unrelated = json.loads(original.model_dump_json())
+    unrelated["primary"]["window_end"] = "2026-11-05T14:00:00+05:30"
+    preserved = operator._operator_facts(PlanProposal.model_validate(unrelated), original)
+    assert preserved.primary.named_recipient == "शर्मा जी"
+    assert preserved.primary.recipient_address == "हाउस नंबर 403"
+    assert preserved.primary.recipient_source.quote == "शर्मा जी"
+    assert preserved.primary.recipient_address_source.quote == "हाउस नंबर 403"
+
+    renamed = json.loads(original.model_dump_json())
+    renamed["primary"]["named_recipient"] = "वर्मा जी"
+    edited = operator._operator_facts(PlanProposal.model_validate(renamed), original)
+    assert edited.primary.named_recipient == "वर्मा जी"
+    assert edited.primary.recipient_source is None
+    assert edited.primary.recipient_address == "हाउस नंबर 403"
+    assert edited.primary.recipient_address_source is None
+
+    changed_action = json.loads(original.model_dump_json())
+    changed_action["primary"]["action"] = "LEAVE_WITH_SECURITY"
+    reattributed = operator._operator_facts(PlanProposal.model_validate(changed_action), original)
+    assert reattributed.primary.recipient_source is None
+    assert reattributed.primary.recipient_address_source is None
+
+
 class NeverLLM:
     model_name = "not-called"
 
@@ -368,3 +450,20 @@ def test_phone_notice_requires_played_current_audio_before_releasing_quarantine(
     with Session(review.engine) as db:
         assert pending_operator_revision(db, review.sid, pid) == (mode != "played")
         assert not db.get(CallSession, review.sid).customer_confirmed
+
+
+def test_courier_release_comes_from_single_committed_record(review):
+    with Session(review.engine) as db:
+        calls = CallService(db)
+        calls.submit_turn(review.sid, CustomerTurnRequest(text="Yes", confirmation=True))
+        saved = calls.commit_plan(review.sid, "courier-release-test")
+        assert calls.commit_plan(review.sid, "courier-release-test").reused
+    route = '/api/orders/1043/courier-instructions'
+    response = review.client.get(route, headers={"X-Operator-Token": "test-operator-token"})
+    assert response.status_code == 200
+    release = response.json()
+    assert release['commit_id'] == saved.commit_id
+    assert release['session_id'] == review.sid
+    assert release['original_delivery_address']
+    assert release['contact'] is None
+    assert release['courier_card']['instructions'] == saved.courier_card.instructions
