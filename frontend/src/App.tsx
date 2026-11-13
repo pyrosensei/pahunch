@@ -1,10 +1,12 @@
 import { lazy, Suspense, useEffect } from 'react';
 import { Link, Route, Routes, useLocation, Navigate } from 'react-router-dom';
 import { Package, Headphones } from 'lucide-react';
+import { IncomingCall } from './components/IncomingCall';
 const Landing = lazy(() => import('./pages/Landing'));
 const Shop = lazy(() => import('./pages/Shop'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Voice = lazy(() => import('./pages/Voice'));
+const CustomerCall = lazy(() => import('./pages/CustomerCall'));
 
 export function Brand({ shop = false }: { shop?: boolean }) {
   return <Link className={`brand ${shop ? 'brand-shop' : ''}`} to={shop ? '/shop' : '/'} aria-label={shop ? 'SwiftCart shop' : 'Pahunch home'}>
@@ -22,7 +24,7 @@ export default function App() {
   }, [location.pathname, operations, landing]);
   const legacyOrder = landing ? new URLSearchParams(location.search).get('order_id') : null;
   if (legacyOrder) return <Navigate to={`/dashboard${location.search}`} replace/>;
-  if (landing) return <><a className="skip-link" href="#main">Skip to content</a><Suspense fallback={<main className="page">Opening Pahunch…</main>}><Landing/></Suspense></>;
+  if (landing) return <><a className="skip-link" href="#main">Skip to content</a><Suspense fallback={<main className="page">Opening Pahunch…</main>}><Landing/></Suspense><IncomingCall/></>;
   return <div className={operations ? 'operations-app' : 'customer-app'}>
     <a className="skip-link" href="#main">Skip to content</a>
     <header className="experience-header">
@@ -35,9 +37,11 @@ export default function App() {
         <Route path="/dashboard" element={<Dashboard/>}/>
         <Route path="/shop" element={<Shop/>}/>
         <Route path="/voice" element={<Voice/>}/>
+        <Route path="/call" element={<CustomerCall/>}/>
         <Route path="*" element={<main id="main" className="page"><h1>Page unavailable</h1><Link to="/shop">Go to SwiftCart</Link></main>}/>
       </Routes>
     </Suspense>
+    <IncomingCall/>
     <footer className="experience-footer"><span>{operations ? 'Pahunch · Delivery coordination' : 'SwiftCart · A fictional demo store'}</span><span>{operations ? 'Confirmed instructions are recorded for the courier.' : 'No real purchase or payment is collected.'}</span></footer>
   </div>;
 }

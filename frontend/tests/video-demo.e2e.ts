@@ -8,6 +8,9 @@ test('two-tab customer correction releases one current courier instruction card'
   const customer = await context.newPage();
   const consolePage = await context.newPage();
   await mockAudio(customer);
+  await customer.addInitScript(() => {
+    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { configurable:true, value:async () => ({getTracks:() => [{stop() {}}]}) });
+  });
   let currentOrder = {...order,payment_mode:'PREPAID',requires_otp:true};
   let current: Record<string, any> | null = null;
   let release: Record<string, any> | null = null;
@@ -34,7 +37,7 @@ test('two-tab customer correction releases one current courier instruction card'
       currentOrder={...currentOrder,status:'OUT_FOR_DELIVERY'}; return fulfill(currentOrder);
     }
     if(path.endsWith('/call')) {
-      if(token!=='demo-key'||currentOrder.status!=='OUT_FOR_DELIVERY') return fulfill({detail:'Dispatch first'},409);
+      if(token!=='demo-key'||!['PENDING','RESCHEDULED','OUT_FOR_DELIVERY'].includes(currentOrder.status)) return fulfill({detail:'Dispatch first'},409);
       current={...session,state:'CALLING'}; return fulfill(current,201);
     }
     if(path==='/api/sessions') return fulfill(current?[current]:[]);
@@ -85,9 +88,12 @@ test('two-tab customer correction releases one current courier instruction card'
   await consolePage.getByRole('button',{name:'Enter operator key'}).click();
   await consolePage.getByLabel('Operator key',{exact:true}).fill('demo-key');
   await consolePage.getByRole('button',{name:'Use operator key'}).click();
-  await dispatch.click();
-  await consolePage.getByRole('button',{name:'Prepare customer conversation'}).click();
-  await customer.getByRole('button',{name:'Connect conversation'}).click();
+  await consolePage.getByRole('button',{name:'Call customer'}).click();
+  await expect(customer.getByRole('dialog', {name:'SwiftCart is calling.'})).toBeVisible();
+  await customer.getByRole('button',{name:'Accept call'}).click();
+  await expect(customer).toHaveURL(/\/call\?session_id=/);
+  await expect(customer.getByRole('heading', {name:'Your delivery call',exact:true})).toBeVisible();
+  await expect(customer.getByRole('button',{name:'Stop microphone'})).toBeVisible();
   await customer.getByText('Keyboard fallback',{exact:true}).click();
   async function send(text:string) {
     await customer.getByRole('textbox',{name:'Your reply'}).fill(text);
@@ -122,7 +128,8 @@ test('two-tab customer correction releases one current courier instruction card'
   await expect(customer.getByRole('button',{name:'Plan saved'})).toBeDisabled();
   await expect(customer.getByText('Your confirmed instructions are saved for the courier.')).toBeVisible();
   expect(commits).toBe(1);
-  expect(writes.filter(path=>path.endsWith('/out-for-delivery'))).toHaveLength(1);
+  expect(writes.filter(path=>path.endsWith('/out-for-delivery'))).toHaveLength(0);
+  expect(currentOrder.status).toBe('PENDING');
 });
 
 test('storefront and operator console expose accessible role-specific interfaces',async({page})=>{

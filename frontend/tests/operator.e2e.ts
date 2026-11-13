@@ -285,7 +285,7 @@ test('prepared conversations stay in SwiftCart and opening timings remain distin
   await mockApi(page, {state:'CALLING'});
   await page.route('**/api/sessions/*/events', route => route.fulfill({json:[{id:1,event_type:'OPENING_LINE_SPOKEN',created_at:session.started_at,payload_json:JSON.stringify({first_audio_ms:650,tts_ms:1200})}]}));
   await page.goto('/dashboard');
-  await expect(page.getByRole('status')).toContainText('Customer voice is ready');
+  await expect(page.getByRole('status')).toContainText('Calling customer');
   await expect(page.getByRole('link',{name:'Start customer voice demo'})).toHaveCount(0);
   await page.getByText('Performance and audit details',{exact:true}).click();
   await expect(page.getByRole('tabpanel',{name:'Conversation'})).toContainText('650 ms');
@@ -296,7 +296,7 @@ test('future out-for-delivery orders require an authorized prepare action', asyn
   const requests = await mockApi(page,{sessions:false});
   await page.route('**/api/orders?**', route => route.fulfill({json:[{...order,status:'OUT_FOR_DELIVERY'}]}));
   await page.goto(`/dashboard?order_id=${order.id}`);
-  const prepare = page.getByRole('button',{name:'Prepare customer conversation'});
+  const prepare = page.getByRole('button',{name:'Call customer'});
   await expect(prepare).toBeDisabled();
   await unlock(page);
   await expect(prepare).toBeEnabled();
@@ -312,7 +312,7 @@ test('pending order selection survives refresh without starting a call', async (
   await page.goto(`/dashboard?order_id=${order.id}`);
   await page.getByRole('button',{name:`Order #${pendingId}`,exact:true}).click();
   await page.getByRole('button',{name:/Updated/}).click();
-  await expect(page.getByRole('heading',{name:'Awaiting dispatch.'})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'Confirm availability before dispatch.'})).toBeVisible();
   await expect(page.getByRole('button',{name:'Mark out for delivery'})).toBeDisabled();
   expect(requests.some(request=>request.method==='POST')).toBe(false);
 });

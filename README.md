@@ -10,7 +10,7 @@ Prisma v3.0 streaming STT · Timbre v3.0 TTS · Gemini 3.1 Flash-Lite planner ·
 [![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
 [![Gnani](https://img.shields.io/badge/speech-Prisma%20%2B%20Timbre-8A2BE2.svg)](https://app.gnani.ai/voice)
 ![Planner](https://img.shields.io/badge/planner-Gemini%203.1%20Flash--Lite-1A7CE7.svg)
-[![Tests](https://img.shields.io/badge/backend%20tests-696%20passing-2ea44f.svg)](#test--evaluation-suites)
+[![Tests](https://img.shields.io/badge/backend%20tests-698%20passing-2ea44f.svg)](#test--evaluation-suites)
 [![Live matrix](https://img.shields.io/badge/live%20matrix-19%2F21-2ea44f.svg)](#live-voice-matrix)
 
 </div>
@@ -338,8 +338,8 @@ and starts one background task, repeating every five seconds. Shutdown stops and
 awaits that task before closing clients. A worker failure appears in logs and in
 `GET /api/dialer/status`; a later successful sweep clears its error.
 
-Automatic candidates must be `OUT_FOR_DELIVERY`, have complete metadata and no
-opt-out, and have a prior failed delivery, COD payment, OTP requirement or value
+Automatic candidates may be `PENDING`, `RESCHEDULED` or `OUT_FOR_DELIVERY`,
+have complete metadata and no opt-out, and have a prior failed delivery, COD payment, OTP requirement or value
 of at least INR 25,000. Their window must satisfy
 `window_start - 60 minutes <= now < window_end`. Naive order timestamps follow
 policy's IST interpretation; stored call timestamps without a zone use UTC.
@@ -481,10 +481,10 @@ are reported separately in `D_REVIEW.md` and `E_REVIEW.md`.
 
 | Suite | Command | Network | Proves |
 |---|---|---|---|
-| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **696 tests** |
+| Unit + integration | `cd backend && uv run pytest` | none | Policy, state machine, planner guards, scheduler, synthetic shop/dashboard, VAD, streaming STT and mocked phone transport — **698 tests** |
 | Browser regressions | `cd backend && node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs` | none | **24 tests** of voice, shop and dashboard behavior against browser API/DOM fakes |
 | Frontend unit | `cd frontend && npm test` | none | **40 Vitest tests** for delivery progress, voice controller and selection state |
-| Frontend e2e | `cd frontend && npm run test:e2e` | none | **171 Playwright checks** (57 specs × desktop/mobile/tablet) for landing, shop, dashboard, voice and operator flows with mocked API, audio and WebSocket |
+| Frontend e2e | `cd frontend && npm run test:e2e` | none | **183 Playwright checks** (61 specs × desktop/mobile/tablet) for landing, shop, dashboard, voice and operator flows with mocked API, audio and WebSocket |
 | Frontend build | `cd frontend && npm run build` | none | TypeScript and Vite production build served by FastAPI |
 | Deterministic scenarios | `cd backend && uv run python ../evals/runner.py` | none | End-to-end call flows with scripted plans and no LLM |
 | Live planner cases | `cd backend && uv run python ../evals/planner_runner.py` | Configured planner | The model returns schema-valid decisions for fixed Hinglish turns |
@@ -646,13 +646,13 @@ The database is created and seeded automatically on startup (8 synthetic orders,
 
 ```bash
 cd backend
-uv run pytest              # 696 tests, no external network required
+uv run pytest              # 698 tests, no external network required
 node --test --test-reporter=tap tests/voice_browser.test.cjs tests/demo_browser.test.cjs  # 24 browser regressions
 
 cd ../frontend
 npm ci
 npm test                   # 40 frontend unit tests
-npm run test:e2e           # 171 Playwright checks (mocked API)
+npm run test:e2e           # 183 Playwright checks (mocked API)
 npm run build              # production build served by FastAPI
 ```
 
@@ -821,16 +821,18 @@ cd ..\backend
    payment method, then place the demo order. Keep its order page open.
 2. Open `http://127.0.0.1:8000/dashboard` as the operator. Enter the existing
    `OPERATOR_API_TOKEN` from the local `backend/.env` in the access form.
-   Select the order, mark it out for delivery, then prepare its conversation.
-3. Return to that SwiftCart order. Connect the conversation and enable the
-   microphone. Keyboard fallback is available for scripted rehearsal.
+   Select the order and choose **Call customer** to confirm availability before dispatch.
+3. Return to the customer tab and accept the incoming-call prompt. The dedicated
+   call page opens and requests microphone access. Keyboard fallback is available
+   for scripted rehearsal.
 4. Discuss the arrangement and explicitly confirm the final version. In the
    console, open **Courier instructions** to inspect the saved commit, original
    address, authorized recipient, handoff location, time and OTP instructions.
 
-The storefront uses the supplied pink, coral, near-black and white palette.
+The landing page and storefront use white, yellow and charcoal.
 The operations console uses near-black, blue, green and gray. Dispatch actions
-require operator access. Pending orders remain outside conversation admission.
+require operator access. Pending orders can receive availability calls before
+the courier departs. **Mark out for delivery** separately records dispatch.
 The console initially lists the 20 most recent catalog orders; history includes
 older records, and the selected order stays selected as new orders arrive.
 
@@ -842,7 +844,10 @@ ineligible neighbour's location. Courier-to-customer OTP verification applies
 at handoff. The AI never collects the code.
 
 Commit updates the saved courier arrangement and any changed appointment
-atomically. The original delivery address remains the address of record.
+atomically. A pending parcel stays pending after a confirmed appointment change.
+The original delivery address remains the address of record. An already-dispatched
+parcel can receive a revised appointment on the same order. Physical route
+adjustments remain the courier operation’s responsibility.
 The courier view displays the authorized neighbour location separately and
 reports unavailable contact details explicitly. Refresh failures retain the
 last retrieved instructions with a stale-data warning.

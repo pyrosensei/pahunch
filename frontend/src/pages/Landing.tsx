@@ -49,7 +49,7 @@ function DeliveryScene({ phase }: { phase: number }) {
     const rect = event.currentTarget.getBoundingClientRect();
     setTilt(((event.clientX - rect.left) / rect.width - .5) * .14);
   }} onPointerLeave={() => setTilt(0)}>
-    <div className="diorama-heading"><span>SWIFTCART → YOUR DOOR</span><span>FIG. 01</span></div>
+    <div className="diorama-heading"><span>A little conversation. A better delivery.</span></div>
     <div className="delivery-canvas" aria-hidden="true">
       {entered && !reduced && !lost ? <SceneBoundary fallback={fallback}><Suspense fallback={fallback}><Scene phase={phase} tilt={paused ? 0 : tilt} active={visible && !paused} onContextLost={() => setLost(true)} /></Suspense></SceneBoundary> : fallback}
     </div>

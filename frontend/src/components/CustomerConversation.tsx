@@ -6,20 +6,28 @@ import { conversationState } from '../voice/presentation';
 import { terminal } from '../api';
 import { VoicePlanDetails } from './VoicePlanDetails';
 
-export function CustomerConversation({ sessionId, savedCard, sessionState }: { sessionId: string; savedCard?: JsonObject | null; sessionState?: string }) {
+export function CustomerConversation({ sessionId, savedCard, sessionState, autoConnect = false }: { sessionId: string; savedCard?: JsonObject | null; sessionState?: string; autoConnect?: boolean }) {
   const [controller] = useState(() => new VoiceController());
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const [text, setText] = useState('');
   const tail = useRef<HTMLDivElement>(null);
+  const microphoneRequested = useRef(false);
   useEffect(() => {
     controller.setAutoCommit(true);
+    if (autoConnect && !terminal.has(sessionState || '') && !savedCard) void controller.connect({ sessionId });
     return () => controller.disconnect();
-  }, [controller]);
+  }, [controller, sessionId, autoConnect, sessionState, savedCard]);
   useEffect(() => { tail.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }, [state.lines.length]);
   const presentation = conversationState(state);
   const writable = state.connected && ['DISCOVERY', 'NEGOTIATION', 'PENDING_CONFIRMATION'].includes(state.session?.state || '');
   const pending = state.processing || state.commitBusy;
   const ended = terminal.has(state.session?.state || sessionState || '');
+  useEffect(() => {
+    if (autoConnect && writable && !microphoneRequested.current) {
+      microphoneRequested.current = true;
+      void controller.toggleMicrophone();
+    }
+  }, [autoConnect, writable, controller]);
   function send() { if (controller.sendText(text)) setText(''); }
   return <section className="customer-conversation" aria-label="Delivery conversation">
     <div className="customer-call-heading"><div className="call-symbol"><AudioLines size={27}/></div><div><span className="eyebrow">PAHUNCH DELIVERY ASSISTANT</span><h2>{ended ? savedCard || state.session?.courier_card ? 'Your delivery instructions are saved.' : 'The conversation has ended.' : state.connected ? presentation.label : 'Let’s arrange your delivery.'}</h2></div></div>

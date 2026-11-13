@@ -214,7 +214,7 @@ def test_dashboard_redacts_legacy_transcript_and_supports_cursor(demo):
     assert client.get(f"/api/sessions/{sid}/turns?after_id={cursor}").json() == []
 
 
-def test_dispatch_requires_operator_access_and_out_for_delivery(demo, monkeypatch):
+def test_predispatch_call_requires_operator_access_without_dispatching(demo, monkeypatch):
     from types import SimpleNamespace
 
     from app import operator
@@ -227,9 +227,9 @@ def test_dispatch_requires_operator_access_and_out_for_delivery(demo, monkeypatc
     assert client.post(ready).status_code == 401
     assert client.post(prepare).status_code == 401
     headers = {"X-Operator-Token": "demo-test-key"}
-    assert client.post(prepare, headers=headers).status_code == 409
-    assert client.post(ready, headers=headers).status_code == 200
     assert client.post(prepare, headers=headers).status_code == 201
+    assert client.get(f"/api/orders/{order['id']}").json()["status"] == "PENDING"
+    assert client.post(ready, headers=headers).status_code == 200
     assert client.post(prepare, headers=headers).status_code == 409
     assert client.get(f"/api/orders/{order['id']}/courier-instructions").status_code == 401
     assert client.get(f"/api/orders/{order['id']}/courier-instructions", headers=headers).json() is None
@@ -247,3 +247,44 @@ def test_recent_order_limit_preserves_the_legacy_unbounded_listing(demo):
     assert first['id'] in [item['id'] for item in all_orders]
     assert all_orders[0]['id'] < all_orders[-1]['id']
     assert client.get('/api/orders?limit=0').status_code==422
+
+@pytest.mark.parametrize('already_dispatched', [False, True])
+def test_rescheduling_updates_the_same_parcel_only_after_confirmation(demo, already_dispatched):
+    client, _, _ = demo
+    order = client.post('/api/orders', json={'product_id':'backpack','payment_mode':'PREPAID'}).json()
+    order_id = order['id']
+    before_count = len(client.get('/api/orders').json())
+    if already_dispatched:
+        assert client.post(f'/api/orders/{order_id}/out-for-delivery').status_code == 200
+    call = client.post(f'/api/orders/{order_id}/call').json()
+    sid = call['id']
+    assert client.post(f'/api/sessions/{sid}/connect').status_code == 200
+    assert client.post(f'/api/sessions/{sid}/context-confirmation').status_code == 200
+    tomorrow = DELIVERY_START + timedelta(days=1, hours=7)
+    proposed = client.post(f'/api/sessions/{sid}/turns', json={
+        'text':'I cannot receive this appointment. Please deliver the next day at five.',
+        'proposal':{'primary':{'action':'RESCHEDULE', 'window_start':tomorrow.isoformat(),
+            'window_end':(tomorrow + timedelta(hours=1)).isoformat(), 'call_on_arrival':True}},
+    })
+    assert proposed.status_code == 200 and proposed.json()['verdict']['valid']
+    assert client.get(f'/api/orders/{order_id}').json()['window_start'] == order['window_start']
+    commit_path = f'/api/sessions/{sid}/commit'
+    commit_body = {'idempotency_key':f'predispatch-reschedule-{already_dispatched}'}
+    assert client.post(commit_path,json=commit_body).status_code == 409
+    assert client.post(f'/api/sessions/{sid}/turns',json={'text':'Yes, confirm that date.','confirmation':True}).json()['customer_confirmed']
+    committed = client.post(commit_path,json=commit_body)
+    assert committed.status_code == 200
+    saved = client.get(f'/api/orders/{order_id}').json()
+    assert saved['id'] == order_id
+    assert saved['status'] == ('RESCHEDULED' if already_dispatched else 'PENDING')
+    assert datetime.fromisoformat(saved['window_start']) == tomorrow
+    assert saved['prior_attempts'] == order['prior_attempts']
+    assert saved['delivery_address_summary'] == order['delivery_address_summary']
+    assert len(client.get('/api/orders').json()) == before_count
+    instructions = client.get(f'/api/orders/{order_id}/courier-instructions').json()
+    assert datetime.fromisoformat(instructions['courier_card']['window_start']) == datetime.fromisoformat(saved['window_start'])
+    assert any('OTP' in line for line in instructions['courier_card']['instructions'])
+    repeated = client.post(commit_path,json=commit_body).json()
+    assert repeated['reused'] and repeated['commit_id'] == committed.json()['commit_id']
+    # Dispatch is an independent operator action, including a revised next attempt.
+    assert client.post(f'/api/orders/{order_id}/out-for-delivery').json()['status'] == 'OUT_FOR_DELIVERY'

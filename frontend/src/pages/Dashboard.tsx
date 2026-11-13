@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { AudioLines, CheckCircle2, ChevronRight, FileCheck2, LockKeyhole, MessageSquare, RefreshCw, Truck } from 'lucide-react';
+import { AudioLines, Phone, CheckCircle2, ChevronRight, FileCheck2, LockKeyhole, MessageSquare, RefreshCw, Truck } from 'lucide-react';
 import { api, dateTime, label, terminal } from '../api';
 import type { Order, Call } from '../api';
 import { OperatorReview } from './OperatorReview';
@@ -42,6 +42,7 @@ export default function Dashboard() {
   const [courierLoadedAt, setCourierLoadedAt] = useState<string | null>(null);
   const [token, setToken] = useState(readKey);
   const [tokenDraft, setTokenDraft] = useState('');
+  const tokenInput = useRef<HTMLInputElement>(null);
   const [authorized, setAuthorized] = useState(false);
   const [accessOpen, setAccessOpen] = useState(false);
   const [error, setError] = useState('');
@@ -132,6 +133,7 @@ export default function Dashboard() {
     }
     void read(); return () => { abort.abort(); clearTimeout(timer); };
   }, [orderId, sessionId, authorized, token, revision]);
+  useEffect(() => { if (accessOpen) tokenInput.current?.focus(); }, [accessOpen]);
   function storeKey(event: FormEvent) {
     event.preventDefault();
     const next = tokenDraft.trim(); if (!next) return;
@@ -147,7 +149,12 @@ export default function Dashboard() {
     setBusy(true); setDispatchError('');
     try {
       const path = action === 'ready' ? `/api/orders/${order.id}/out-for-delivery` : `/api/orders/${order.id}/call`;
-      await api(path, { method: 'POST', headers: { 'X-Operator-Token': token } });
+      const options = { method: 'POST', headers: { 'X-Operator-Token': token } };
+      if (action === 'ready') await api<Order>(path, options);
+      else {
+        const created = await api<Call>(path, options);
+        setCalls(current => [created, ...current.filter(item => item.id !== created.id)]);
+      }
       setRevision(value => value + 1);
     } catch (failure) { setDispatchError((failure as Error).message); }
     finally { setBusy(false); }
@@ -155,19 +162,25 @@ export default function Dashboard() {
   const metrics = events.filter(event => event.event_type === 'VOICE_TURN').map(payload).at(-1);
   const opening = events.filter(event => event.event_type === 'OPENING_LINE_SPOKEN').map(payload).at(-1);
   const tabs: [WorkspaceTab, string][] = [['conversation', 'Conversation'], ['review', 'Review'], ['courier', 'Courier instructions']];
-  const canPrepare = order?.status === 'OUT_FOR_DELIVERY' && !call;
+  const canPrepare = !!order && ['PENDING', 'RESCHEDULED', 'OUT_FOR_DELIVERY'].includes(order.status) && !call;
   return <main id="main" className="operations-page">
     <header className="operations-title"><div><span className="eyebrow">DISPATCH DESK</span><h1>Every conversation.<br/><em>A clear next step.</em></h1></div><div className="operations-health"><span className="live-indicator"/>PC voice demo<button className="text-link" onClick={() => setRevision(value => value + 1)}><RefreshCw size={14}/>{updated ? `Updated ${new Date(updated).toLocaleTimeString('en-IN')}` : 'Refresh'}</button></div></header>
-    <section className="operator-access" aria-label="Operator access"><div><LockKeyhole size={15}/><strong>{authorized ? 'Operator access active' : 'Read-only monitoring'}</strong><span>{authorized ? 'Dispatch and review actions are available.' : 'Enter your operator key to dispatch and review deliveries.'}</span></div><button className="text-link" onClick={() => setAccessOpen(value => !value)}>{accessOpen ? 'Close access settings' : 'Enter operator key'}</button>{token && <button className="text-link" onClick={clearKey}>Clear access</button>}{accessOpen && <form onSubmit={storeKey}><label>Operator key<input type="password" aria-label="Operator key" value={tokenDraft} onChange={event => setTokenDraft(event.target.value)} autoComplete="off"/></label><button className="button primary" disabled={!tokenDraft.trim()}>Use operator key</button></form>}{accessError && <p className="notice error" role="alert">{accessError}</p>}</section>
+    <section className="operator-access" aria-label="Operator access"><div><LockKeyhole size={15}/><strong>{authorized ? 'Operator access active' : 'Read-only monitoring'}</strong><span>{authorized ? 'Dispatch and review actions are available.' : 'Enter your operator key to dispatch and review deliveries.'}</span></div><button className="text-link" onClick={() => setAccessOpen(value => !value)}>{accessOpen ? 'Close access settings' : 'Enter operator key'}</button>{token && <button className="text-link" onClick={clearKey}>Clear access</button>}{accessOpen && <form onSubmit={storeKey}><label>Operator key<input ref={tokenInput} type="password" aria-label="Operator key" value={tokenDraft} onChange={event => setTokenDraft(event.target.value)} autoComplete="off"/></label><button className="button primary" disabled={!tokenDraft.trim()}>Use operator key</button></form>}{accessError && <p className="notice error" role="alert">{accessError}</p>}</section>
     {error && <p className="notice error" role="alert">{error}</p>}
     <div className="operations-workspace"><aside className="operations-orders"><div className="operations-list-title"><h2>{history ? 'Order history' : 'Demo orders'}</h2><span>{orders.length}</span></div><label className="history-toggle"><input type="checkbox" checked={history} onChange={event => setHistory(event.target.checked)}/>Include older records</label><div className="operations-order-list">{loading ? <p role="status">Loading orders…</p> : !orders.length ? <p>No demo orders yet. Place an order in SwiftCart to begin.</p> : orders.map(item => {
       const session = calls.find(value => value.order_id === item.id);
       return <button key={item.id} className={`operations-order ${orderId === item.id ? 'selected' : ''}`} aria-label={`Order #${item.id}`} aria-pressed={orderId === item.id} onClick={() => setParams({ order_id: String(item.id) })}><span><strong>#{item.id}</strong><ChevronRight size={16}/></span><small>{item.merchant_name} · {item.payment_mode === 'COD' ? 'Cash on delivery' : 'Prepaid'}</small><span className={session?.courier_card ? 'order-result saved' : 'order-result'}>{session?.courier_card ? 'Instructions saved' : label(session?.state || item.status)}</span></button>;
     })}</div></aside>
     <section className="operations-detail" aria-label="Selected delivery">
-      {order ? <><header className="selected-order-heading"><div><span className="eyebrow">SWIFTCART / ORDER #{order.id}</span><h2>{call?.courier_card ? 'Instructions confirmed.' : order.status === 'PENDING' ? 'Awaiting dispatch.' : call ? 'Conversation in progress.' : 'Ready for a conversation.'}</h2></div><span className="order-result">{label(order.status)}</span></header>
+      {order ? <><header className="selected-order-heading"><div><span className="eyebrow">SWIFTCART / ORDER #{order.id}</span><h2>{call?.courier_card ? 'Instructions confirmed.' : order.status === 'PENDING' ? 'Confirm availability before dispatch.' : call ? 'Conversation in progress.' : 'Ready for a conversation.'}</h2></div><span className="order-result">{label(order.status)}</span></header>
         <dl className="selected-order-facts"><div><dt>Delivery window · IST</dt><dd>{dateTime(order.window_start)} – {dateTime(order.window_end)}</dd></div><div><dt>Original delivery address</dt><dd>{order.delivery_address_summary}</dd></div><div><dt>Handoff</dt><dd>{order.payment_mode === 'COD' ? 'Cash on delivery · direct handoff' : order.requires_otp ? 'Prepaid · courier verifies OTP' : 'Prepaid'}</dd></div></dl>
-        <div className="dispatch-actions">{order.status === 'PENDING' && <button className="button primary" disabled={!authorized || busy || !!error} onClick={() => void dispatch('ready')}><Truck size={17}/>{busy ? 'Updating…' : 'Mark out for delivery'}</button>}{canPrepare && <button className="button primary" disabled={!authorized || busy || !!error} onClick={() => void dispatch('prepare')}><AudioLines size={17}/>{busy ? 'Preparing…' : 'Prepare customer conversation'}</button>}{call && !terminal.has(call.state) && <p role="status">Customer voice is ready on this order’s SwiftCart page.</p>}{order.status === 'PENDING' && <p>Customer voice becomes available after dispatch and conversation preparation.</p>}</div>
+        <div className="dispatch-actions">
+          {!call && <button className="button primary" disabled={!authorized || !canPrepare || busy || !!error} onClick={() => void dispatch('prepare')}><Phone size={17}/>{busy ? 'Calling…' : 'Call customer'}</button>}
+          {!authorized && <button className="button secondary" onClick={() => setAccessOpen(true)}><LockKeyhole size={17}/>Unlock calling</button>}
+          {['PENDING', 'RESCHEDULED'].includes(order.status) && <button className="button secondary" disabled={!authorized || busy || !!error} onClick={() => void dispatch('ready')}><Truck size={17}/>{busy ? 'Updating…' : 'Mark out for delivery'}</button>}
+          {call && !terminal.has(call.state) && <p role="status">{call.state === 'CALLING' ? 'Calling customer. Waiting for them to accept in SwiftCart.' : 'Customer call is active. Follow the conversation below.'}</p>}
+          {order.status === 'PENDING' && <p>Call before the parcel leaves to confirm the date, time and recipient. The confirmed plan is saved for the courier; dispatch remains a separate action.</p>}
+        </div>
         {dispatchError && <p className="notice error" role="alert">{dispatchError}</p>}
         <div className="workspace-tabs" role="tablist" aria-label="Delivery workspace" onKeyDown={event => {
           if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -177,7 +190,7 @@ export default function Dashboard() {
         }}>{tabs.map(([id, title]) => <button key={id} id={`tab-${id}`} role="tab" aria-selected={tab === id} aria-controls={`panel-${id}`} tabIndex={tab === id ? 0 : -1} onClick={() => setTab(id)}>{title}{id === 'courier' && courier && <CheckCircle2 size={14}/>}</button>)}</div>
         {detailError && <p className="notice error" role="status">{detailError}</p>}
         <div id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`}>
-          {tab === 'conversation' && <><div className="operations-transcript" aria-label="Recorded conversation">{turns.length ? turns.map(turn => <article key={turn.id} className={`operations-turn ${turn.speaker.toLowerCase()}`}><header><strong>{turn.speaker === 'AGENT' ? 'Pahunch' : turn.speaker === 'CUSTOMER' ? 'Customer' : 'Operator / system'}</strong><time>{dateTime(turn.created_at)}</time></header><p>{turn.text}</p>{turn.structured_payload?.planner && <TurnMeta planner={turn.structured_payload.planner}/>}</article>) : <div className="operations-empty"><MessageSquare size={35}/><h3>{call ? 'Ready for the customer.' : 'The conversation will appear here.'}</h3><p>{call ? 'Connect from the selected order in SwiftCart. The agent speaks first.' : 'Dispatch this order and prepare its customer conversation to begin.'}</p></div>}</div>
+          {tab === 'conversation' && <><div className="operations-transcript" aria-label="Recorded conversation">{turns.length ? turns.map(turn => <article key={turn.id} className={`operations-turn ${turn.speaker.toLowerCase()}`}><header><strong>{turn.speaker === 'AGENT' ? 'Pahunch' : turn.speaker === 'CUSTOMER' ? 'Customer' : 'Operator / system'}</strong><time>{dateTime(turn.created_at)}</time></header><p>{turn.text}</p>{turn.structured_payload?.planner && <TurnMeta planner={turn.structured_payload.planner}/>}</article>) : <div className="operations-empty"><MessageSquare size={35}/><h3>{call ? 'Ready for the customer.' : 'The conversation will appear here.'}</h3><p>{call ? 'The customer accepts the incoming call in SwiftCart. Their talking page opens automatically and the assistant speaks first.' : 'Select Call customer to confirm availability before dispatch.'}</p></div>}</div>
           <details className="operations-diagnostics"><summary>Performance and audit details</summary><dl>{[['First substantive audio', metrics?.first_response_audio_ms], ['Speech recognition', metrics?.stt_ms], ['Planning', metrics?.planner_ms], ['Speech synthesis', metrics?.tts_ms], ['Total server turn', metrics?.total_ms], ['Introduction first audio', opening?.first_audio_ms]].map(([name, value]) => <div key={String(name)}><dt>{String(name)}</dt><dd>{ms(value)}</dd></div>)}</dl><p>Server timings exclude device playback and speech endpoint detection.</p><details><summary>Audit trail</summary>{events.map(event => <article key={event.id}><strong>{label(event.event_type)}</strong><small>{dateTime(event.created_at)}</small><pre>{JSON.stringify(payload(event), null, 2)}</pre></article>)}</details></details></>}
           {tab === 'review' && <div className="operations-review">{call ? <><OperatorReview key={call.id} summary={operator} fallbackPlan={call.proposal || null} confirmed={call.customer_confirmed} committed={!!call.courier_card} token={authorized ? token : ''} stale={!!operatorError || !!error} order={order} onUpdated={value => { setOperator(value); setRevision(number => number + 1); }}/><section className="operations-summary" aria-label="Conversation summary"><h3>Customer request & outcome</h3><p>{operator?.summary.text || 'Unlock operator access to read the verified summary.'}</p>{operator?.customer_requests.slice(-3).map(request => <blockquote key={request.turn_id}>{request.text}</blockquote>)}</section>{!!operator?.operator_events.length && <section className="operations-summary"><h3>Operator decisions</h3>{operator.operator_events.map(event => <article key={event.id}><strong>{label(event.action)}</strong><p>{event.reason}</p><small>{dateTime(event.created_at)}</small></article>)}</section>}</> : <div className="operations-empty"><FileCheck2 size={35}/><h3>Review follows the conversation.</h3><p>Validated proposals and customer confirmation will appear here.</p></div>}</div>}
           {tab === 'courier' && <section className="courier-release" aria-label="Released courier instructions">{courier ? <><div className="courier-release-heading"><CheckCircle2 size={29}/><div><span className="eyebrow">CUSTOMER CONFIRMED</span><h3>Ready for the courier.</h3></div></div><dl className="courier-reference"><dt>Order</dt><dd>#{courier.order_id}</dd><dt>Commit reference</dt><dd>{courier.commit_id}</dd><dt>Confirmed at</dt><dd>{dateTime(courier.committed_at)}</dd><dt>Original delivery address</dt><dd>{courier.original_delivery_address}</dd><dt>Customer contact</dt><dd>{courier.contact || 'Contact details are not recorded in this demo.'}</dd></dl><VoicePlanDetails proposal={call?.proposal || null} card={courier.courier_card}/><p className="courier-release-note">Loaded from the saved delivery commit. {courierLoadedAt && `Last retrieved ${dateTime(courierLoadedAt)}.`} The delivery outcome remains pending.</p></> : <div className="operations-empty"><FileCheck2 size={35}/><h3>{authorized ? 'Waiting for confirmed instructions.' : 'Operator access required.'}</h3><p>{authorized ? 'The courier’s instructions appear after explicit customer confirmation and a successful save.' : 'Unlock operator access to retrieve the saved courier instructions.'}</p></div>}</section>}
