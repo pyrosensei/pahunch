@@ -115,16 +115,43 @@ def merge_details(db, session_id, text, old, new):
         ):
             raise ValueError("TIME_SOURCE_REQUIRED")
         result.window_end = new.window_end
-    if new.action == "HAND_TO_CUSTOMER":
+    action = new.handoff_action or new.action
+    if action == "HAND_TO_CUSTOMER":
         result.recipient_source = None
         result.recipient_address_source = None
-    if new.action != "UNSPECIFIED" and not (
-        new.action == "RESCHEDULE"
+    if action != "UNSPECIFIED" and not (
+        action == "RESCHEDULE"
         and old.action in {"LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY"}
     ):
-        result.action = new.action
+        result.action = action
     result.call_on_arrival = new.call_on_arrival
     return result
+
+
+def normalize_relative_day(db, session_id, text, decision, call_date):
+    details = decision.request_details
+    if details is None or details.relative_day_source is None:
+        return
+    quote = evidence_text(db, session_id, text, details.relative_day_source, field="time_source")
+    offsets = {"today": 0, "aaj": 0, "आज": 0, "tomorrow": 1, "kal": 1, "कल": 1}
+    offset = offsets.get(quote.casefold().strip())
+    if offset is None:
+        raise ValueError("TIME_RELATIVE_DAY_AMBIGUOUS")
+    requested_date = call_date + timedelta(days=offset)
+    primary = decision.proposal.primary if decision.proposal else None
+    start = details.window_start or (primary.window_start if primary else None)
+    if start is None:
+        return
+    local = _utc(start).astimezone(IST)
+    shift = timedelta(days=(requested_date - local.date()).days)
+    details.window_start = local + shift
+    if details.window_end is not None:
+        details.window_end = _utc(details.window_end).astimezone(IST) + shift
+    if primary is not None and primary.window_start is not None:
+        primary_start = _utc(primary.window_start).astimezone(IST)
+        primary_shift = timedelta(days=(requested_date - primary_start.date()).days)
+        primary.window_start = primary_start + primary_shift
+        primary.window_end = _utc(primary.window_end).astimezone(IST) + primary_shift
 
 
 def ground_recipient(db, session_id, text, step, details):

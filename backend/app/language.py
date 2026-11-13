@@ -591,10 +591,29 @@ def recipient_label(field: str, quote: str) -> str:
         if match and 1 <= len(match.group(1).split()) <= 3:
             return match.group(1).strip(" ,.")
         return text
-    if field != "recipient_address" or _HOUSE_CUE.search(text) is None:
+    if field != "recipient_address":
+        return text
+    tokens = normalize_text(text).split()
+    number_words = set(_DIGIT_WORDS) | {"hundred", "sau", "सौ", "and", "aur", "और"}
+    if _HOUSE_CUE.search(text) is None and not all(token in number_words or token.isdigit() for token in tokens):
+        return text
+    hundred_index = next((index for index, token in enumerate(tokens) if token in {"hundred", "sau", "सौ"}), None)
+    if hundred_index is not None:
+        indices = [index for index, token in enumerate(tokens) if token in _DIGIT_WORDS or token.isdigit()]
+        if not indices:
+            return text
+        expression_end = max(indices[-1], hundred_index) + 1
+        expression = tokens[indices[0]:expression_end]
+        expression = [token for token in expression if token not in {"and", "aur", "और"}]
+        if len(expression) not in {2, 3} or expression[1] not in {"hundred", "sau", "सौ"}:
+            return text
+        hundreds = _DIGIT_WORDS.get(expression[0], expression[0])
+        units = _DIGIT_WORDS.get(expression[-1], expression[-1]) if len(expression) == 3 else "0"
+        if hundreds.isdigit() and units.isdigit() and 1 <= int(hundreds) <= 9 and 0 <= int(units) <= 9:
+            return str(int(hundreds) * 100 + int(units))
         return text
     digits = []
-    for token in normalize_text(text).split():
+    for token in tokens:
         if token.isdigit():
             digits.append(token)
         elif token in _DIGIT_WORDS:
@@ -782,7 +801,7 @@ def is_call_purpose_question(text: str) -> bool:
 def is_availability_acceptance(text: str) -> bool:
     cleaned = " ".join(re.sub(r"[?!.।,]", " ", text.casefold()).split())
     return cleaned in {
-        "yes", "yes i am available", "yes i'll be home", "yes i will be home",
+        "yes", "okay", "ok", "theek hai", "thik hai", "ठीक है", "yes i am available", "yes i'll be home", "yes i will be home",
         "haan", "han", "haan main ghar par hoon", "haan available hoon",
         "हाँ", "हां", "जी हाँ", "हाँ मैं घर पर हूँ", "हां मैं घर पर हूं",
         "हाँ उपलब्ध हूँ", "हां उपलब्ध हूं",

@@ -26,7 +26,7 @@ def frontend_client(tmp_path, monkeypatch):
     return make_client
 
 
-@pytest.mark.parametrize("path", ["/", "/dashboard", "/shop", "/voice"])
+@pytest.mark.parametrize("path", ["/", "/dashboard", "/shop", "/voice", "/call", "/call?session_id=example&order_id=1042"])
 def test_built_app_routes_serve_the_react_shell(frontend_client, path):
     with frontend_client(built=True) as client:
         response = client.get(path)

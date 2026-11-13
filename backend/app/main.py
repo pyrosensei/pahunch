@@ -268,6 +268,10 @@ def create_app(
             content_type,
         )
 
+    @app.post("/api/sessions/{session_id}/decline", response_model=CallSession)
+    def decline_call(session_id: str, session: SessionDep) -> CallSession:
+        return CallService(session).decline(session_id)
+
     @app.post("/api/sessions/{session_id}/no-answer", response_model=CallSession)
     def no_answer(session_id: str, session: SessionDep) -> CallSession:
         return CallService(session).mark_no_answer(session_id)
@@ -356,6 +360,7 @@ def create_app(
         @app.get("/dashboard", include_in_schema=False)
         @app.get("/shop", include_in_schema=False)
         @app.get("/voice", include_in_schema=False)
+        @app.get("/call", include_in_schema=False)
         def frontend_page():
             return FileResponse(frontend_index)
 

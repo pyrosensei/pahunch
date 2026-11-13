@@ -47,9 +47,11 @@ class RequestDetails(BaseModel):
     window_start: datetime | None = None
     window_end: datetime | None = None
     time_source: CustomerEvidence | None = None
+    relative_day_source: CustomerEvidence | None = Field(default=None, description="Quote only today, tomorrow, aaj, kal, आज or कल when the requested primary date is relative to call_date. The backend resolves this day.")
     recipient_source: CustomerEvidence | None = None
     recipient_address_source: CustomerEvidence | None = None
     action: Literal["UNSPECIFIED", "HAND_TO_CUSTOMER", "LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY", "RESCHEDULE"] = "UNSPECIFIED"
+    handoff_action: Literal["HAND_TO_CUSTOMER", "LEAVE_WITH_NEIGHBOR", "LEAVE_WITH_SECURITY"] | None = Field(default=None, description="The customer's explicitly requested recipient action, independent of a time change. Use HAND_TO_CUSTOMER for 'directly to me instead', even if action is RESCHEDULE. Use null for a time-only change.")
     call_on_arrival: bool = True
 
 
@@ -100,7 +102,7 @@ class PlannerDecision(BaseModel):
     action: PlannerAction
     awaiting_continuation: bool = False
     request_details: RequestDetails | None = None
-    missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "other"]] = Field(default_factory=list, max_length=6)
+    missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "availability", "other"]] = Field(default_factory=list, max_length=6)
     message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
@@ -152,6 +154,7 @@ class PolicyVerdict(BaseModel):
 
 class CustomerTurnRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2_000)
+    transcript_confidence: float | None = Field(default=None, ge=0, le=1)
     proposal: PlanProposal | None = None
     confirmation: bool = False
     address_change_requested: bool = False

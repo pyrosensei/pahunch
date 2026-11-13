@@ -8,6 +8,8 @@ from uuid import uuid4
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.config import settings
+from app.consent import is_explicit_confirmation
 from app.errors import DomainError
 from app.language import has_otp_disclosure, redact_payload
 from app.models import (
@@ -26,6 +28,7 @@ from app.models import (
     PolicyDecisionRecord,
     Speaker,
     Turn,
+    TwilioBinding,
 )
 from app.policy import HIGH_VALUE_THRESHOLD_INR, _utc, validate_plan
 from app.schemas import (
@@ -43,12 +46,17 @@ from app.tools import ToolName, require_tool
 MAX_TURNS = 8
 MAX_CLARIFICATIONS = 3
 CALL_COOLDOWN = timedelta(hours=1)
+MANUAL_BROWSER_RETRY_DELAY = timedelta(seconds=30)
 MAX_CALL_ATTEMPTS = 3
 ADMISSION_LOCK = RLock()
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _call_time(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def pending_operator_revision(db: Session, session_id: str, proposal_id: str | None) -> bool:
@@ -153,14 +161,8 @@ class CallService:
                     return "NON_RETRYABLE_FAILURE"
         if len(existing) >= MAX_CALL_ATTEMPTS:
             return "ATTEMPT_LIMIT"
-        completed = [call.ended_at or call.started_at for call in existing]
-        if order.last_call_completed_at is not None:
-            completed.append(order.last_call_completed_at)
-        if (
-            completed
-            and now - max(t.replace(tzinfo=UTC) if t.tzinfo is None else t for t in completed)
-            < CALL_COOLDOWN
-        ):
+        retry_at = self.retry_after(order, existing, automatic=automatic)
+        if retry_at is not None and now < retry_at:
             return "COOLDOWN"
         if automatic:
             if self._trigger_reason(order) == "DELIVERY_CONFIRMATION":
@@ -175,6 +177,21 @@ class CallService:
             select(CallSession.id).where(CallSession.state.notin_(TERMINAL_STATES))
         ).first()
         return "CAPACITY" if active is not None else None
+
+    def retry_after(self, order: Order, history: list[CallSession], *, automatic: bool = False) -> datetime | None:
+        if not history:
+            return _call_time(order.last_call_completed_at) + CALL_COOLDOWN if order.last_call_completed_at else None
+        latest = max(history, key=lambda call: _call_time(call.ended_at or call.started_at))
+        completed = _call_time(latest.ended_at or latest.started_at)
+        if order.last_call_completed_at and _call_time(order.last_call_completed_at) > completed:
+            return _call_time(order.last_call_completed_at) + CALL_COOLDOWN
+        delay = CALL_COOLDOWN
+        if not automatic and latest.state in {CallState.DECLINED, CallState.NO_ANSWER, CallState.UNREACHABLE}:
+            runtime = self.db.get(CallRuntime, latest.id)
+            browser = runtime is None or runtime.transport == "browser"
+            if browser and self.db.get(TwilioBinding, latest.id) is None:
+                delay = MANUAL_BROWSER_RETRY_DELAY
+        return completed + delay
 
     def _trigger_reason(self, order: Order) -> str:
         if order.prior_attempts > 0:
@@ -196,11 +213,47 @@ class CallService:
         ).all()
         return next((call for call in calls if call.state not in TERMINAL_STATES), None)
 
+    def _replace_unanswered_automatic_invitation(self) -> None:
+        """Give an operator priority without disturbing accepted or phone calls."""
+        holder = self.db.exec(select(CallSession).where(
+            CallSession.state.notin_(TERMINAL_STATES)
+        )).first()
+        if holder is None or holder.state != CallState.CALLING:
+            return
+        runtime = self.db.get(CallRuntime, holder.id)
+        if runtime is None or runtime.transport != "browser":
+            return
+        if self.db.get(TwilioBinding, holder.id) is not None:
+            return
+        presence = self.db.exec(select(AuditEvent).where(
+            AuditEvent.session_id == holder.id,
+            AuditEvent.event_type.in_(["BROWSER_ATTACHED", "BROWSER_DETACHED"]),
+        ).order_by(AuditEvent.id.desc())).first()
+        if presence is not None and presence.event_type == "BROWSER_ATTACHED":
+            return
+        started = self.db.exec(select(DialerEvent).where(
+            DialerEvent.session_id == holder.id, DialerEvent.event_type == "STARTED",
+        ).order_by(DialerEvent.id.desc())).first()
+        if started is None:
+            return
+        try:
+            source = json.loads(started.payload_json)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(source, dict) or source.get("origin") != "automatic":
+            return
+        # Release and replacement are committed together by create_call.
+        self.finish_call(holder.id, CallState.NO_ANSWER,
+            reason="UNANSWERED_AUTOMATIC_INVITATION_REPLACED", commit=False)
+
     def create_call(self, order_id: int, *, automatic: bool = False) -> CallSession:
         with ADMISSION_LOCK:
             self.db.expire_all()
             order = self._order(order_id)
             reason = self.eligibility_reason(order, automatic=automatic)
+            if reason == "CAPACITY" and not automatic:
+                self._replace_unanswered_automatic_invitation()
+                reason = self.eligibility_reason(order, automatic=False)
             if reason:
                 detail = {
                     "ORDER_CLOSED": "Delivered or cancelled orders are not callable",
@@ -213,6 +266,13 @@ class CallService:
                     "COOLDOWN": "Call cooldown is active",
                     "CAPACITY": "Demo call capacity is occupied",
                 }.get(reason, reason)
+                if reason == "CAPACITY":
+                    holder = self.db.exec(select(CallSession).where(
+                        CallSession.state.notin_(TERMINAL_STATES)
+                    )).first()
+                    if holder is not None:
+                        state = "waiting for an answer" if holder.state == CallState.CALLING else holder.state.value.lower().replace("_", " ")
+                        detail = f"Demo call capacity is occupied by order #{holder.order_id} ({state}). View that call in the console."
                 raise DomainError(409, detail)
             now = self.clock()
             call = CallSession(
@@ -262,14 +322,15 @@ class CallService:
         self.db.commit()
 
     def finish_call(
-        self, session_id: str, state: CallState, *, reason: str, retryable: bool = False
+        self, session_id: str, state: CallState, *, reason: str, retryable: bool = False,
+        commit: bool = True,
     ) -> CallSession:
         with ADMISSION_LOCK:
             self.db.expire_all()
             call = self.get_call(session_id)
             if call.state in TERMINAL_STATES:
                 return call
-            if state not in {CallState.NO_ANSWER, CallState.UNREACHABLE, CallState.TOOL_FAILURE}:
+            if state not in {CallState.DECLINED, CallState.NO_ANSWER, CallState.UNREACHABLE, CallState.TOOL_FAILURE}:
                 raise ValueError("Unsupported failure disposition")
             self._transition(call, state)
             call.customer_confirmed = False
@@ -288,9 +349,24 @@ class CallService:
                 "CALL_DISPOSITION",
                 {"state": state, "reason": reason, "retryable_failure": runtime.retryable_failure},
             )
-            self.db.commit()
-            self.db.refresh(call)
+            if commit:
+                self.db.commit()
+                self.db.refresh(call)
+            else:
+                self.db.flush()
             return call
+
+    @_call_mutation
+    def decline(self, session_id: str) -> CallSession:
+        call = self.get_call(session_id)
+        if call.state == CallState.DECLINED:
+            return call
+        runtime = self.db.get(CallRuntime, session_id)
+        if call.state != CallState.CALLING:
+            raise DomainError(409, "This invitation has already ended or been accepted. Refresh its call status.")
+        if (runtime and runtime.transport != "browser") or self.db.get(TwilioBinding, session_id):
+            raise DomainError(409, "Only a waiting browser invitation can be declined here")
+        return self.finish_call(session_id, CallState.DECLINED, reason="CUSTOMER_NOT_NOW")
 
     @_call_mutation
     def connect(self, session_id: str) -> CallSession:
@@ -361,6 +437,20 @@ class CallService:
         request = CustomerTurnRequest.model_validate(cleaned)
         if request.confirmation and pending_operator_revision(self.db, call.id, call.current_proposal_id):
             raise DomainError(409, "The revised plan must be presented before fresh customer confirmation")
+        low_confidence = (
+            request.transcript_confidence is not None
+            and request.transcript_confidence < settings.planner_min_transcript_confidence
+        )
+        if request.confirmation and (
+            request.proposal is not None or not is_explicit_confirmation(request.text) or low_confidence
+        ):
+            call.customer_confirmed = False
+            reason = "LOW_TRANSCRIPT_CONFIDENCE" if low_confidence else "EXPLICIT_AGREEMENT_REQUIRED"
+            self._audit(call.id, "CUSTOMER_CONFIRMATION_REJECTED", {"reason": reason})
+            self.db.commit()
+            raise DomainError(409, "Explicit customer agreement to the current plan is required")
+        if request.proposal is not None and low_confidence:
+            raise DomainError(409, "Transcript confidence is too low to propose a delivery change")
         if not request.confirmation:
             call.customer_confirmed = False
 
@@ -510,6 +600,20 @@ class CallService:
             raise DomainError(409, "Customer confirmation is required before commit")
         if not call.current_proposal_id:
             raise DomainError(409, "No plan is available to commit")
+
+        confirmation = self.db.exec(select(Turn).where(
+            Turn.session_id == session_id, Turn.speaker == Speaker.CUSTOMER,
+        ).order_by(Turn.id.desc())).first()
+        payload = json.loads(confirmation.structured_payload_json) if confirmation else {}
+        confidence = payload.get("transcript_confidence")
+        if (
+            confirmation is None or not payload.get("confirmation")
+            or not is_explicit_confirmation(confirmation.text)
+            or (confidence is not None and confidence < settings.planner_min_transcript_confidence)
+        ):
+            call.customer_confirmed = False
+            self.db.commit()
+            raise DomainError(409, "The current plan requires verified customer confirmation")
 
         proposal_record = self.db.get(PlanProposalRecord, call.current_proposal_id)
         if proposal_record is None or not self._decision(proposal_record.id).valid:

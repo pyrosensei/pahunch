@@ -147,7 +147,7 @@ def test_exact_window_boundaries(engine, dialer, clock, offset, expected):
     assert bool(started) == expected
 
 
-@pytest.mark.parametrize("seconds,expected", [(3599, False), (3600, True), (3601, True)])
+@pytest.mark.parametrize("seconds,expected", [(29, False), (30, True), (31, True)])
 def test_retry_gap_uses_end_time_and_exact_boundary(engine, clock, seconds, expected):
     with Session(engine) as db:
         history(db, ended=NOW - timedelta(seconds=seconds))
@@ -374,12 +374,12 @@ def test_retryable_outcomes_and_missing_end_time_use_latest_start(engine, clock,
         history(db, state=state)
         call = db.get(CallSession, "previous-0")
         call.ended_at = None
-        call.started_at = NOW - timedelta(minutes=59)
+        call.started_at = NOW - timedelta(seconds=29)
         db.commit()
         service = CallService(db, clock=clock)
         with pytest.raises(DomainError, match="cooldown"):
             service.create_call(1042)
-        clock.now += timedelta(minutes=1)
+        clock.now += timedelta(seconds=1)
         assert service.create_call(1042).id
 
 
@@ -521,3 +521,161 @@ def test_automatic_call_can_confirm_availability_before_dispatch(engine, dialer,
     assert len(started) == 1
     with Session(engine) as db:
         assert db.get(Order, 1042).status.value == status
+
+def test_manual_start_replaces_only_unanswered_automatic_invitation(engine, clock):
+    from app.models import AuditEvent, DialerEvent
+
+    with Session(engine) as db:
+        calls = CallService(db, clock=clock)
+        waiting = calls.create_call(1042, automatic=True)
+        requested = calls.create_call(1043)
+        assert waiting.state == CallState.NO_ANSWER
+        assert requested.state == CallState.CALLING
+        active = db.exec(select(CallSession).where(CallSession.state == CallState.CALLING)).all()
+        assert [call.id for call in active] == [requested.id]
+        with pytest.raises(DomainError, match=r'order #1043'):
+            calls.create_call(1045)
+        audit = db.exec(select(AuditEvent).where(AuditEvent.session_id == waiting.id,
+            AuditEvent.event_type == 'CALL_DISPOSITION')).all()
+        assert len(audit) == 1
+        assert 'UNANSWERED_AUTOMATIC_INVITATION_REPLACED' in audit[0].payload_json
+        assert len(db.exec(select(DialerEvent).where(DialerEvent.event_type == 'STARTED')).all()) == 2
+
+
+@pytest.mark.parametrize('protected', ['CONNECTED', 'DISCOVERY', 'browser_attached', 'phone_transport', 'phone_binding'])
+def test_manual_priority_preserves_accepted_attached_and_phone_calls(engine, clock, protected):
+    from app.models import CallRuntime, TwilioBinding
+
+    with Session(engine) as db:
+        calls = CallService(db, clock=clock)
+        waiting = calls.create_call(1042, automatic=True)
+        if protected in {'CONNECTED', 'DISCOVERY'}:
+            calls.connect(waiting.id)
+            if protected == 'DISCOVERY':
+                calls.confirm_context(waiting.id)
+        elif protected == 'browser_attached':
+            calls.browser_presence(waiting.id, attached=True)
+        elif protected == 'phone_transport':
+            db.get(CallRuntime, waiting.id).transport = 'twilio'
+            db.commit()
+        else:
+            db.add(TwilioBinding(session_id=waiting.id))
+            db.commit()
+        state = waiting.state
+        with pytest.raises(DomainError, match=r'capacity.*order #1042'):
+            calls.create_call(1043)
+        assert waiting.state == state
+        assert waiting.outcome is None
+
+
+def test_invalid_manual_request_does_not_displace_an_automatic_call(engine, clock):
+    with Session(engine) as db:
+        calls = CallService(db, clock=clock)
+        waiting = calls.create_call(1042, automatic=True)
+        with pytest.raises(DomainError, match='Delivered or cancelled'):
+            calls.create_call(1049)
+        assert waiting.state == CallState.CALLING
+        assert waiting.outcome is None
+
+
+def test_replacing_an_automatic_invitation_and_new_start_roll_back_together(engine, clock, monkeypatch):
+    with Session(engine) as db:
+        calls = CallService(db, clock=clock)
+        waiting = calls.create_call(1042, automatic=True)
+        def failed_commit():
+            raise RuntimeError('simulated write failure')
+        monkeypatch.setattr(db, 'commit', failed_commit)
+        with pytest.raises(RuntimeError, match='simulated write'):
+            calls.create_call(1043)
+        db.rollback()
+        assert db.get(CallSession, waiting.id).state == CallState.CALLING
+        assert len(db.exec(select(CallSession)).all()) == 1
+
+
+def test_accepting_and_replacing_automatic_invitation_share_admission_lock(engine, clock):
+    with Session(engine) as db:
+        sid = CallService(db, clock=clock).create_call(1042, automatic=True).id
+    barrier = Barrier(2)
+    def act(accept):
+        with Session(engine) as db:
+            barrier.wait(timeout=5)
+            try:
+                calls = CallService(db, clock=clock)
+                return calls.connect(sid).id if accept else calls.create_call(1043).id
+            except DomainError:
+                return None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        accepted, replacement = list(pool.map(act, [True, False]))
+    assert (accepted is None) != (replacement is None)
+    with Session(engine) as db:
+        active = db.exec(select(CallSession).where(CallSession.state.in_([CallState.CALLING, CallState.CONNECTED]))).all()
+        assert len(active) == 1
+        assert active[0].id == (accepted or replacement)
+
+@pytest.mark.parametrize('state',[CallState.DECLINED,CallState.NO_ANSWER])
+def test_automatic_retries_keep_the_longer_cooldown(engine,clock,state):
+    with Session(engine) as db:
+        history(db,state=state,ended=NOW-timedelta(minutes=30))
+        calls=CallService(db,clock=clock)
+        assert calls.eligibility_reason(db.get(Order,1042),automatic=True)=='COOLDOWN'
+        clock.now+=timedelta(minutes=30)
+        assert calls.create_call(1042,automatic=True).id
+
+
+def test_customer_decline_releases_slot_and_manual_retry_obeys_delay(engine,clock):
+    from app.models import AuditEvent
+    with Session(engine) as db:
+        calls=CallService(db,clock=clock)
+        original=calls.create_call(1042)
+        ended=calls.decline(original.id)
+        assert ended.state==CallState.DECLINED
+        assert ended.outcome==CallOutcome.DECLINED
+        assert calls.decline(original.id).id==ended.id
+        events=db.exec(select(AuditEvent).where(AuditEvent.session_id==ended.id,AuditEvent.event_type=='CALL_DISPOSITION')).all()
+        assert len(events)==1
+        assert 'CUSTOMER_NOT_NOW' in events[0].payload_json
+        assert calls.eligibility_reason(db.get(Order,1043)) is None
+        with pytest.raises(DomainError,match='cooldown'):
+            calls.create_call(1042)
+        clock.now+=timedelta(seconds=30)
+        retried=calls.create_call(1042)
+        assert retried.id!=ended.id and retried.state==CallState.CALLING
+
+
+def test_decline_never_ends_an_accepted_or_phone_call(engine,clock):
+    from app.models import CallRuntime
+    with Session(engine) as db:
+        calls=CallService(db,clock=clock)
+        original=calls.create_call(1042)
+        db.get(CallRuntime,original.id).transport='twilio'
+        db.commit()
+        with pytest.raises(DomainError,match='browser invitation'):
+            calls.decline(original.id)
+        db.get(CallRuntime,original.id).transport='browser'
+        db.commit()
+        calls.connect(original.id)
+        with pytest.raises(DomainError,match='already ended or been accepted'):
+            calls.decline(original.id)
+        assert calls.get_call(original.id).state==CallState.CONNECTED
+
+
+def test_declined_invitation_retries_are_still_bounded(engine,clock):
+    with Session(engine) as db:
+        calls=CallService(db,clock=clock)
+        for _ in range(3):
+            call=calls.create_call(1042)
+            calls.decline(call.id)
+            clock.now+=timedelta(seconds=30)
+        with pytest.raises(DomainError,match='attempt limit'):
+            calls.create_call(1042)
+
+
+def test_phone_retry_does_not_use_the_short_browser_delay(engine,clock):
+    from app.models import CallRuntime
+    with Session(engine) as db:
+        history(db,ended=NOW-timedelta(seconds=40))
+        db.add(CallRuntime(session_id='previous-0',transport='twilio',last_seen_at=NOW,observed_state=CallState.NO_ANSWER))
+        db.commit()
+        calls=CallService(db,clock=clock)
+        with pytest.raises(DomainError,match='cooldown'):
+            calls.create_call(1042)

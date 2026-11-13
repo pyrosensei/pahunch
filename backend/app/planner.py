@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.availability import availability_question, availability_reply, date_feasibility_question
 from app.calls import ADMISSION_LOCK, CallService, pending_operator_revision, utc_now
+from app.consent import is_explicit_confirmation
 from app.dialogue import (
     EvidenceError,
     clarification_fallback,
@@ -18,6 +19,7 @@ from app.dialogue import (
     load_details,
     merge_details,
     normalize_clarification,
+    normalize_relative_day,
     save_details,
 )
 from app.errors import DomainError
@@ -160,121 +162,6 @@ IDENTITY_REPLY_MESSAGE = (
     "Aap tracking link se apna order verify kar sakte hain."
 )
 
-_AFFIRMATIVE_WORDS = {
-    "yahi",
-    "haan",
-    "han",
-    "ha",
-    "yes",
-    "yeah",
-    "yep",
-    "sure",
-    "confirm",
-    "confirmed",
-    "theek",
-    "thik",
-    "sahi",
-    "ok",
-    "okay",
-    "bilkul",
-    "zaroor",
-    "chalo",
-}
-_CONFIRMATION_WORDS = _AFFIRMATIVE_WORDS | {
-    "dijiye",
-    "aage",
-    "aap",
-    "aapka",
-    "aapke",
-    "ahead",
-    "badh",
-    "badhaiye",
-    "badhao",
-    "badho",
-    "bhi",
-    "do",
-    "go",
-    "hai",
-    "ho",
-    "is",
-    "iss",
-    "jaaye",
-    "jaye",
-    "ji",
-    "kar",
-    "kardo",
-    "de",
-    "dena",
-    "hi",
-    "use",
-    "us",
-    "usko",
-    "kariye",
-    "karo",
-    "ke",
-    "kijiye",
-    "ko",
-    "par",
-    "plan",
-    "please",
-    "saath",
-    "to",
-    "toh",
-}
-
-# Prisma STT returns Devanagari script; map the confirmation vocabulary to the
-# Latin words the gate already knows. Anything unmapped fails the whitelist.
-_DEVANAGARI_WORD_MAP = {
-    "इस": "is",
-    "इसी": "is",
-    "इसे": "is",
-    "को": "ko",
-    "योजना": "plan",
-    "यही": "yahi",
-    "दीजिए": "dijiye",
-    "हाँ": "haan",
-    "हां": "haan",
-    "हा": "ha",
-    "ठीक": "theek",
-    "ठिक": "thik",
-    "सही": "sahi",
-    "बिल्कुल": "bilkul",
-    "बिलकुल": "bilkul",
-    "ज़रूर": "zaroor",
-    "जरूर": "zaroor",
-    "चलो": "chalo",
-    "ओके": "ok",
-    "ओक": "ok",
-    "कन्फर्म": "confirm",
-    "है": "hai",
-    "हैं": "hai",
-    # Prisma sometimes renders Hindi "hai" with the Marathi form; seen live.
-    "आहे": "hai",
-    "कर": "kar",
-    "करो": "karo",
-    "करिए": "kariye",
-    "करिये": "kariye",
-    "कीजिए": "kijiye",
-    "कीजिये": "kijiye",
-    "दे": "de",
-    "देना": "dena",
-    "दो": "do",
-    "आगे": "aage",
-    "बढ़ाओ": "badhao",
-    "बढाओ": "badhao",
-    "बढ़ाइए": "badhaiye",
-    "बढाइए": "badhaiye",
-    "उसे": "use",
-    "उस": "us",
-    "उसको": "usko",
-    "ही": "hi",
-    "दें": "de",
-    "प्लान": "plan",
-    "प्लीज़": "please",
-    "प्लीज": "please",
-    "जी": "ji",
-}
-
 POLICY_EXPLANATIONS = {
     ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY: (
         "OTP courier ko customer se directly verify karna hai. Security drop allowed nahi hai; authorized named padosi ke liye arrival call aur successful verification zaroori hai."
@@ -322,31 +209,6 @@ ALTERNATIVE_LABELS = {
     PlanAction.RETRY_AFTER_DELAY: "retry",
     PlanAction.ESCALATE_TO_HUMAN: "human review",
 }
-
-
-def is_explicit_confirmation(text: str) -> bool:
-    # Prisma mixes precomposed nukta letters (U+095C/U+095D) with the
-    # decomposed base+nukta spelling used below; fold to one form.
-    text = text.replace("\u095c", "\u0921\u093c").replace("\u095d", "\u0922\u093c")
-    # \w does not cover Devanagari combining marks, so keep the whole block
-    # explicit or matras would be stripped ("हाँ" -> "ह").
-    normalized = " ".join(
-        re.sub(r"[^\w\s\u0900-\u097F]|\u0964|\u0965|\u0970|\u0971", " ", text.lower()).split()
-    )
-    normalized = " ".join(_DEVANAGARI_WORD_MAP.get(token, token) for token in normalized.split())
-    if not normalized or len(normalized) > 80 or "?" in text or re.search(r"\d", normalized):
-        return False
-    words: list[str] = []
-    for token in normalized.split():
-        word = _DEVANAGARI_WORD_MAP.get(token, token)
-        if not word.isascii() or not word.isalpha():
-            # An unmapped word (for example "हम्म" or "लग") means this is not
-            # a clean confirmation; dropping it could invert the meaning.
-            return False
-        words.append(word)
-    return any(word in _AFFIRMATIVE_WORDS for word in words) and all(
-        word in _CONFIRMATION_WORDS for word in words
-    )
 
 
 _OTP_QUESTION_WORDS = (
@@ -750,7 +612,7 @@ def _order_date_question(text: str) -> bool:
     return bool(date_topic and question)
 
 
-def _order_date_reply(db: Session, order: Order, text: str, language: str) -> str:
+def _order_date_answer(db: Session, order: Order, text: str, language: str) -> str:
     window = _window_label(PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end), language)
     asks_placed = bool(re.search(r"\b(ordered|placed|order date|same|alag)\b|अभी|अलग|एक ही|ऑर्डर.{0,12}(?:तारीख|डेट)", text, re.IGNORECASE))
     if not asks_placed:
@@ -762,6 +624,21 @@ def _order_date_reply(db: Session, order: Order, text: str, language: str) -> st
         placed = customer_moment(local, language)
         return {"en-IN": f"Your order was placed on {placed}. Its scheduled delivery is {window}; the order time and delivery appointment are separate.", "hi-IN": f"आपका ऑर्डर {placed} को किया गया था। डिलीवरी {window} में निर्धारित है; ऑर्डर करने का समय और डिलीवरी का समय अलग हैं।", "hi-en": f"Aapka order {placed} ko place hua tha. Delivery {window} mein scheduled hai; order karne ka time aur delivery ka time alag hain."}[language]
     return {"en-IN": f"The order-placement time is not recorded for this demo order. The scheduled delivery is {window}; this is the delivery appointment, not the order time.", "hi-IN": f"इस डेमो ऑर्डर में ऑर्डर करने का समय दर्ज नहीं है। डिलीवरी {window} में निर्धारित है; यह डिलीवरी का समय है, ऑर्डर करने का समय नहीं।", "hi-en": f"Is demo order ka placement time recorded nahi hai. Delivery {window} mein scheduled hai; yeh delivery ka time hai, order karne ka time nahi."}[language]
+
+
+
+def _order_date_reply(db: Session, order: Order, text: str, language: str) -> str:
+    message = _order_date_answer(db, order, text, language)
+    if re.search(r"\b(payment|paid|prepaid|cod|cash)\b|भुगतान|पेमेंट|पैसे", text, re.IGNORECASE):
+        if order.payment_mode == PaymentMode.COD:
+            message += " " + {"en-IN": "Payment is due to the courier at delivery.", "hi-IN": "भुगतान डिलीवरी के समय कूरियर को करना है।", "hi-en": "Payment delivery ke samay courier ko karna hai."}[language]
+        else:
+            message += " " + {"en-IN": "Your order is already paid.", "hi-IN": "आपके ऑर्डर का भुगतान हो चुका है।", "hi-en": "Aapke order ka payment ho chuka hai."}[language]
+    if re.search(r"\b(otp|handoff|recipient)\b|ओटीपी|किसे", text, re.IGNORECASE):
+        message += " " + _handoff_policy(order, language)
+        if order.requires_otp:
+            message += " " + courier_otp_guidance(order, language)
+    return message
 
 
 def _system_prompt() -> str:
@@ -811,6 +688,9 @@ RULES
 - For an eligible named neighbour receiving an OTP order, the courier calls the customer and verifies OTP directly before handoff. The assistant never collects, verifies or records OTP. Verification failure means no handoff.
 - Frustration is not a reason to reject the customer's request. Respond helpfully; only sustained personal abuse warrants a brief polite boundary. Do not routinely tell customers to calm down.
 - call_date is today. "aaj"=call_date, "kal"=next day.
+- For a relative primary delivery date, set request_details.relative_day_source to the exact day word (today/tomorrow/aaj/kal/आज/कल), with customer evidence. The backend anchors it to call_date. A scheduled delivery tomorrow does not make today the scheduled day.
+- Keep timing and handoff intent separate. When the customer changes from a neighbour to "directly to me", set request_details.handoff_action=HAND_TO_CUSTOMER even if the proposal action is RESCHEDULE. Use null for time-only changes. A missing former neighbour location then stops being relevant.
+- A RESPOND question asking if the customer can receive the scheduled delivery has missing_fields=["availability"]. A short yes/okay answers that question. Propose the recorded window for review, then ask for separate confirmation.
 - available_slots are availability periods, not fixed appointment pairs. A requested window wholly inside a period is permitted; preserve the customer's requested time rather than copying the entire period.
 - "6 se 8" is ambiguous AM/PM. Prefer the reading wholly contained in an available period; otherwise ask AM/PM.
 - A specific requested time outside availability is still PROPOSE_PLAN with that exact time. Never invent an earlier delivery date or silently move the request to another day.
@@ -1103,6 +983,13 @@ class PlannerService:
                 pass
         return conversation_language(text, language)
 
+    def _call_date(self, call, order):
+        dynamic_order = self.db.exec(select(DialerEvent.id).where(
+            DialerEvent.order_id == order.id, DialerEvent.event_type == "ORDER_CREATED",
+        )).first() is not None
+        started = call.started_at.replace(tzinfo=UTC) if call.started_at.tzinfo is None else call.started_at
+        return started.astimezone(IST).date() if dynamic_order else _local_time(order.window_start).date()
+
     def _user_prompt(
         self,
         call: CallSession,
@@ -1174,9 +1061,7 @@ class PlannerService:
         # Seeded evaluation fixtures have an explicit virtual delivery-day
         # anchor. Real checkout orders use the actual call date so a call made
         # today for tomorrow's delivery cannot shift "tomorrow" another day.
-        dynamic_order = self.db.exec(select(DialerEvent.id).where(DialerEvent.order_id == order.id, DialerEvent.event_type == "ORDER_CREATED")).first() is not None
-        started = call.started_at.replace(tzinfo=UTC) if call.started_at.tzinfo is None else call.started_at
-        call_date = started.astimezone(IST).date() if dynamic_order else _local_time(order.window_start).date()
+        call_date = self._call_date(call, order)
         context = {
             "response_language": self._language(call.id, request.text),
             "proposal_wording_templates": [
@@ -1232,7 +1117,7 @@ class PlannerService:
             "minimum_confidence": self.min_confidence,
             "minimum_transcript_confidence": self.min_transcript_confidence,
         }
-        return json.dumps(context, ensure_ascii=False, indent=2)
+        return json.dumps(context, ensure_ascii=False)
 
     def _audit_llm(
         self,
@@ -1616,7 +1501,7 @@ class PlannerService:
             assert decision.proposal is not None
             turn = self.calls.submit_turn(
                 session_id,
-                CustomerTurnRequest(text=request.text, proposal=decision.proposal),
+                CustomerTurnRequest(text=request.text, proposal=decision.proposal, transcript_confidence=request.transcript_confidence),
             )
             verdict = turn.verdict
             reason = (
@@ -1660,7 +1545,7 @@ class PlannerService:
             else:
                 turn = self.calls.submit_turn(
                     session_id,
-                    CustomerTurnRequest(text=request.text, confirmation=True),
+                    CustomerTurnRequest(text=request.text, confirmation=True, transcript_confidence=request.transcript_confidence),
                 )
                 message = CONFIRMATION_ACCEPTED_MESSAGE
             meta.fallback_reason = meta.error_code or "DETERMINISTIC_CONFIRMATION"
@@ -1687,6 +1572,14 @@ class PlannerService:
                 raise DomainError(
                     409,
                     f"Planner is not available in call state {call.state.value}",
+                )
+
+            low_transcript = request.transcript_confidence is not None and request.transcript_confidence < self.min_transcript_confidence
+            if low_transcript and (is_explicit_confirmation(request.text) or is_availability_acceptance(request.text)):
+                return self._degraded_turn(
+                    session_id, request, error_code="LOW_TRANSCRIPT_CONFIDENCE",
+                    message=SAFE_UNCLEAR_MESSAGE,
+                    meta=PlannerMeta(model="rules:transcript-confidence", degraded=True),
                 )
 
             if has_otp_disclosure(request.text):
@@ -1817,7 +1710,11 @@ class PlannerService:
                 meta.fallback_reason = "OUTBOUND_DELIVERY_PURPOSE"
                 turn = self.calls.submit_turn(session_id, CustomerTurnRequest(text=request.text))
                 return self._respond(session_id, turn, message, meta)
-            if opening and call.current_proposal_id is None and is_availability_acceptance(request.text):
+            last_agent = self.db.exec(select(Turn).where(
+                Turn.session_id == session_id, Turn.speaker == Speaker.AGENT,
+            ).order_by(Turn.id.desc())).first()
+            availability_asked = last_agent is not None and "availability" in json.loads(last_agent.structured_payload_json).get("planner", {}).get("missing_fields", [])
+            if (opening or availability_asked) and call.current_proposal_id is None and is_availability_acceptance(request.text):
                 order = self._order(call.order_id)
                 proposal = PlanProposal(primary=PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end))
                 return self._execute_decision(session_id, request,
@@ -2042,6 +1939,7 @@ class PlannerService:
         old_details = load_details(self.db, session_id)
         _fill_clear_time(decision, request.text, old_details, order)
         try:
+            normalize_relative_day(self.db, session_id, request.text, decision, self._call_date(call, order))
             details = merge_details(self.db, session_id, request.text, old_details, decision.request_details)
             recipient_changed = (
                 old_details.recipient_source is not None and details.recipient_source is not None

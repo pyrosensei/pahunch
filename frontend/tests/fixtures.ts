@@ -44,7 +44,7 @@ export async function mockApi(page: Page, options: {
 } = {}) {
   const requests: Array<{ method: string; path: string; body: unknown }> = [];
   let currentOrder = { ...order };
-  let currentSession = { ...session, transport: options.transport || 'browser', state: options.state || session.state };
+  let currentSession: typeof session & {retry_after?:string;remaining_attempts?:number} = { ...session, transport: options.transport || 'browser', state: options.state || session.state };
   let hasOrder = true;
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -91,6 +91,10 @@ export async function mockApi(page: Page, options: {
       created_at: session.started_at, structured_payload: { planner },
     }] : []);
     if (path.endsWith('/events')) return fulfill([]);
+    if (path.endsWith('/decline')) {
+      currentSession = {...currentSession,state:'DECLINED',retry_after:new Date(Date.now()+30000).toISOString(),remaining_attempts:2};
+      return fulfill(currentSession);
+    }
     if (path.endsWith('/connect')) {
       currentSession = { ...currentSession, state: 'CONNECTED' };
       return fulfill(currentSession);

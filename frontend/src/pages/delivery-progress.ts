@@ -19,7 +19,7 @@ export function deliveryProgress(call: Call, turns: RecordedTurn[], events: Reco
   if (call.state === 'COMMITTED') return { title: 'Delivery plan saved', detail: 'The customer confirmed the plan and the courier instructions are ready. This is not a delivered parcel.', step: 5 };
   if (call.state === 'CANCELLED') return { title: 'Order cancelled', detail: 'Cancelled at the customer’s request before dispatch. No delivery plan was committed.', step: 5 };
   if (call.state === 'CANCELLED') return { title: 'Order cancelled', detail: 'The backend accepted cancellation before shipment. This conversation is closed.', step: 5 };
-  if (['NO_ANSWER', 'UNREACHABLE', 'ESCALATED', 'TOOL_FAILURE', 'TURN_BUDGET_EXHAUSTED'].includes(call.state)) return { title: 'Conversation ended', detail: 'This session is closed. Review its recorded outcome below; create a fresh demo order to try another conversation.', step: 5 };
+  if (['DECLINED', 'NO_ANSWER', 'UNREACHABLE', 'ESCALATED', 'TOOL_FAILURE', 'TURN_BUDGET_EXHAUSTED'].includes(call.state)) return { title: 'Conversation ended', detail: 'This session is closed. Review its recorded outcome below; create a fresh demo order to try another conversation.', step: 5 };
   if (call.transport === 'twilio') return { title: call.state === 'CALLING' ? 'Phone attempt pending' : 'Phone conversation in progress', detail: 'Phone status comes from the configured transport. This is not a PC microphone session.', step: 1 };
   const names = events.map(event => event.event_type);
   const connected = names.lastIndexOf('REALTIME_CONNECTED') > names.lastIndexOf('REALTIME_DISCONNECTED');

@@ -267,3 +267,9 @@
 @keyframes incoming-call-pulse { 50% { box-shadow: 0 0 0 20px #fff5cf60; } }
 @media (prefers-reduced-motion: reduce) { .incoming-call-icon { animation: none; } }
 @media (max-width: 540px) { .incoming-call { padding: 28px 22px; } .customer-call-title { align-items: flex-start; gap: 14px; } #root .customer-call-page { padding: 24px 18px 40px; } #root .customer-call-page .customer-conversation { padding: 22px 18px; } }
+.operations-call-slot { display: flex; align-items: center; gap: 16px; padding: 18px 22px; margin: 20px 0; background: #29262b; border: 1px solid #59515d; border-radius: 12px; }
+.operations-call-slot > svg { color: #9bc9ff; flex-shrink: 0; }
+.operations-call-slot strong { font-size: 14px; }
+#root .operations-call-slot p { color: #c6c0c9; font-size: 13px; margin: 6px 0 0; }
+.operations-call-slot .button { margin-left: auto; white-space: nowrap; }
+@media (max-width: 540px) { .operations-call-slot { flex-wrap: wrap; padding: 18px; } .operations-call-slot > div { flex: 1; min-width: 160px; } .operations-call-slot .button { width: 100%; } }

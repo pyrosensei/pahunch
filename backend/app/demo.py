@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from app.calls import ADMISSION_LOCK, CallService, utc_now
+from app.calls import ADMISSION_LOCK, MAX_CALL_ATTEMPTS, CallService, utc_now
 from app.catalog import catalog_items, find_product
 from app.db import get_session
 from app.errors import DomainError
@@ -162,8 +162,17 @@ def sessions(
         statement.order_by(CallSession.started_at.desc(), CallSession.id.desc()).limit(limit)
     ).all()
     result = []
+    histories = {}
+    service = CallService(db)
     for call in calls:
         summary = call.model_dump(mode="json")
+        if call.order_id not in histories:
+            histories[call.order_id] = list(db.exec(select(CallSession).where(CallSession.order_id == call.order_id)).all())
+        history = histories[call.order_id]
+        summary["remaining_attempts"] = max(0, MAX_CALL_ATTEMPTS - len(history))
+        order = db.get(Order, call.order_id)
+        retry_at = service.retry_after(order, history) if order else None
+        summary["retry_after"] = retry_at.isoformat() if retry_at else None
         runtime = db.get(CallRuntime, call.id)
         summary["transport"] = runtime.transport if runtime else "browser"
         binding = db.get(TwilioBinding, call.id)

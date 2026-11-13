@@ -16,6 +16,8 @@ export function IncomingCall() {
   const [offer, setOffer] = useState<{ call: Call; order: Order } | null>(null);
   const [dismissed, setDismissed] = useState<string | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
+  const [declining, setDeclining] = useState(false);
+  const [declineError, setDeclineError] = useState('');
   const customerPage = !['/dashboard', '/voice', '/call'].includes(location.pathname);
   const requestedOrder = new URLSearchParams(location.search).get('order_id');
   const targetOrder = location.pathname === '/shop' && requestedOrder && /^\d+$/.test(requestedOrder) ? requestedOrder : orderId;
@@ -59,20 +61,30 @@ export function IncomingCall() {
     return () => { if (node?.open) node.close(); };
   }, [visible, offer?.call.id]);
 
+  async function decline() {
+    if (!offer || declining) return;
+    setDeclining(true); setDeclineError('');
+    try {
+      await api(`/api/sessions/${encodeURIComponent(offer.call.id)}/decline`, {method:'POST'});
+      setDismissed(offer.call.id); setOffer(null);
+    } catch (failure) { setDeclineError((failure as Error).message); }
+    finally { setDeclining(false); }
+  }
   if (!visible) return null;
   return <dialog ref={dialog} className="incoming-call" aria-labelledby="incoming-call-title" aria-describedby="incoming-call-detail"
-    onCancel={event => { event.preventDefault(); setDismissed(offer.call.id); }}>
+    onCancel={event => { event.preventDefault(); void decline(); }}>
     <div className="incoming-call-icon"><PhoneIncoming size={34}/></div>
     <p className="eyebrow">INCOMING DELIVERY CALL</p>
     <h2 id="incoming-call-title">SwiftCart is calling.</h2>
     <p id="incoming-call-detail">Pahunch delivery assistant · Order #{offer.order.id}</p>
     <p>Answer to arrange your delivery with the voice assistant.</p>
+    {declineError && <p className="notice error" role="alert">{declineError}</p>}
     <div className="incoming-call-actions">
-      <button className="button primary" autoFocus onClick={() => {
+      <button className="button primary" autoFocus disabled={declining} onClick={() => {
         setDismissed(offer.call.id);
         navigate(`/call?session_id=${encodeURIComponent(offer.call.id)}&order_id=${offer.order.id}`);
       }}><Phone size={19}/>Accept call</button>
-      <button className="button secondary" onClick={() => setDismissed(offer.call.id)}>Not now</button>
+      <button className="button secondary" disabled={declining} onClick={() => void decline()}>{declining ? 'Declining…' : 'Not now'}</button>
     </div>
   </dialog>;
 }

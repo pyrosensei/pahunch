@@ -1,6 +1,8 @@
+import re
 import unicodedata
 from datetime import UTC, datetime, time, timedelta, timezone
 
+from app.language import recipient_label
 from app.models import DeliverySlot, Order, PaymentMode
 from app.schemas import (
     SLOT_ACTIONS,
@@ -23,12 +25,29 @@ _VAGUE_LOCATIONS = {
     "near my house", "same building", "neighbour", "neighbor", "not known", "unknown",
     "बगल में", "बगल वाले", "पास में", "पास ही", "पास", "मेरे बगल में",
     "bagal mein", "bagal me", "bagal wale", "paas mein", "paas me", "paas hi",
+    "somewhere nearby", "near my home", "पड़ोस में", "पता नहीं", "anywhere",
 }
 
 
 def usable_recipient_location(value: str | None) -> bool:
     normalized = " ".join(unicodedata.normalize("NFKC", value or "").casefold().split()).strip(" .,!?;।")
-    return bool(normalized) and normalized not in _VAGUE_LOCATIONS
+    if not normalized or normalized in _VAGUE_LOCATIONS:
+        return False
+    label = recipient_label("recipient_address", normalized)
+    if re.search(r"(?<!\d)\d{1,8}(?!\d)", label):
+        return True
+    if re.fullmatch(r"(?:house|flat|apartment|मकान|फ्लैट)\s+(?:number\s+|no\.?\s+)?[a-z]", normalized):
+        return True
+    premises = re.search(
+        r"\b(?:house|flat|apartment|door|gate|entrance|floor|shop|office|building|ghar|makaan)\b|"
+        r"मकान|घर|फ्लैट|दरवाज|दरवाज़|गेट|दुकान|इमारत", normalized,
+    )
+    identifying_detail = re.search(
+        r"\b(?:opposite|behind|left|right|first|second|third|blue|red|green|white|yellow|"
+        r"pehla|doosra|baye|daye|neela|lal|safed)\b|"
+        r"सामने|पीछे|बाएँ|दाएँ|पहला|पहले|दूसरा|दूसरे|नील|लाल|हरे|सफेद|पीले", normalized,
+    )
+    return bool(premises and identifying_detail)
 
 
 def _utc(value: datetime) -> datetime:

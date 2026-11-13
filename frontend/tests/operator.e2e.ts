@@ -316,3 +316,16 @@ test('pending order selection survives refresh without starting a call', async (
   await expect(page.getByRole('button',{name:'Mark out for delivery'})).toBeDisabled();
   expect(requests.some(request=>request.method==='POST')).toBe(false);
 });
+
+test('operator sees the order holding the call slot and can inspect it', async ({page}) => {
+  await mockApi(page, {state:'CALLING'});
+  await page.route('**/api/orders?**', route => route.fulfill({json:[{...order,id:order.id+1},order]}));
+  await page.goto('/dashboard');
+  const slot=page.getByRole('region', {name:'Current call slot'});
+  await expect(slot).toContainText(`Order #${order.id}`);
+  await expect(slot).toContainText('Waiting for an answer');
+  await expect(page.getByRole('region',{name:'Selected delivery'})).toContainText(`ORDER #${order.id+1}`);
+  await slot.getByRole('button',{name:'View call',exact:true}).click();
+  await expect(page.getByRole('region',{name:'Selected delivery'})).toContainText(`ORDER #${order.id}`);
+  await expect(slot).toHaveCount(0);
+});

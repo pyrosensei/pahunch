@@ -4,6 +4,7 @@ from app.models import CallSession, CallState
 TERMINAL_STATES = {
     CallState.CANCELLED,
     CallState.COMMITTED,
+    CallState.DECLINED,
     CallState.NO_ANSWER,
     CallState.UNREACHABLE,
     CallState.ESCALATED,
@@ -13,7 +14,7 @@ TERMINAL_STATES = {
 
 ALLOWED_TRANSITIONS = {
     CallState.CREATED: {CallState.CALLING},
-    CallState.CALLING: {CallState.CONNECTED, CallState.NO_ANSWER, CallState.TOOL_FAILURE},
+    CallState.CALLING: {CallState.CONNECTED, CallState.DECLINED, CallState.NO_ANSWER, CallState.TOOL_FAILURE},
     CallState.CONNECTED: {
         CallState.CONTEXT_CONFIRMATION,
         CallState.UNREACHABLE,

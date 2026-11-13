@@ -288,3 +288,20 @@ def test_rescheduling_updates_the_same_parcel_only_after_confirmation(demo, alre
     assert repeated['reused'] and repeated['commit_id'] == committed.json()['commit_id']
     # Dispatch is an independent operator action, including a revised next attempt.
     assert client.post(f'/api/orders/{order_id}/out-for-delivery').json()['status'] == 'OUT_FOR_DELIVERY'
+
+
+def test_decline_endpoint_updates_summary_and_releases_admission(demo):
+    client,_,_=demo
+    first=client.post('/api/orders',json={'product_id':'backpack','payment_mode':'PREPAID'}).json()
+    second=client.post('/api/orders',json={'product_id':'watch','payment_mode':'PREPAID'}).json()
+    call=client.post(f"/api/orders/{first['id']}/call").json()
+    sid=call['id']
+    declined=client.post(f'/api/sessions/{sid}/decline')
+    assert declined.status_code==200 and declined.json()['state']=='DECLINED'
+    assert client.post(f'/api/sessions/{sid}/decline').json()['state']=='DECLINED'
+    assert client.get('/api/sessions',params={'order_id':first['id'],'active':True}).json()==[]
+    summary=client.get('/api/sessions',params={'order_id':first['id']}).json()[0]
+    assert summary['remaining_attempts']==2
+    assert datetime.fromisoformat(summary['retry_after'])-datetime.fromisoformat(declined.json()['ended_at']).replace(tzinfo=UTC)==timedelta(seconds=30)
+    assert client.post(f"/api/orders/{second['id']}/call").status_code==201
+    assert client.get(f"/api/orders/{first['id']}").json()['status']=='PENDING'
