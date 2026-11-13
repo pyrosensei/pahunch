@@ -1,18 +1,18 @@
 /* Shared consumer-facing theme. Root scope also keeps lazy route styles consistent. */
 body { background:var(--bg); color:var(--ink); font-size:16px; }
-#root { --soft-ink:#52665c; }
+#root { --soft-ink:#62666e; }
 #root :where(p) { font-size:15px; line-height:1.7; }
 #root :where(small,dt,dd,label,legend,summary,select,input,textarea) { font-size:14px; line-height:1.6; }
 #root :where(button,a) { font-size:14px; }
 #root :where(button,select,input:not([type=checkbox]),summary,.button,.text-link) { min-height:44px; }
 #root :where(button,input,select,textarea) { font-family:Manrope,sans-serif; }
 #root :where(button:disabled) { opacity:1; background:#e7e9e3; color:#657066; border-color:#d7ddd4; cursor:not-allowed; transform:none; box-shadow:none; }
-#root :where(a,button,input,select,textarea,summary):focus-visible { outline:3px solid #226b55; outline-offset:4px; }
+#root :where(a,button,input,select,textarea,summary):focus-visible { outline:3px solid #946b00; outline-offset:4px; }
 #root :where(h1,h2,h3) { color:var(--ink); }
 #root :where(.eyebrow,.mono,.voice-eyebrow,.voice-section-label,.section-label>span,.shop-banner,.shop-stamp,.pill,.count-badge,.turn-label,.turn-meta,.queue-row>small,.voice-connection,.voice-thread-title,.voice-line>span,.voice-save-note,.voice-session-note,.voice-bottom-note,.inspector-state,.operator-source,.dispatch-footnote,.request-count,.progress-counter,.operator-call-context,.operator-access small,.operator-access strong,.operator-access .text-link,.dispatch-ledger,.dispatch-ledger .text-link,.ready-order small,.ready-order span,.ready-deliveries h3,.session-card small,.plan-progress li,.plan-progress li>span:first-child,.operator-future-phone>summary,.voice-order-facts>div,.microphone-level) { font-size:12px; line-height:1.6; }
 #root :where(.button,.voice-connect,.voice-save,.voice-disconnect,.voice-controls button) { border-radius:8px; padding:13px 20px; font-size:14px; font-weight:700; }
-#root :where(.button.primary,.button.orange,.voice-connect,.voice-save:not(:disabled),.voice-compose button:not(:disabled)) { background:#bb4936; color:#fff; border-color:#bb4936; box-shadow:0 4px 0 #87352516; }
-#root :where(.button.primary,.button.orange,.voice-connect):hover:not(:disabled) { background:#a23b2b; }
+#root :where(.button.primary,.button.orange,.voice-connect,.voice-save:not(:disabled),.voice-compose button:not(:disabled)) { background:#ffd447; color:#20242a; border-color:#e5b82d; box-shadow:0 4px 0 #b5840010; }
+#root :where(.button.primary,.button.orange,.voice-connect):hover:not(:disabled) { background:#f5c529; }
 #root .button.secondary { background:#fff; color:var(--ink); border:1px solid #c9d8cd; }
 #root .text-link { display:inline-flex; align-items:center; gap:9px; color:var(--teal); }
 #root :where(.panel,.checkout-panel,.order-success,.next-card,.voice-studio,.voice-order-card,.voice-plan-card) { border-radius:12px; border:1px solid #dce5dc; box-shadow:0 8px 30px #234c3a05; }
@@ -48,7 +48,7 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .diorama-origin,#root .diorama-destination { font-size:12px; }
 #root .diorama-origin small,#root .diorama-destination small { font-size:10px; }
 #root .diorama-footer { font-size:12px; bottom:24px; left:25px; right:25px; }
-#root .diorama-footer button { width:44px; height:44px; background:#fffdf6; border:1px solid #b9cebc; }
+#root .diorama-footer button { width:44px; height:44px; background:#ffffff; border:1px solid #e4d7aa; }
 #root .diorama-disclosure { font-size:12px; bottom:-38px; }
 #root .scene-caption { border-radius:10px; padding:15px 20px; bottom:125px; }
 #root .scene-caption .mono { font-size:11px; }
@@ -59,7 +59,7 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .courier-label-top,#root .courier-label-top span:last-child,#root .courier-label-bottom { font-size:10px; }
 #root .chapter-number>span { font:700 12px/1.6 Manrope,sans-serif; letter-spacing:.04em; }
 #root .story-chapter>p { font-size:16px; }
-#root .story-chapter blockquote { font-size:23px; border-color:#93bea4; padding-left:18px; }
+#root .story-chapter blockquote { font-size:23px; border-color:#edc447; padding-left:18px; }
 #root .story-chapter blockquote footer { font-size:13px; }
 #root .chapter-footnote { font-size:11px; flex-wrap:wrap; }
 #root .policy-example>.mono { font-size:11px; }
@@ -72,12 +72,12 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .dispatch-toolbar,#root .dispatch-toolbar .mono { font-size:11px; }
 #root .dispatch-transcript p { font-size:14px; }
 #root .dispatch-transcript small,#root .dispatch-transcript>.mono,#root .dispatch-plan>.mono { font-size:11px; }
-#root .dispatch-plan { background:#e3f1e5; }
+#root .dispatch-plan { background:#fff6d8; }
 #root .dispatch-plan :where(dt,dd) { font-size:13px; }
 #root .dispatch-footer { font-size:12px; }
-#root .demo-invitation { border:0; border-radius:32px; background:#f8e4d9; padding:45px; gap:35px; }
+#root .demo-invitation { border:0; border-radius:32px; background:#fff4cd; padding:45px; gap:35px; }
 #root .demo-checklist li { font-size:14px; gap:15px; }
-#root .demo-checklist li>span { font-size:13px; color:#79472e; }
+#root .demo-checklist li>span { font-size:13px; color:#795600; }
 #root .landing-footer p,#root .footer-right { font-size:13px; }
 
 /* Storefront */
@@ -379,20 +379,16 @@ body { background:var(--bg); color:var(--ink); font-size:16px; }
 #root .editorial-hero > p { max-width: 470px; font-size: 17px; }
 #root .hero-capabilities { display: flex; flex-wrap: wrap; gap: 12px 20px; margin-top: 30px; }
 #root .hero-capabilities span { color: var(--muted); font-size: 12px; border-left: 2px solid var(--orange); padding-left: 10px; }
-#root .delivery-diorama { border-radius:36px; background:#e3f0e2; border:1px solid #d3e3cf; box-shadow:0 16px 0 -7px #d1e2cc; height:590px; min-height:0;
-  background: radial-gradient(ellipse at 48% 40%, #fdf7e7 0%, #e8eee4 65%, #e0e8df 100%);
-  border: 1px solid #cdd9ca;
-  box-shadow: 0 24px 60px #19332e0c;
-}
+#root .delivery-diorama { height:590px; min-height:0; box-shadow:0 24px 60px #5a430b08; }
 #root .story-chapter { min-height:480px; margin:0 0 24px; padding:38px 30px; border:1px solid var(--line); border-radius:12px; background:#fffefa; background: transparent; border: 0; border-top: 1px solid var(--line); border-radius: 0; padding-left: 0; }
-#root .chapter-number { font-size:20px; gap:15px; color:var(--teal); font-weight:700; color: var(--orange); }
+#root .chapter-number { font-size:20px; gap:15px; color:var(--teal); font-weight:700; }
 #root .chapter-number > span { color: var(--muted); }
 #root .story-chapter h2 { font-size:48px; font-weight:700; letter-spacing: -.045em; }
-#root .editorial-platform { padding:70px 42px; gap:40px; background: #193b32; color: #f6f4eb; border-radius: 12px; }
-#root .editorial-platform h2 { color: #f6f4eb; }
-#root .editorial-platform .platform-copy > p { color: #d1dfd4; }
-#root .editorial-platform .eyebrow, #root .editorial-platform .text-link { color: #edd5b1; }
-#root .editorial-platform .serif-word { color: #edd5b1; }
+#root .editorial-platform { padding:70px 42px; gap:40px; background:#f8f8f6; color:var(--ink); border-radius:24px; }
+#root .editorial-platform h2 { color:var(--ink); }
+#root .editorial-platform .platform-copy > p { color:var(--muted); }
+#root .editorial-platform .eyebrow, #root .editorial-platform .text-link { color:#6b5000; }
+#root .editorial-platform .serif-word { color:var(--ink); }
 #root .dispatch-preview { border-radius:12px; overflow:hidden; background: #fff; color: var(--ink); box-shadow: 0 12px 40px #0002; }
 #root .dispatch-header h1 { font-size:36px; font-weight:700; font-weight: 700; letter-spacing: -.045em; }
 #root .dispatch-ledger { padding:16px 20px; border:0; border-radius:18px; background:#e6f1e5; gap:16px; background: #193b32; color: #f6f4eb; border: 0; border-radius: 10px; padding: 20px 24px; }

@@ -123,10 +123,11 @@ def mark_ready(order_id: int, request: Request, db: SessionDep):
         ).first()
         if created is None or order.status not in {
             OrderStatus.PENDING,
+            OrderStatus.RESCHEDULED,
             OrderStatus.OUT_FOR_DELIVERY,
         }:
             raise DomainError(409, "Only a pending synthetic checkout order can be marked ready")
-        if order.status == OrderStatus.PENDING:
+        if order.status in {OrderStatus.PENDING, OrderStatus.RESCHEDULED}:
             order.status = OrderStatus.OUT_FOR_DELIVERY
             db.add(
                 DialerEvent(

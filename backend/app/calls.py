@@ -162,8 +162,6 @@ class CallService:
             < CALL_COOLDOWN
         ):
             return "COOLDOWN"
-        if order.status != OrderStatus.OUT_FOR_DELIVERY:
-            return "NOT_OUT_FOR_DELIVERY"
         if automatic:
             if self._trigger_reason(order) == "DELIVERY_CONFIRMATION":
                 return "NO_RISK_TRIGGER"
@@ -214,7 +212,6 @@ class CallService:
                     "ATTEMPT_LIMIT": "Call attempt limit reached",
                     "COOLDOWN": "Call cooldown is active",
                     "CAPACITY": "Demo call capacity is occupied",
-                    "NOT_OUT_FOR_DELIVERY": "An operator must mark this order out for delivery before preparing a conversation",
                 }.get(reason, reason)
                 raise DomainError(409, detail)
             now = self.clock()
@@ -548,7 +545,9 @@ class CallService:
             or _utc(primary.window_start) != _utc(order.window_start)
             or _utc(primary.window_end) != _utc(order.window_end)
         ):
-            order.status = OrderStatus.RESCHEDULED
+            # A confirmed appointment does not dispatch a parcel still at the depot.
+            if order.status != OrderStatus.PENDING:
+                order.status = OrderStatus.RESCHEDULED
             order.window_start = proposal.primary.window_start
             order.window_end = proposal.primary.window_end
         order.last_call_completed_at = now

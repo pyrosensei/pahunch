@@ -131,7 +131,7 @@ test('SwiftCart product selection derives delivery verification from payment wit
 });
 
 test('SwiftCart checkout keeps dispatch and operator controls out of the customer page', async ({ page }) => {
-  const requests = await mockApi(page);
+  const requests = await mockApi(page, { sessions:false });
   await page.goto('/shop');
   await page.getByRole('button', { name: 'Choose Airbook 14 Laptop' }).click();
   await page.getByRole('button', { name: 'Prepaid', exact: true }).click();

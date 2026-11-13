@@ -114,8 +114,6 @@ def dialer(engine, clock):
 @pytest.mark.parametrize(
     "change,reason",
     [
-        ({"status": "PENDING"}, "NOT_OUT_FOR_DELIVERY"),
-        ({"status": "RESCHEDULED"}, "NOT_OUT_FOR_DELIVERY"),
         ({"status": "DELIVERED"}, "ORDER_CLOSED"),
         ({"status": "CANCELLED"}, "ORDER_CLOSED"),
         ({"call_opt_out": True}, "OPTED_OUT"),
@@ -511,3 +509,15 @@ def test_http_start_and_sweep_use_same_admission(engine, dialer, clock, monkeypa
         assert http.result(timeout=5) in {201, 409}
     with Session(engine) as db:
         assert len(db.exec(select(CallSession)).all()) == 1
+
+
+@pytest.mark.parametrize("status", ["PENDING", "RESCHEDULED"])
+def test_automatic_call_can_confirm_availability_before_dispatch(engine, dialer, status):
+    with Session(engine) as db:
+        order = db.get(Order, 1042)
+        order.status = status
+        db.commit()
+    started = dialer.sweep()
+    assert len(started) == 1
+    with Session(engine) as db:
+        assert db.get(Order, 1042).status.value == status
