@@ -22,6 +22,14 @@ class PlannerAction(str, Enum):
     ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 
 
+class TurnRelevance(str, Enum):
+    DELIVERY = "DELIVERY"
+    OFF_TOPIC = "OFF_TOPIC"
+    MIXED = "MIXED"
+    AMBIGUOUS = "AMBIGUOUS"
+    CALL_CONTROL = "CALL_CONTROL"
+
+
 SLOT_ACTIONS = {
     PlanAction.HAND_TO_CUSTOMER,
     PlanAction.LEAVE_WITH_SECURITY,
@@ -100,6 +108,12 @@ class PlannerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PlannerAction
+    relevance: TurnRelevance = TurnRelevance.DELIVERY
+    delivery_quotes: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="For MIXED speech, exact current-utterance substrings directed to this delivery assistant. Exclude household/background speech, quotations and instructions to other people.",
+    )
     awaiting_continuation: bool = False
     request_details: RequestDetails | None = None
     missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "availability", "other"]] = Field(default_factory=list, max_length=6)
@@ -178,6 +192,9 @@ class AgentTurnRequest(BaseModel):
 
 
 class PlannerMeta(BaseModel):
+    relevance: TurnRelevance = TurnRelevance.DELIVERY
+    delivery_quotes: list[str] = Field(default_factory=list)
+    presented_proposal_id: str | None = None
     language_warning: str | None = None
     missing_fields: list[str] = Field(default_factory=list)
     review_needed: bool = False

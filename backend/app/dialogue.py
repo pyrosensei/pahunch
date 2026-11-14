@@ -1,5 +1,6 @@
 """Source-backed request details and recoverable clarification context."""
 
+import json
 from datetime import timedelta
 
 from sqlmodel import Session, select
@@ -31,6 +32,16 @@ class EvidenceError(ValueError):
         self.current_match = current_match
 
 
+def delivery_evidence_text(turn: Turn) -> str:
+    """Legacy turns remain readable. Classified background cannot ground a plan."""
+    payload = json.loads(turn.structured_payload_json)
+    if payload.get("relevance") in {"OFF_TOPIC", "AMBIGUOUS", "CALL_CONTROL"}:
+        return ""
+    if payload.get("relevance") == "MIXED":
+        return "\n".join(payload.get("delivery_quotes", []))
+    return turn.text
+
+
 def evidence_text(
     db: Session, session_id: str, current_text: str, evidence: CustomerEvidence,
     *, field: str = "recipient_source",
@@ -52,7 +63,7 @@ def evidence_text(
             reference_kind = turn.speaker.value.lower()
         if reference_kind != "customer":
             raise EvidenceError(field, "NOT_CUSTOMER", reference_kind, current_match)
-        source = turn.text
+        source = delivery_evidence_text(turn)
     if evidence.quote not in source or has_otp_disclosure(evidence.quote):
         raise EvidenceError(field, "MISMATCH", reference_kind, current_match)
     return evidence.quote
@@ -183,13 +194,14 @@ def ground_recipient(db, session_id, text, step, details):
             setattr(step, source_field, evidence)
         elif getattr(step, field):
             # Old JSON plans retain compatibility for literal source text.
-            sources = db.exec(
-                select(Turn.text).where(
+            turns = db.exec(
+                select(Turn).where(
                     Turn.session_id == session_id, Turn.speaker == Speaker.CUSTOMER
                 )
             ).all()
             if not any(
-                getattr(step, field).casefold() in source.casefold() for source in [text, *sources]
+                getattr(step, field).casefold() in source.casefold()
+                for source in [text, *[delivery_evidence_text(turn) for turn in turns]]
             ):
                 raise EvidenceError(source_field, "REQUIRED", "missing", False)
 
@@ -229,12 +241,13 @@ def normalize_clarification(decision, details, order, slots):
         (supplied.recipient_source is not None or supplied.recipient_address_source is not None)
         and details.action == "LEAVE_WITH_NEIGHBOR"
     )
-    if not (completing_time or completing_recipient):
+    completing_handoff = (supplied.handoff_action or supplied.action) == "HAND_TO_CUSTOMER"
+    if not (completing_time or completing_recipient or completing_handoff):
         return
     if "continuation" in decision.missing_fields and "end_time" not in decision.missing_fields:
         return
     if details.window_start is None:
-        if not completing_recipient or {"time", "end_time"}.intersection(decision.missing_fields):
+        if not (completing_recipient or completing_handoff) or {"time", "end_time"}.intersection(decision.missing_fields):
             return
         # A named handoff with no new time keeps the order's scheduled window.
         details = details.model_copy(deep=True)
@@ -332,9 +345,9 @@ def clarification_fallback(fields, language):
             "Delivery ka kaunsa time aapke liye theek rahega?",
         ),
         "other": (
-            "I received your words. Could you say a little more about that?",
-            "आपकी बात मिली है। इसके बारे में थोड़ा और बताइए।",
-            "Aapki baat mili hai. Iske baare mein thoda aur bataiye.",
+            "Would you like to receive the parcel at the scheduled time, or arrange another time or recipient?",
+            "क्या आप तय समय पर पार्सल लेंगे, या समय या पार्सल लेने वाला व्यक्ति बदलना है?",
+            "Kya aap tay samay par parcel lenge, ya time ya parcel lene wala badalna hai?",
         ),
     }
     return messages.get(kind, messages["other"])[{"en-IN": 0, "hi-IN": 1, "hi-en": 2}[language]]

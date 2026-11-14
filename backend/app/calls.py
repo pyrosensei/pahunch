@@ -38,6 +38,7 @@ from app.schemas import (
     CustomerTurnRequest,
     PlanAction,
     PlanProposal,
+    TurnRelevance,
     TurnResult,
 )
 from app.state_machine import TERMINAL_STATES, transition
@@ -423,11 +424,25 @@ class CallService:
 
     @_call_mutation
     def submit_turn(
-        self, session_id: str, request: CustomerTurnRequest, *, clarification: bool = False, clarification_key: str = "other"
+        self,
+        session_id: str,
+        request: CustomerTurnRequest,
+        *,
+        clarification: bool = False,
+        clarification_key: str = "other",
+        relevance: TurnRelevance = TurnRelevance.DELIVERY,
     ) -> TurnResult:
         call = self.get_call(session_id)
         if call.state in TERMINAL_STATES:
             raise DomainError(409, "Call session is already terminal")
+        non_delivery = relevance in {
+            TurnRelevance.OFF_TOPIC, TurnRelevance.AMBIGUOUS, TurnRelevance.CALL_CONTROL,
+        }
+        if non_delivery and (
+            request.proposal or request.confirmation
+            or request.address_change_requested or request.escalation_reason
+        ):
+            raise DomainError(409, "Non-delivery speech cannot authorize a delivery action")
         original = request.model_dump(mode="json")
         cleaned = redact_payload(original)
         if has_otp_disclosure(request.text):
@@ -451,14 +466,18 @@ class CallService:
             raise DomainError(409, "Explicit customer agreement to the current plan is required")
         if request.proposal is not None and low_confidence:
             raise DomainError(409, "Transcript confidence is too low to propose a delivery change")
-        if not request.confirmation:
+        if not request.confirmation and not non_delivery:
             call.customer_confirmed = False
 
+        payload = request.model_dump(mode="json")
+        payload["relevance"] = relevance.value
+        if request.confirmation:
+            payload["confirmed_proposal_id"] = call.current_proposal_id
         turn = Turn(
             session_id=call.id,
             speaker=Speaker.CUSTOMER,
             text=request.text,
-            structured_payload_json=request.model_dump_json(),
+            structured_payload_json=json.dumps(payload, ensure_ascii=False),
             created_at=self.clock(),
         )
         self.db.add(turn)
@@ -601,13 +620,22 @@ class CallService:
         if not call.current_proposal_id:
             raise DomainError(409, "No plan is available to commit")
 
-        confirmation = self.db.exec(select(Turn).where(
+        customer_turns = self.db.exec(select(Turn).where(
             Turn.session_id == session_id, Turn.speaker == Speaker.CUSTOMER,
-        ).order_by(Turn.id.desc())).first()
+        ).order_by(Turn.id.desc())).all()
+        # Recorded background/call-control turns do not revoke existing consent.
+        # A later delivery request still invalidates it through submit_turn.
+        confirmation = next(
+            (turn for turn in customer_turns if json.loads(turn.structured_payload_json).get(
+                "relevance"
+            ) not in {"OFF_TOPIC", "CALL_CONTROL", "AMBIGUOUS"}),
+            None,
+        )
         payload = json.loads(confirmation.structured_payload_json) if confirmation else {}
         confidence = payload.get("transcript_confidence")
         if (
             confirmation is None or not payload.get("confirmation")
+            or payload.get("confirmed_proposal_id", call.current_proposal_id) != call.current_proposal_id
             or not is_explicit_confirmation(confirmation.text)
             or (confidence is not None and confidence < settings.planner_min_transcript_confidence)
         ):

@@ -262,6 +262,8 @@ def test_prompt_examples_and_output_shape_match_provider_schema(db, scripted_llm
     required = set(schema["required"])
     assert required == {
         "action",
+        "relevance",
+        "delivery_quotes",
         "awaiting_continuation",
         "request_details",
         "missing_fields",

@@ -11,7 +11,7 @@ from app.schemas import CustomerTurnRequest, PlannerAction, PlannerMeta, TurnRes
 from app.state_machine import TERMINAL_STATES
 
 
-def _intent(text: str) -> str | None:
+def _intent(text: str, *, standalone: bool = False) -> str | None:
     text = text.strip().lower()
     text = re.sub(r"^(?:कोई नहीं|koi nahi)[,।\s]*", "", text)
     if not re.search(r"\b(?:cancel|cancellation|cancelled)\b|कैंसिल|कैंसल|कैनसिल|रद्द", text):
@@ -22,16 +22,18 @@ def _intent(text: str) -> str | None:
     if re.search(r"^(?:why|when|how|what|who)\b|क्यों|किसने|कब रद्द|\b(?:said|says|told|quoted)\b|बोला|कहा था", text):
         return None
     if re.search(r"\b(?:can|could|may) (?:i|we)\b|cancellation policy|कैंसिल हो सकता|रद्द हो सकता|cancel kar sakta", text):
-        return "question"
-    if re.search(r"\b(?:please )?cancel (?:my |the |this )?order\b|\bcancel it\b|\border cancellation please\b", text):
+        return None if standalone else "question"
+    match = re.search(r"\b(?:please )?cancel (?:my |the |this )?order\b|\bcancel it\b|\border cancellation please\b", text)
+    if match and (not standalone or match.group() == text.rstrip(".!?। ")):
         return "request"
-    if re.search(r"(?:कैंसिल|कैंसल|कैनसिल|रद्द|\bcancel\b).{0,12}(?:कर|कीजिए)|cancel\s+kar(?:o|do| dijiye| de|na)", text):
+    match = re.search(r"(?:कैंसिल|कैंसल|कैनसिल|रद्द|\bcancel\b).{0,12}(?:कर|कीजिए)|cancel\s+kar(?:o|do| dijiye| de|na)", text)
+    if match and (not standalone or match.group() == text.rstrip(".!?। ")):
         return "request"
     return None
 
 
-def handle_cancellation(db: Session, session_id: str, text: str, language: str) -> tuple[TurnResult, str, PlannerMeta] | None:
-    intent = _intent(text)
+def handle_cancellation(db: Session, session_id: str, text: str, language: str, *, require_standalone: bool = False) -> tuple[TurnResult, str, PlannerMeta] | None:
+    intent = _intent(text, standalone=require_standalone)
     if intent is None:
         return None
     with ADMISSION_LOCK:

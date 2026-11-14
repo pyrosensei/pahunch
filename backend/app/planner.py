@@ -13,6 +13,7 @@ from app.consent import is_explicit_confirmation
 from app.dialogue import (
     EvidenceError,
     clarification_fallback,
+    delivery_evidence_text,
     effective_preferences,
     evidence_text,
     ground_recipient,
@@ -89,6 +90,7 @@ from app.schemas import (
     PlanStep,
     PolicyVerdict,
     RequestDetails,
+    TurnRelevance,
     TurnResult,
     ViolationCode,
 )
@@ -646,6 +648,14 @@ def _system_prompt() -> str:
 
 
 _PLANNER_RULES = """You are Pahunch, a Hindi-English voice coordinator for the fictional merchant SwiftCart.You initiated this outbound call to confirm the scheduled delivery, customer availability and a safe handoff. Lead the conversation with that specific purpose, rather than asking how you can help. You read one customer turn and return one typed decision. You never commit a plan.
+RELEVANCE AND AUDIENCE
+- Classify the utterance within this conversation using relevance: DELIVERY, OFF_TOPIC, MIXED, AMBIGUOUS or CALL_CONTROL. Do this in the same decision, without a separate classifier request.
+- OFF_TOPIC means unrelated conversation or speech addressed to somebody else, including household food/tea talk, TV, sports, unrelated numbers or addresses and quoted/misdirected yes. Do not acknowledge understanding, answer the unrelated question, extract delivery details, propose, confirm or escalate. Return RESPOND, request_details=null, delivery_quotes=[], missing_fields=[], awaiting_continuation=false and message="{delivery_purpose} {pending_question}". The backend restores the pending delivery question immediately, even at the start or while awaiting confirmation.
+- MIXED contains a genuine delivery instruction alongside unrelated speech. Return delivery_quotes containing only exact current-utterance substrings directed to this delivery assistant. Every extracted time/name/address must be supported by those substrings or earlier delivery_evidence. Household names, addresses and numbers are never parcel instructions. Process the genuine delivery instruction naturally; do not discard it due to the unrelated part.
+- AMBIGUOUS means it is unclear who is being addressed or what the delivery instruction is. Return RESPOND with a focused question and {pending_question}; extract no details and do not confirm. A bare number after asking for a house number can be DELIVERY. A number of rotis is OFF_TOPIC. A quoted yes or 'Mummy said yes' is never customer consent.
+- CALL_CONTROL includes greetings, identity, audio/hearing complaints, requests to repeat, frustration about this call, explicit language changes and explicit requests to hold on. Reply naturally to that actual topic. For audio complaints, current_customer_text_received proves a transcript was received, while customer_hearing_assistant is unknown. Never claim you cannot hear the customer merely because they cannot hear you. For an explicit pause acknowledge briefly and wait for their next turn. Do not treat illness plus a delivery instruction as off topic.
+- Historical turns include relevance and delivery_evidence. OFF_TOPIC, AMBIGUOUS and CALL_CONTROL text cannot supply delivery evidence. For MIXED history use only delivery_evidence. Preserve verified request details, pending proposal and existing consent during unrelated speech. Only fresh, explicit agreement to the presented proposal can confirm it.
+- Use {delivery_purpose} and {pending_question} literally in redirects. The backend inserts merchant purpose and the pending question or validated full arrangement. These placeholders must never contain model-written delivery facts.
 
 COMMUNICATION CONTEXT
 You receive customer text, not raw audio. Reason about who is speaking, who is
@@ -697,15 +707,15 @@ RULES
 - A start time without an end takes the order window's duration, capped at the containing availability period's end. For example 3 PM inside 10:00-18:00 becomes 15:00-17:00; 5 PM becomes 17:00-18:00. Explicit requested endpoints must not be shortened.
 - HAND_TO_CUSTOMER means hand-off inside the order's own scheduled window. Any other window is RESCHEDULE.
 - Never repeat a plan policy rejected. Build a fresh plan from the customer's latest instruction.
-- Never repeat a clarification question verbatim. When the customer asks whether a date or time is possible instead of supplying the missing detail, answer from available_slots in at most two sentences: name the recorded alternative or say the requested one is unavailable, then ask for the missing detail once.
+- After unrelated speech, re-ask the pending delivery question. Otherwise avoid repeating a clarification verbatim. When the customer asks whether a date or time is possible instead of supplying the missing detail, answer from available_slots in at most two sentences: name the recorded alternative or say the requested one is unavailable, then ask for the missing detail once.
 - Two contradictory instructions in one turn: ASK_CLARIFICATION. Never pick one.
 - A correction ("ruko ruko", "nahi", "actually") plus a clear new instruction: PROPOSE_PLAN with the new instruction. Never ask which version.
 - A conditional retry never replaces the handoff. Keep the handoff as primary and add fallback.action=RETRY_AFTER_DELAY with the stated delay_minutes and max_retries=1.
 - Timestamps are ISO 8601 with +05:30. window_end is always later than window_start.
 - Encode the customer's requested action faithfully, even if policy will reject it. The backend decides legality.
-- An instruction to hand over, leave, retry or reschedule the parcel is PROPOSE_PLAN, including polite instructions phrased as questions. Copy the scheduled_window when the customer says scheduled time or gives no different time; do not ask for facts already supplied in context.
+- Only an instruction about THIS ORDER'S PARCEL to hand over, leave, retry or reschedule is PROPOSE_PLAN, including polite instructions phrased as questions. Copy the scheduled_window when the customer says scheduled time or gives no different time; do not ask for facts already supplied in context. Instructions about another object are OFF_TOPIC even if they contain a person's name, a house number and words like give, deliver, de dena or bhej do. Do not silently replace the object of that sentence with this parcel.
 - Follow decision_examples for the action and JSON shape. They illustrate the types; base this turn's facts on customer_utterance and the order. A handoff acknowledgement without a structured proposal is invalid.
-- A named third party ("security", "guard", a neighbour) means that third-party drop as primary, even when direct_handoff_only is true. Never rewrite it as HAND_TO_CUSTOMER.
+- For a genuine request about this parcel, a named third party ("security", "guard", a neighbour) means that third-party drop as primary, even when direct_handoff_only is true. Never rewrite it as HAND_TO_CUSTOMER. A third-party name in unrelated household speech grants no delivery permission.
 - ESCALATE_TO_HUMAN never goes inside a proposal; use the action.
 - fallback only when the customer asked for a retry or an alternative. A RETRY_AFTER_DELAY step has no window, and the primary handoff carries no delay_minutes or max_retries.
 - If current_proposal exists and the turn is only agreement: CONFIRM_PLAN with proposal=null, not a repeated PROPOSE_PLAN.
@@ -731,12 +741,21 @@ EXAMPLES
 - Order window 05 Nov 16:00-19:00 and "कल सुबह दस से बारह बजे ठीक रहेगा": PROPOSE_PLAN, RESCHEDULE, 2026-11-06T10:00:00+05:30 to 2026-11-06T12:00:00+05:30, even when that slot is available.
 - "आज शाम छह बजे सिक्योरिटी को दे देना और कल सुबह दस बजे मुझे ही दे दो": ASK_CLARIFICATION, proposal=null.
 - "अगर फोन न उठाऊँ तो पंद्रह मिनट बाद एक री-ट्राय कर देना": keep HAND_TO_CUSTOMER as primary, add fallback.action=RETRY_AFTER_DELAY, delay_minutes=15, max_retries=1.
+
+Before choosing any action, identify WHO is being addressed and WHAT object or activity the utterance concerns. A delivery call's context does not convert every handover, number, address or yes into a parcel instruction. An explicit different object/activity takes precedence over the delivery context. Use AMBIGUOUS if the intended audience/reference cannot be determined.
+- "Take Dad's medicine to Ravi in flat 208" is OFF_TOPIC at EVERY stage, including after a neighbour location question. Medicine is the object, not this parcel. Extract no recipient or address.
+- "पापा की दवाई रवि को फ्लैट 208 में दे देना" and "Papa ki dawai Ravi ko flat 208 mein de dena" have the same OFF_TOPIC meaning.
+- "Mum, take tea to Ravi in flat 208. For my parcel, deliver directly to me at the scheduled time" is MIXED. delivery_quotes=["For my parcel, deliver directly to me at the scheduled time"]. Only that delivery-directed span supplies evidence.
+- "Mummy said yes to dinner" is OFF_TOPIC, never CONFIRM_PLAN. "Yes, I confirm this delivery plan" is DELIVERY when a valid proposal is awaiting agreement.
+- "403" immediately after asking for the neighbour's house number is DELIVERY. "Bring 403 plates for the party" is OFF_TOPIC despite the pending house-number question.
+- OFF_TOPIC and AMBIGUOUS can never be PROPOSE_PLAN or CONFIRM_PLAN. Restore the pending question using the literal redirect placeholders. Do not add 'I understand' or a generic acknowledgement.
 """
 
 
 PLANNER_OUTPUT_SHAPE = """OUTPUT SHAPE
-Return one JSON object with exactly these eight keys and nothing else:
-{"action":"...","awaiting_continuation":false,"request_details":null,"missing_fields":[],"message":"...","proposal":null,"escalation_reason":null,"confidence":0.9}
+Return one JSON object with exactly these keys and nothing else:
+{"action":"...","relevance":"DELIVERY","delivery_quotes":[],"awaiting_continuation":false,"request_details":null,"missing_fields":[],"message":"...","proposal":null,"escalation_reason":null,"confidence":0.9}
+relevance is DELIVERY, OFF_TOPIC, MIXED, AMBIGUOUS or CALL_CONTROL. delivery_quotes is a list of exact delivery-directed current customer substrings for MIXED, otherwise [].
 
 action is one of RESPOND, ASK_CLARIFICATION, PROPOSE_PLAN, CONFIRM_PLAN, ESCALATE_TO_HUMAN.
 awaiting_continuation is true only with ASK_CLARIFICATION when the customer is clearly still dictating; otherwise false.
@@ -938,13 +957,108 @@ class PlannerService:
         except (ValueError, TypeError):
             return None
 
-    def _recent_turns(self, session_id: str) -> list[dict[str, str]]:
+    def _recent_turns(self, session_id: str) -> list[dict]:
         turns = list(
             self.db.exec(
                 select(Turn).where(Turn.session_id == session_id).order_by(Turn.id.desc()).limit(10)
             ).all()
         )
-        return [{"id": turn.id, "speaker": turn.speaker.value, "text": turn.text} for turn in reversed(turns)]
+        return [
+            {
+                "id": turn.id,
+                "speaker": turn.speaker.value,
+                "text": turn.text,
+                "relevance": json.loads(turn.structured_payload_json).get("relevance"),
+                "delivery_evidence": delivery_evidence_text(turn) if turn.speaker == Speaker.CUSTOMER else None,
+            }
+            for turn in reversed(turns)
+        ]
+
+    def _pending_question(self, call, order, language):
+        """Rebuild the pending choice from saved facts, without changing a plan."""
+        current = self._current_proposal(call)
+        if current is not None:
+            proposal = PlanProposal.model_validate(current)
+            if validate_plan(proposal, order, self._slots(order.id)).valid:
+                if call.customer_confirmed:
+                    return {
+                        "en-IN": "Your agreement is recorded. The delivery plan is awaiting its final check.",
+                        "hi-IN": "आपकी सहमति दर्ज है। डिलीवरी व्यवस्था की अंतिम जाँच बाकी है।",
+                        "hi-en": "Aapki sahmati darj hai. Delivery arrangement ka final check baaki hai.",
+                    }[language], [], None
+                return (
+                    f"{_plan_summary(proposal, language, requires_otp=order.requires_otp)}. {phrase('confirmation_question', language)}",
+                    [], call.current_proposal_id,
+                )
+        last = self.db.exec(select(Turn).where(
+            Turn.session_id == call.id, Turn.speaker == Speaker.AGENT,
+        ).order_by(Turn.id.desc())).first()
+        fields = []
+        if last:
+            fields = json.loads(last.structured_payload_json).get("planner", {}).get("missing_fields", [])
+        details = load_details(self.db, call.id)
+        if not fields and details.action == "LEAVE_WITH_NEIGHBOR":
+            fields = ["recipient" if details.recipient_source is None else "recipient_address"]
+        if fields and fields[0] in {"recipient", "recipient_address", "time", "end_time"}:
+            return clarification_fallback(fields, language), fields, None
+        window = _window_label(PlanStep(
+            action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end,
+        ), language)
+        return {
+            "en-IN": f"Will you be available to receive your parcel on {window}, or would another delivery time work?",
+            "hi-IN": f"क्या आप {window} में पार्सल लेने के लिए उपलब्ध होंगे, या दूसरा डिलीवरी समय चाहिए?",
+            "hi-en": f"Kya aap {window} mein parcel lene ke liye available honge, ya doosra delivery time chahiye?",
+        }[language], ["availability"], None
+
+    def _non_delivery_reply(self, session_id, request, decision, meta):
+        call = self.calls.get_call(session_id)
+        order = self._order(call.order_id)
+        language = self._language(session_id, request.text)
+        pending, fields, proposal_id = self._pending_question(call, order, language)
+        purpose = {
+            "en-IN": f"I called about your {order.merchant_name} delivery.",
+            "hi-IN": f"मैंने आपकी {order.merchant_name} डिलीवरी के लिए कॉल किया है।",
+            "hi-en": f"Maine aapki {order.merchant_name} delivery ke liye call kiya hai.",
+        }[language]
+        # Only the wrapper is model-written. Saved delivery facts are inserted
+        # after validation, including a full proposal before renewed consent.
+        wrapper = decision.message
+        checked = wrapper.replace("{delivery_purpose}", "").replace("{pending_question}", "")
+        reason = wording_error(checked or "?", language, respond=True, relax_language=True)
+        if decision.relevance == TurnRelevance.OFF_TOPIC and (
+            wrapper.count("{delivery_purpose}") != 1 or wrapper.count("{pending_question}") != 1
+        ):
+            reason = "MISSING_REDIRECT_PLACEHOLDERS"
+        if decision.relevance == TurnRelevance.AMBIGUOUS and "{pending_question}" not in wrapper:
+            reason = "MISSING_PENDING_QUESTION"
+        if proposal_id and decision.relevance != TurnRelevance.CALL_CONTROL and "{pending_question}" not in wrapper:
+            reason = "MISSING_PENDING_QUESTION"
+        if re.search(r"I (?:heard|understand)|samajh|baat (?:mil|sun)|समझ|बात (?:मिली|सुन)", checked, re.IGNORECASE):
+            reason = "UNHELPFUL_ACKNOWLEDGEMENT"
+        if decision.action not in {PlannerAction.RESPOND, PlannerAction.ASK_CLARIFICATION}:
+            reason = "NON_DELIVERY_ACTION"
+        if reason:
+            wrapper = "{delivery_purpose} {pending_question}"
+        message = wrapper.replace("{delivery_purpose}", purpose).replace("{pending_question}", pending)
+        if reason and decision.relevance == TurnRelevance.CALL_CONTROL:
+            key = conversational_input(request.text)
+            message = phrase(key, language) if key else {
+                "en-IN": "I can repeat my reply. I cannot verify whether the audio reached you. ",
+                "hi-IN": "मैं अपनी बात दोहरा सकती हूँ। आवाज आप तक पहुँची या नहीं, इसकी पुष्टि मेरे पास नहीं है। ",
+                "hi-en": "Main apni baat dobara keh sakti hoon. Audio aap tak pahuncha ya nahi, main verify nahi kar sakti. ",
+            }[language]
+            message += " " + pending
+        meta.missing_fields = fields
+        meta.awaiting_continuation = False
+        presents_plan = proposal_id if "{pending_question}" in wrapper else None
+        meta.action = PlannerAction.PROPOSE_PLAN if presents_plan else PlannerAction.RESPOND
+        meta.presented_proposal_id = presents_plan
+        meta.wording_source = "template" if reason else "model"
+        meta.fallback_reason = reason
+        turn = self.calls.submit_turn(
+            session_id, CustomerTurnRequest(text=request.text), relevance=decision.relevance,
+        )
+        return self._respond(session_id, turn, message, meta)
 
     def _communication_observations(self, session_id: str) -> list[dict]:
         events = self.db.exec(
@@ -1073,6 +1187,10 @@ class PlannerService:
             "current_customer_turn_id": None,
             "clarification_placeholders": {"order_window": _window_label(PlanStep(action=PlanAction.HAND_TO_CUSTOMER, window_start=order.window_start, window_end=order.window_end), self._language(call.id, request.text))},
             "current_state": call.state.value,
+            "pending_delivery_question": self._pending_question(call, order, language)[0],
+            "customer_confirmed": call.customer_confirmed,
+            "current_proposal_id": call.current_proposal_id,
+            "redirect_wording_template": "{delivery_purpose} {pending_question}",
             "call_purpose": "Outbound delivery coordination: confirm availability for the scheduled window and obtain an explicit safe handoff plan.",
             "call_date": call_date.isoformat(),
             "order": {
@@ -1163,6 +1281,11 @@ class PlannerService:
     ) -> AgentTurnResponse:
         meta.review_needed = turn.clarification_count > 3
         customer_turn = self.db.get(Turn, turn.turn_id)
+        if customer_turn is not None:
+            payload = json.loads(customer_turn.structured_payload_json)
+            payload.update(relevance=meta.relevance.value, delivery_quotes=meta.delivery_quotes)
+            customer_turn.structured_payload_json = json.dumps(payload, ensure_ascii=False)
+            self.db.add(customer_turn)
         meta.response_language = self._language(session_id, customer_turn.text if customer_turn else "")
         message = translate_fixed(message, meta.response_language)
         filler = r"^(?:Understood[.!]|I understand[.!]|Thanks for clarifying[.!]|समझ गई[।.!]|मैं आपकी बात समझ रही हूँ[।.!]|आपकी बात समझ रही हूँ[।.!]|स्पष्ट करने के लिए धन्यवाद[।.!]|Samajh gayi[.!]|Aapki baat samajh gayi[.!])\s*"
@@ -1215,6 +1338,8 @@ class PlannerService:
                         "response_language": meta.response_language,
                         "wording_source": meta.wording_source,
                         "fallback_reason": meta.fallback_reason,
+                        "relevance": meta.relevance.value,
+                        "presented_proposal_id": meta.presented_proposal_id,
                     }
                 ),
                 created_at=utc_now(),
@@ -1288,7 +1413,7 @@ class PlannerService:
             f"{failure}\n"
             "Return only one corrected compact JSON object. Include every required "
             "top-level field: action, awaiting_continuation, request_details, "
-            "missing_fields, message, proposal, escalation_reason and confidence. "
+            "missing_fields, relevance, delivery_quotes, message, proposal, escalation_reason and confidence. "
             "Use null, false or [] where a value does not apply."
         )
 
@@ -1300,6 +1425,7 @@ class PlannerService:
         user_prompt: str,
         schema: dict,
         context: tuple | None = None,
+        customer_text: str = "",
     ) -> tuple[LLMCompletion, PlannerDecision | None]:
         prompt = user_prompt
         first: LLMCompletion | None = None
@@ -1362,6 +1488,36 @@ class PlannerService:
                 first = completion
                 continue
 
+            if (
+                decision.relevance == TurnRelevance.MIXED
+                and decision.action == PlannerAction.CONFIRM_PLAN
+                and not is_explicit_confirmation(customer_text)
+            ):
+                if attempt:
+                    if decision.request_details is None:
+                        return _merge_completions(first, completion) if first else completion, None
+                    # Use the extracted typed facts, never the claimed consent.
+                    # Existing normalization builds a reviewable proposal only
+                    # after evidence and missing-field checks succeed.
+                    decision.action = PlannerAction.ASK_CLARIFICATION
+                    decision.message = ""
+                    decision.missing_fields = []
+                else:
+                    repair_stage = "mixed_instruction"
+                    first = completion
+                    self._audit_llm(
+                        session_id, model=completion.model, action=decision.action,
+                        error_code="MIXED_INSTRUCTION_NOT_AGREEMENT", event_type="LLM_REPAIR",
+                    )
+                    prompt = self._repair_prompt(
+                        user_prompt,
+                        "This mixed utterance is not explicit agreement. Extract its delivery-directed "
+                        "instruction and evidence into request_details. Use PROPOSE_PLAN to review "
+                        "the requested arrangement, or ASK_CLARIFICATION for a genuinely missing "
+                        "detail. Household speech is not consent. Do not return CONFIRM_PLAN.",
+                    )
+                    continue
+
             if attempt:
                 self._audit_llm(
                     session_id,
@@ -1390,6 +1546,7 @@ class PlannerService:
         language = self._language(session_id, request.text)
         meta.response_language = language
         meta.review_needed = self.calls.get_call(session_id).clarification_count >= 3
+        evidence_input = "\n".join(meta.delivery_quotes) if meta.relevance == TurnRelevance.MIXED else request.text
         if decision.action in {PlannerAction.RESPOND, PlannerAction.ASK_CLARIFICATION}:
             if (
                 decision.action == PlannerAction.RESPOND
@@ -1407,13 +1564,16 @@ class PlannerService:
                     re.search(r"\{(?:order_window|payment_mode|handoff_policy)\}", decision.message)
                 )
                 reason = wording_error(
-                    checked_message, language, respond=decision.action == PlannerAction.RESPOND, source_text=request.text, known_facts=self._known_facts(session_id, order), clarification=decision.action == PlannerAction.ASK_CLARIFICATION, relax_language=not bool(re.search(r"(?:speak|reply|continue|talk).{0,15}english|hindi mein|हिंदी में", request.text, re.IGNORECASE)), wording_text=_model_own_wording(decision.message, language) if uses_fact_template else None
+                    checked_message, language, respond=decision.action == PlannerAction.RESPOND, source_text=evidence_input, known_facts=self._known_facts(session_id, order), clarification=decision.action == PlannerAction.ASK_CLARIFICATION, relax_language=not bool(re.search(r"(?:speak|reply|continue|talk).{0,15}english|hindi mein|हिंदी में", request.text, re.IGNORECASE)), wording_text=_model_own_wording(decision.message, language) if uses_fact_template else None
                 )
                 fallback_key = conversational_input(request.text)
                 if reason is None:
                     message = " ".join(checked_message.split())
                 elif decision.action == PlannerAction.RESPOND:
-                    message = _respond_fallback(fallback_key, order, language)
+                    message = (
+                        _respond_fallback(fallback_key, order, language) if fallback_key
+                        else self._pending_question(self.calls.get_call(session_id), order, language)[0]
+                    )
                 else:
                     message = phrase(fallback_key, language) if fallback_key else clarification_fallback(decision.missing_fields, language)
                 if reason is not None:
@@ -1425,7 +1585,7 @@ class PlannerService:
                             "reason": reason,
                             "wording": redact_customer_text(" ".join(decision.message.split()))[:280],
                             "outcome": "replaced",
-                            "fallback": fallback_key or ("ack" if decision.action == PlannerAction.RESPOND else "clarification"),
+                            "fallback": fallback_key or ("pending_question" if decision.action == PlannerAction.RESPOND else "clarification"),
                         },
                     )
             if reason is None and not language_matches(decision.message, language):
@@ -1439,7 +1599,7 @@ class PlannerService:
                     # Record what the customer said even when the wording was
                     # replaced; otherwise the same question repeats forever.
                     try:
-                        details = merge_details(self.db, session_id, request.text, details, current)
+                        details = merge_details(self.db, session_id, evidence_input, details, current)
                     except ValueError:
                         pass
                 if reason is None:
@@ -1448,7 +1608,7 @@ class PlannerService:
                         evidence = getattr(details, field)
                         if evidence is not None:
                             try:
-                                replacements[key] = evidence_text(self.db, session_id, request.text, evidence, field=field)
+                                replacements[key] = evidence_text(self.db, session_id, evidence_input, evidence, field=field)
                             except ValueError:
                                 reason = "UNGROUNDED_EVIDENCE"
                                 replacements[key] = ""
@@ -1459,7 +1619,7 @@ class PlannerService:
                         message = clarification_fallback(decision.missing_fields, language)
                 if "time" in decision.missing_fields:
                     generic = clarification_fallback(decision.missing_fields, language)
-                    date_label = mentioned_date(request.text, language)
+                    date_label = mentioned_date(evidence_input, language)
                     if date_label and " ".join(message.split()) == " ".join(generic.split()):
                         date_label = date_label.title()
                         message = {
@@ -1468,7 +1628,7 @@ class PlannerService:
                             "hi-en": f"{date_label} ko kaunsa time theek rahega?",
                         }[language]
                         date_aware = True
-                clocks = mentioned_times(request.text)
+                clocks = mentioned_times(evidence_input)
                 if (
                     {"time", "end_time"}.intersection(decision.missing_fields)
                     and 1 < len(clocks) <= 3
@@ -1515,7 +1675,10 @@ class PlannerService:
                     .replace("{plan_summary}", _plan_summary(decision.proposal, language, requires_otp=order.requires_otp))
                     .replace("{confirmation_question}", phrase("confirmation_question", language))
                 )
-                meta.wording_source = "template" if str(meta.model).startswith("rules:") else "model"
+                meta.wording_source = "template" if (
+                    str(meta.model).startswith("rules:")
+                    or meta.fallback_reason == "MIXED_INSTRUCTION_REPAIRED"
+                ) else "model"
             else:
                 message = (
                     plan_result_message(verdict, decision.proposal, language)
@@ -1533,7 +1696,7 @@ class PlannerService:
                         order, self._slots(order.id), language, rejected=True, requested=requested
                     )
                 meta.wording_source = "template"
-            meta.fallback_reason = reason
+            meta.fallback_reason = reason or meta.fallback_reason
         elif decision.action == PlannerAction.CONFIRM_PLAN:
             if not is_explicit_confirmation(request.text):
                 turn = self.calls.submit_turn(
@@ -1600,7 +1763,12 @@ class PlannerService:
                 )
 
             from app.cancellation import handle_cancellation
-            cancellation = handle_cancellation(self.db, session_id, request.text, self._language(session_id, request.text))
+            # Only a standalone explicit command can bypass model relevance.
+            # Longer speech may contain a cancellation addressed to someone else.
+            cancellation = handle_cancellation(
+                self.db, session_id, request.text, self._language(session_id, request.text),
+                require_standalone=True,
+            )
             if cancellation is not None:
                 turn, message, meta = cancellation
                 return self._respond(session_id, turn, message, meta)
@@ -1707,8 +1875,9 @@ class PlannerService:
                         heard = {"en-IN": "Yes, I can hear you. ", "hi-en": "Haan, aapki aawaz aa rahi hai. ", "hi-IN": "हाँ, आपकी आवाज सुनाई दे रही है। "}[language]
                         message = heard + message
                 meta.action = PlannerAction.RESPOND
+                meta.relevance = TurnRelevance.CALL_CONTROL
                 meta.fallback_reason = "OUTBOUND_DELIVERY_PURPOSE"
-                turn = self.calls.submit_turn(session_id, CustomerTurnRequest(text=request.text))
+                turn = self.calls.submit_turn(session_id, CustomerTurnRequest(text=request.text), relevance=TurnRelevance.CALL_CONTROL)
                 return self._respond(session_id, turn, message, meta)
             last_agent = self.db.exec(select(Turn).where(
                 Turn.session_id == session_id, Turn.speaker == Speaker.AGENT,
@@ -1769,6 +1938,7 @@ class PlannerService:
                 user_prompt=user_prompt,
                 schema=schema,
                 context=context,
+                customer_text=request.text,
             )
         except LLMStructuredOutputError as error:
             self.calls._audit(
@@ -1859,8 +2029,46 @@ class PlannerService:
 
         meta.action = decision.action
         meta.confidence = decision.confidence
+        meta.relevance = decision.relevance
+        meta.delivery_quotes = decision.delivery_quotes
+        if (
+            decision.relevance == TurnRelevance.MIXED
+            and decision.action == PlannerAction.ASK_CLARIFICATION
+            and not decision.message
+        ):
+            meta.fallback_reason = "MIXED_INSTRUCTION_REPAIRED"
         meta.missing_fields = decision.missing_fields
         meta.awaiting_continuation = decision.awaiting_continuation
+        if decision.relevance in {TurnRelevance.OFF_TOPIC, TurnRelevance.AMBIGUOUS, TurnRelevance.CALL_CONTROL}:
+            self._audit_llm(
+                session_id,
+                model=completion.model,
+                action=decision.action,
+                confidence=decision.confidence,
+                latency_ms=completion.latency_ms,
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=completion.completion_tokens,
+            )
+            return self._non_delivery_reply(session_id, request, decision, meta)
+        evidence_request = request
+        if decision.relevance == TurnRelevance.MIXED:
+            if not decision.delivery_quotes or any(
+                not quote.strip() or quote not in request.text or has_otp_disclosure(quote)
+                for quote in decision.delivery_quotes
+            ):
+                decision.relevance = meta.relevance = TurnRelevance.AMBIGUOUS
+                meta.delivery_quotes = []
+                return self._non_delivery_reply(session_id, request, decision, meta)
+            evidence_request = request.model_copy(update={"text": "\n".join(decision.delivery_quotes)})
+        from app.cancellation import handle_cancellation
+        cancellation = handle_cancellation(
+            self.db, session_id, evidence_request.text, self._language(session_id, request.text),
+        )
+        if cancellation is not None:
+            turn, message, cancellation_meta = cancellation
+            cancellation_meta.relevance = meta.relevance
+            cancellation_meta.delivery_quotes = meta.delivery_quotes
+            return self._respond(session_id, turn, message, cancellation_meta)
         conversation = conversational_input(request.text)
         if conversation and decision.action in {
             PlannerAction.PROPOSE_PLAN,
@@ -1937,10 +2145,10 @@ class PlannerService:
             self.db.commit()
 
         old_details = load_details(self.db, session_id)
-        _fill_clear_time(decision, request.text, old_details, order)
+        _fill_clear_time(decision, evidence_request.text, old_details, order)
         try:
-            normalize_relative_day(self.db, session_id, request.text, decision, self._call_date(call, order))
-            details = merge_details(self.db, session_id, request.text, old_details, decision.request_details)
+            normalize_relative_day(self.db, session_id, evidence_request.text, decision, self._call_date(call, order))
+            details = merge_details(self.db, session_id, evidence_request.text, old_details, decision.request_details)
             recipient_changed = (
                 old_details.recipient_source is not None and details.recipient_source is not None
                 and old_details.recipient_source.quote.casefold() != details.recipient_source.quote.casefold()
@@ -1977,7 +2185,7 @@ class PlannerService:
                     primary.call_on_arrival = details.call_on_arrival
                 for step in (decision.proposal.primary, decision.proposal.fallback):
                     if step is not None:
-                        ground_recipient(self.db, session_id, request.text, step, details)
+                        ground_recipient(self.db, session_id, evidence_request.text, step, details)
         except ValueError as error:
             decision.action = PlannerAction.ASK_CLARIFICATION
             decision.proposal = None
@@ -2001,6 +2209,7 @@ class PlannerService:
             meta.error_code = "UNGROUNDED_PLAN_TEXT"
             meta.degraded = True
             meta.fallback_reason = str(error)
+            decision.request_details = None
             details = old_details
         if decision.proposal is not None:
             if any(
@@ -2045,7 +2254,7 @@ class PlannerService:
         if decision.proposal is not None:
             # Pronouns in a follow-up can refer to a neighbour the customer
             # already named. Ground only in customer turns, never agent text.
-            customer_context = "\n".join([request.text, *[t["text"] for t in self._recent_turns(session_id) if t["speaker"] == Speaker.CUSTOMER.value]]).casefold()
+            customer_context = "\n".join([evidence_request.text, *[t["delivery_evidence"] for t in self._recent_turns(session_id) if t["speaker"] == Speaker.CUSTOMER.value]]).casefold()
             if any(
                 has_otp_disclosure(t) or re.search(r"\d{4,}", t)
                 for t in [decision.proposal.notes or "", *decision.proposal.customer_statements]
