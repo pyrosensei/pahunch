@@ -142,6 +142,51 @@ def mark_ready(order_id: int, request: Request, db: SessionDep):
         return order
 
 
+def session_summary(db: Session, call: CallSession, *, history: list[CallSession] | None = None) -> dict:
+    """One customer/operator session representation, including transport and saved plans."""
+    summary = call.model_dump(mode="json")
+    if history is None:
+        history = list(db.exec(select(CallSession).where(CallSession.order_id == call.order_id)).all())
+    service = CallService(db)
+    summary["remaining_attempts"] = max(0, MAX_CALL_ATTEMPTS - len(history))
+    order = db.get(Order, call.order_id)
+    retry_at = service.retry_after(order, history) if order else None
+    summary["retry_after"] = retry_at.isoformat() if retry_at else None
+    runtime = db.get(CallRuntime, call.id)
+    binding = db.get(TwilioBinding, call.id)
+    summary["transport"] = runtime.transport if runtime else "browser"
+    if binding:
+        summary["transport"] = "twilio"
+    summary["dispatch_state"] = binding.dispatch_state if binding else None
+    summary["phone_consent"] = binding.consented if binding else False
+    summary["proposal"] = None
+    summary["verdict"] = None
+    summary["courier_card"] = None
+    if call.current_proposal_id:
+        proposal = db.get(PlanProposalRecord, call.current_proposal_id)
+        decision = db.exec(
+            select(PolicyDecisionRecord)
+            .where(PolicyDecisionRecord.proposal_id == call.current_proposal_id)
+            .order_by(PolicyDecisionRecord.created_at.desc())
+        ).first()
+        if proposal:
+            summary["proposal"] = redact_payload(json.loads(proposal.proposal_json))
+        if decision:
+            summary["verdict"] = {
+                "valid": decision.valid,
+                "violations": json.loads(decision.violations_json),
+                "allowed_alternatives": json.loads(decision.allowed_alternatives_json),
+            }
+    commit = db.exec(
+        select(DeliveryCommit)
+        .where(DeliveryCommit.session_id == call.id)
+        .order_by(DeliveryCommit.committed_at.desc())
+    ).first()
+    if commit:
+        summary["courier_card"] = redact_payload(json.loads(commit.courier_card_json))
+    return summary
+
+
 @router.get("/sessions")
 def sessions(
     db: SessionDep,
@@ -163,47 +208,10 @@ def sessions(
     ).all()
     result = []
     histories = {}
-    service = CallService(db)
     for call in calls:
-        summary = call.model_dump(mode="json")
         if call.order_id not in histories:
             histories[call.order_id] = list(db.exec(select(CallSession).where(CallSession.order_id == call.order_id)).all())
-        history = histories[call.order_id]
-        summary["remaining_attempts"] = max(0, MAX_CALL_ATTEMPTS - len(history))
-        order = db.get(Order, call.order_id)
-        retry_at = service.retry_after(order, history) if order else None
-        summary["retry_after"] = retry_at.isoformat() if retry_at else None
-        runtime = db.get(CallRuntime, call.id)
-        summary["transport"] = runtime.transport if runtime else "browser"
-        binding = db.get(TwilioBinding, call.id)
-        summary["dispatch_state"] = binding.dispatch_state if binding else None
-        summary["phone_consent"] = binding.consented if binding else False
-        summary["proposal"] = None
-        summary["verdict"] = None
-        summary["courier_card"] = None
-        if call.current_proposal_id:
-            proposal = db.get(PlanProposalRecord, call.current_proposal_id)
-            decision = db.exec(
-                select(PolicyDecisionRecord)
-                .where(PolicyDecisionRecord.proposal_id == call.current_proposal_id)
-                .order_by(PolicyDecisionRecord.created_at.desc())
-            ).first()
-            if proposal:
-                summary["proposal"] = redact_payload(json.loads(proposal.proposal_json))
-            if decision:
-                summary["verdict"] = {
-                    "valid": decision.valid,
-                    "violations": json.loads(decision.violations_json),
-                    "allowed_alternatives": json.loads(decision.allowed_alternatives_json),
-                }
-        commit = db.exec(
-            select(DeliveryCommit)
-            .where(DeliveryCommit.session_id == call.id)
-            .order_by(DeliveryCommit.committed_at.desc())
-        ).first()
-        if commit:
-            summary["courier_card"] = redact_payload(json.loads(commit.courier_card_json))
-        result.append(summary)
+        result.append(session_summary(db, call, history=histories[call.order_id]))
     return result
 
 

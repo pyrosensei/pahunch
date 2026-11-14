@@ -7,12 +7,35 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.db import get_session
 from app.dialer import Dialer
 from app.main import create_app
-from app.models import DialerEvent, Order
+from app.models import CallRuntime, DialerEvent, Order, TwilioBinding
 from app.operator import require_operator_key
 from app.seed import seed_database
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
 DELIVERY_START = datetime.fromisoformat("2026-11-01T10:00:00+05:30")
+
+
+@pytest.mark.parametrize("mode", ["browser", "legacy_browser", "twilio", "legacy_twilio"])
+def test_customer_session_detail_has_the_same_transport_and_plan_as_the_list(demo, mode):
+    client, _, engine = demo
+    sid = client.post("/api/orders/1042/call").json()["id"]
+    with Session(engine) as db:
+        runtime = db.get(CallRuntime, sid)
+        if mode.startswith("legacy"):
+            db.delete(runtime)
+        elif mode == "twilio":
+            runtime.transport = "twilio"
+        if mode in {"twilio", "legacy_twilio"}:
+            db.add(TwilioBinding(session_id=sid))
+        db.commit()
+    detail = client.get(f"/api/sessions/{sid}")
+    assert detail.status_code == 200
+    listed = client.get("/api/sessions", params={"order_id": 1042}).json()[0]
+    assert detail.json() == listed
+    assert detail.json()["transport"] == ("twilio" if "twilio" in mode else "browser")
+    assert detail.json()["courier_card"] is None
+    assert detail.json()["remaining_attempts"] == 2
+    assert client.get("/api/sessions/missing-session").status_code == 404
 
 
 @pytest.fixture

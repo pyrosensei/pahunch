@@ -78,6 +78,10 @@ def test_complete_call_flow_over_http(client):
     card = client.get(f"/api/sessions/{session_id}/courier-card")
     assert card.status_code == 200
     assert card.json()["order_id"] == 1042
+    detail = client.get(f"/api/sessions/{session_id}").json()
+    assert detail["transport"] == "browser"
+    assert detail["courier_card"] == card.json()
+    assert detail["proposal"] is not None and detail["verdict"]["valid"]
 
     events = client.get(f"/api/sessions/{session_id}/events")
     assert events.status_code == 200

@@ -13,6 +13,7 @@ from app.calls import ADMISSION_LOCK, CallService
 from app.config import settings
 from app.db import engine, get_session, init_db
 from app.demo import router as demo_router
+from app.demo import session_summary
 from app.dialer import Dialer
 from app.errors import DomainError
 from app.gnani import SpeechClient, build_gnani_speech_client, split_api_keys
@@ -206,9 +207,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="No active call for this order")
         return call
 
-    @app.get("/api/sessions/{session_id}", response_model=CallSession)
-    def get_call_session(session_id: str, session: SessionDep) -> CallSession:
-        return CallService(session).get_call(session_id)
+    @app.get("/api/sessions/{session_id}")
+    def get_call_session(session_id: str, session: SessionDep) -> dict:
+        return session_summary(session, CallService(session).get_call(session_id))
 
     @app.post("/api/sessions/{session_id}/connect", response_model=CallSession)
     def connect_call(session_id: str, session: SessionDep) -> CallSession:
