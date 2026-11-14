@@ -7,6 +7,9 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.db.bak-*
 .coverage
 htmlcov/
@@ -21,4 +24,3 @@ frontend/test-run-*.txt
 
 # Keep local review and instruction documents out of Git.
 *.[mM][dD]
-!/README.md
