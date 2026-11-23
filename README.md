@@ -1,30 +1,26 @@
-<div align="center">
-
 # Pahunch
 
-**A better delivery plan, before dispatch.**
+![Pahunch. Plan the handoff before dispatch. A parcel connects a voice conversation to a confirmed courier instruction.](docs/media/readme-hero.svg)
 
-Browser voice prototype · Portfolio project · Work in progress
+**A browser voice prototype for coordinating deliveries before the parcel leaves.** The customer works out a time or an eligible recipient, the backend checks the delivery rules, and the operator sees the confirmed instructions.
 
-[The experience](#the-experience) · [How it works](#how-it-works) · [Run locally](#run-locally-on-windows) · [Checks and status](#checks-and-status)
+[See the browser demo flow](#the-experience) · [Explore the implementation](#how-it-works) · [Run locally](#run-locally-on-windows)
 
-</div>
-
-I ordered a phone while I was out of town. The delivery was coming to my address, but I needed a conversation about when I would actually be there to receive it.
-
-Pahunch explores that conversation **before the parcel leaves**. The customer discusses a delivery time or an eligible recipient. The backend checks the arrangement against the order’s delivery rules, asks for explicit confirmation, and saves instructions the operator can inspect for the courier.
-
-I built the prototype for Gnani AI’s Great Indian AI Internship Challenge and missed the submission deadline. I’m sharing it as a portfolio project and continuing to develop it.
+> I ordered a phone while I was out of town. My address was right, but who would be there to receive it? That question became Pahunch, a portfolio prototype built for Gnani AI’s Great Indian AI Internship Challenge.
 
 ## The experience
 
-**Listen → Validate → Commit.** A conversation becomes a proposed plan, then a checked and confirmed courier instruction. A saved plan does not mean the parcel has been dispatched or delivered.
+![Pahunch operator console showing Ready for the courier, the saved delivery window, and call-on-arrival instructions for a demo order.](docs/media/courier-preview.jpg)
 
-The local demo has two sides:
+*Saved courier instructions in the operator console, captured from a local demo order.*
 
-| Customer · SwiftCart | Operator · Pahunch |
-| --- | --- |
-| Place a demo order, accept the incoming browser call, and discuss delivery. | Start the call, inspect the conversation and policy verdict, and retrieve saved courier instructions. |
+| 01 · Listen | 02 · Validate | 03 · Save |
+| :--- | :--- | :--- |
+| The customer accepts an incoming call in **SwiftCart** and discusses the handoff. | The backend checks the requested time, recipient and delivery rules. | After explicit agreement, the **Pahunch console** displays the saved instructions. |
+
+<details>
+<summary><strong>Walk through the two-tab demo</strong></summary>
+
 
 Once the application is running:
 
@@ -35,6 +31,8 @@ Once the application is running:
 5. Open **Courier instructions** in the console to inspect the saved result. Choose **Mark out for delivery** when the parcel actually leaves.
 
 The console is where courier instructions are viewed in this prototype. The order’s original address is retained; an authorized neighbour’s location belongs to the handoff instructions. Where OTP verification applies, the courier verifies with the customer. The assistant does not collect the code.
+
+</details>
 
 ## How it works
 

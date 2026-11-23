@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="398" viewBox="0 0 1120 398" role="img" aria-labelledby="title desc">
+  <title id="title">Pahunch — plan the handoff before dispatch</title>
+  <desc id="desc">An illustrated parcel on a route from a voice conversation to a confirmed courier instruction.</desc>
+  <defs>
+    <linearGradient id="paper" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#fbf6e6"/>
+      <stop offset="1" stop-color="#f4ead2"/>
+    </linearGradient>
+    <pattern id="dots" width="18" height="18" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#374550" opacity=".15"/>
+    </pattern>
+    <clipPath id="frame"><rect width="1120" height="398" rx="26"/></clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1120" height="398" fill="url(#paper)"/>
+    <path d="M684 0h436v398H570Z" fill="#e2ebeb"/>
+    <path d="M684 0h436v398H570Z" fill="url(#dots)"/>
+    <path d="M657 143c42 0 41 37 87 37h72c42 0 64 19 64 57v25c0 25 18 40 53 40h120" fill="none" stroke="#657f80" stroke-width="2.5" stroke-dasharray="4 8" stroke-linecap="round"/>
+    <g transform="translate(650 142)">
+      <circle r="32" fill="#fffaf0" stroke="#9faeaa"/>
+      <path d="M-16 0h5l4-9 6 18 6-22 6 13h5" fill="none" stroke="#245c85" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(812 178)" stroke="#3e3b2e" stroke-width="1.6" stroke-linejoin="round">
+      <ellipse cx="18" cy="93" rx="117" ry="15" fill="#657f80" opacity=".16" stroke="none"/>
+      <path d="m-87-35 96-36 91 41L4 9z" fill="#f9ce74"/>
+      <path d="M-87-35 4 9v78l-91-42z" fill="#d79c57"/>
+      <path d="m4 9 96-39v79L4 87z" fill="#edb86c"/>
+      <path d="m-38-54 25-9 91 42-24 10z" fill="#fae5ad" stroke="none"/>
+      <path d="M53-11 78-21v25L53 14z" fill="#fae5ad" stroke="none"/>
+      <path d="m22 30 36-15v25L22 55z" fill="#fff8e2" stroke="none"/>
+      <path d="m28 35 23-10m-23 17 16-7" stroke="#8e7557" stroke-width="1.4"/>
+    </g>
+    <g transform="translate(968 262)">
+      <rect width="86" height="76" rx="12" fill="#f8fcf5" stroke="#849d92"/>
+      <circle cx="22" cy="24" r="11" fill="#d4e6d8"/>
+      <path d="m17 24 4 4 7-8" fill="none" stroke="#365d49" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M40 24h28M13 48h57M13 58h40" stroke="#81978c" stroke-width="2" stroke-linecap="round"/>
+    </g>
+    <g font-family="system-ui, Segoe UI, sans-serif" fill="#192833">
+      <rect x="57" y="50" width="42" height="42" rx="10" fill="#287fcc"/>
+      <text x="68" y="78" font-size="26" font-weight="800" fill="#fff">p.</text>
+      <text x="111" y="78" font-size="24" font-weight="750" letter-spacing="-.75">Pahunch</text>
+      <text x="54" y="177" font-size="57" font-weight="750" letter-spacing="-2.4">Plan the handoff</text>
+      <text x="54" y="241" font-size="57" font-weight="750" letter-spacing="-2.4">before dispatch.</text>
+      <text x="58" y="295" font-size="20" fill="#3e5158">Talk through the delivery. Check the rules.</text>
+      <text x="58" y="322" font-size="20" fill="#3e5158">Save the plan the customer confirms.</text>
+    </g>
+  </g>
+</svg>
