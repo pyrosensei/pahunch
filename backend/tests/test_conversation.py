@@ -6,7 +6,7 @@ from sqlmodel import select
 from test_planner import db as planner_database
 from test_planner import run, start_call, valid_proposal
 
-from app.calls import MAX_CLARIFICATIONS, MAX_TURNS
+from app.calls import MAX_CLARIFICATIONS
 from app.language import conversation_language, mentioned_date, mentioned_time, phrase
 from app.llm import LLMTimeoutError
 from app.models import Order, PaymentMode, PlanProposalRecord, Turn
@@ -30,11 +30,11 @@ def reply(action, message, proposal=None, confidence=0.95):
     "text,key,language",
     [
         ("Hello", "greeting", "en-IN"),
-        ("नमस्ते", "greeting", "hi-IN"),
-        ("Namaste", "greeting", "hi-IN"),
+        ("नमस्ते", "greeting", "hi-en"),
+        ("Namaste", "greeting", "hi-en"),
         ("Can you hear me?", "heard", "en-IN"),
-        ("आपको मेरी आवाज़ आ रही?", "heard", "hi-IN"),
-        ("आपको मेरी आवाज़ आ रही है?", "heard", "hi-IN"),
+        ("आपको मेरी आवाज़ आ रही?", "heard", "hi-en"),
+        ("आपको मेरी आवाज़ आ रही है?", "heard", "hi-en"),
     ],
 )
 def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
@@ -43,7 +43,11 @@ def test_unsafe_conversational_reply_uses_matching_contextual_fallback(
     planner = PlannerService(db, scripted_llm([reply("RESPOND", "I will deliver the parcel.")]))
     call = start_call(planner.calls)
     result = run(planner, call.id, text)
-    assert result.agent_message == phrase(key, language)
+    if key == "heard" and language == "hi-en":
+        assert result.agent_message.startswith(phrase(key, language))
+        assert "आपकी delivery" in result.agent_message
+    else:
+        assert result.agent_message == phrase(key, language)
     assert result.planner.wording_source == "template"
     assert result.planner.fallback_reason == "UNSAFE_WORDING"
     assert result.turn.verdict is None
@@ -132,11 +136,11 @@ def test_window_question_example_keeps_server_fact_placeholder(db, scripted_llm,
     [
         (
             "Please hand the parcel to me",
-            "Understood. {plan_summary} {confirmation_question}",
+            "Then {plan_summary} {confirmation_question}",
             "en-IN",
         ),
-        ("मुझे ही पार्सल देना", "समझ गई। {plan_summary} {confirmation_question}", "hi-IN"),
-        ("Mujhe hi parcel dena", "Samajh gayi. {plan_summary} {confirmation_question}", "hi-en"),
+        ("मुझे ही पार्सल देना", "तो {plan_summary} {confirmation_question}", "hi-en"),
+        ("Mujhe hi parcel dena", "तो {plan_summary} {confirmation_question}", "hi-en"),
     ],
 )
 def test_model_wrapper_uses_server_facts_and_records_source(
@@ -148,7 +152,7 @@ def test_model_wrapper_uses_server_facts_and_records_source(
     assert result.planner.wording_source == "model"
     assert result.planner.fallback_reason is None
     assert result.planner.response_language == language
-    if language == "hi-IN":
+    if language in {"hi-IN", "hi-en"}:
         assert "शाम 6" in result.agent_message and "रात 8" in result.agent_message
     else:
         assert "6 PM" in result.agent_message and "8 PM" in result.agent_message
@@ -198,7 +202,7 @@ def test_invalid_policy_always_uses_deterministic_refusal(db, scripted_llm):
     planner = PlannerService(
         db,
         scripted_llm(
-            [reply("PROPOSE_PLAN", "Understood. {plan_summary} {confirmation_question}", proposal)]
+            [reply("PROPOSE_PLAN", "Then {plan_summary} {confirmation_question}", proposal)]
         ),
     )
     call = start_call(planner.calls)
@@ -215,7 +219,7 @@ def test_invalid_policy_always_uses_deterministic_refusal(db, scripted_llm):
     [
         ("Hello", "Hello, how can I help with your delivery?", "en-IN"),
         ("Can you hear me?", "Yes, I can hear you. What would you like to arrange?", "en-IN"),
-        ("क्या आपको मेरी आवाज सुनाई दे रही है?", "हाँ, आपकी आवाज सुनाई दे रही है। बताइए।", "hi-IN"),
+        ("क्या आपको मेरी आवाज सुनाई दे रही है?", "हाँ, आपकी आवाज सुनाई दे रही है। बताइए।", "hi-en"),
         ("Kya meri aawaz aa rahi hai?", "Haan, aapki aawaz aa rahi hai. Boliye.", "hi-en"),
     ],
 )
@@ -340,15 +344,15 @@ def test_clarification_limit_keeps_session_recoverable(db, scripted_llm):
     assert "human" not in result.agent_message.lower()
 
 
-def test_turn_limit_does_not_speak_another_plan_offer(db, scripted_llm):
+def test_conversation_continues_without_turn_count_ending(db, scripted_llm):
     planner = PlannerService(
-        db, scripted_llm([reply("RESPOND", "Hello, how can I help?")] * (MAX_TURNS + 1))
+        db, scripted_llm([reply("RESPOND", "Hello, how can I help?")] * (12))
     )
     call = start_call(planner.calls)
-    for _ in range(MAX_TURNS + 1):
+    for _ in range(12):
         result = run(planner, call.id, "Hello")
-    assert result.state == "TURN_BUDGET_EXHAUSTED"
-    assert result.planner.fallback_reason == "TURN_BUDGET_EXHAUSTED"
+    assert result.state == "DISCOVERY"
+    assert result.planner.fallback_reason != "TURN_BUDGET_EXHAUSTED"
     assert "confirmation" not in result.agent_message.lower()
 
 
@@ -436,7 +440,7 @@ def test_distinct_customer_turns_get_distinct_contextual_replies_then_commit(db,
             reply("RESPOND", "Your scheduled delivery window is {order_window}."),
             reply(
                 "PROPOSE_PLAN",
-                "Thanks for clarifying. {plan_summary} {confirmation_question}",
+                "Then {plan_summary} {confirmation_question}",
                 valid_proposal(),
             ),
         ]
@@ -483,7 +487,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
     planner = PlannerService(
         db,
         scripted_llm(
-            [reply("PROPOSE_PLAN", "Samajh gayi. {plan_summary} {confirmation_question}", proposal)]
+            [reply("PROPOSE_PLAN", "तो {plan_summary} {confirmation_question}", proposal)]
         ),
     )
     call = start_call(planner.calls, 1046)
@@ -491,7 +495,7 @@ def test_named_recipient_and_window_are_rendered_from_validated_proposal(db, scr
     assert result.turn.verdict.valid
     assert result.planner.wording_source == "model"
     assert "Sharma ji" in result.agent_message
-    assert "2 PM-4 PM" in result.agent_message
+    assert "दोपहर 2 से 4 बजे" in result.agent_message
 
 
 def test_recipient_text_cannot_insert_an_otp_request_into_server_wording(db, scripted_llm):
@@ -541,7 +545,7 @@ def test_response_placeholder_is_filled_with_server_facts(db, scripted_llm):
     fixed_window(db)
     planner = PlannerService(
         db,
-        scripted_llm([reply("RESPOND", "आपकी डिलीवरी का निर्धारित समय {order_window} है।")]),
+        scripted_llm([reply("RESPOND", "आपकी delivery का scheduled time {order_window} है।")]),
     )
     call = start_call(planner.calls)
     result = run(planner, call.id, "मुझे एक बात बतानी थी")
@@ -617,7 +621,7 @@ def test_response_uses_the_server_handoff_policy(db, scripted_llm):
     result = run(planner, call.id, "मुझे एक बात बतानी थी")
     assert result.planner.wording_source == "model"
     assert result.planner.fallback_reason is None
-    assert "अनुमत तरीके" in result.agent_message
+    assert "इस order में ये options हैं" in result.agent_message
 
 
 def test_delivery_commitment_in_english_is_rejected(db, scripted_llm):
@@ -733,7 +737,7 @@ def test_date_only_utterance_gets_a_date_aware_time_clarification(db, scripted_l
     planner = PlannerService(db, scripted_llm([item]))
     call = start_call(planner.calls)
     result = run(planner, call.id, "बारह नवंबर को हो सकता है।")
-    assert result.agent_message == "12 नवंबर को कौन सा समय ठीक रहेगा?"
+    assert result.agent_message == "12 नवंबर को कौन सा time ठीक रहेगा?"
     assert result.planner.wording_source == "template"
     assert result.planner.fallback_reason == "DATE_AWARE_CLARIFICATION"
 

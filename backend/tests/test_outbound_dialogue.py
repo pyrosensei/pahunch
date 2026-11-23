@@ -73,8 +73,9 @@ def test_audibility_question_uses_heard_and_delivery_purpose(db, utterance):
     record_opening(db, call.id)
     result = asyncio.run(planner.handle_turn(call.id, AgentTurnRequest(text=utterance)))
     assert result.planner.fallback_reason == "OUTBOUND_DELIVERY_PURPOSE"
-    assert result.agent_message.startswith("हाँ, आपकी आवाज सुनाई दे रही है।")
-    assert "1042" in result.agent_message
+    assert result.agent_message.startswith("हाँ, आपकी आवाज़ आ रही है।")
+    assert len(result.agent_message) < 120
+    assert "OTP" not in result.agent_message
     assert not result.turn.customer_confirmed
 
 
@@ -105,7 +106,7 @@ def test_socket_records_proactive_opening_and_first_yes_only_proposes():
             purpose = await socket.event("turn")
             assert purpose["planner"]["fallback_reason"] == "OUTBOUND_DELIVERY_PURPOSE"
             assert "1042" in purpose["agent_message"]
-            assert "available hain" in purpose["agent_message"]
+            assert "available हैं" in purpose["agent_message"]
             assert "IST" not in purpose["agent_message"]
             assert not purpose["turn"]["customer_confirmed"]
             purpose_end = await socket.event("agent_audio_end")

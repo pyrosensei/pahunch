@@ -44,7 +44,6 @@ from app.schemas import (
 from app.state_machine import TERMINAL_STATES, transition
 from app.tools import ToolName, require_tool
 
-MAX_TURNS = 8
 MAX_CLARIFICATIONS = 3
 CALL_COOLDOWN = timedelta(hours=1)
 MANUAL_BROWSER_RETRY_DELAY = timedelta(seconds=30)
@@ -461,7 +460,9 @@ class CallService:
         ):
             call.customer_confirmed = False
             reason = "LOW_TRANSCRIPT_CONFIDENCE" if low_confidence else "EXPLICIT_AGREEMENT_REQUIRED"
-            self._audit(call.id, "CUSTOMER_CONFIRMATION_REJECTED", {"reason": reason})
+            self._audit(call.id, "CUSTOMER_CONFIRMATION_REJECTED", {
+                "reason": reason, "proposal_id": call.current_proposal_id,
+            })
             self.db.commit()
             raise DomainError(409, "Explicit customer agreement to the current plan is required")
         if request.proposal is not None and low_confidence:
@@ -485,12 +486,7 @@ class CallService:
         call.turn_count += 1
         verdict = None
 
-        if call.turn_count > MAX_TURNS:
-            call.customer_confirmed = False
-            self._transition(call, CallState.TURN_BUDGET_EXHAUSTED)
-            call.outcome = CallOutcome.TURN_BUDGET_EXHAUSTED
-            call.ended_at = self.clock()
-        elif request.address_change_requested:
+        if request.address_change_requested:
             self._escalate(call, "ADDRESS_CHANGE_REQUESTED")
         elif request.escalation_reason:
             self._escalate(call, request.escalation_reason)
@@ -575,7 +571,9 @@ class CallService:
                 if record is None or not validate_plan(PlanProposal.model_validate_json(record.proposal_json), order, slots).valid:
                     raise DomainError(409, "The current plan needs updated delivery details before confirmation")
                 call.customer_confirmed = True
-                self._audit(call.id, "CUSTOMER_CONFIRMED")
+                self._audit(call.id, "CUSTOMER_CONFIRMED", {
+                    "reason": "EXPLICIT_AGREEMENT", "proposal_id": call.current_proposal_id,
+                })
 
         self.db.commit()
         return TurnResult(
@@ -711,10 +709,23 @@ class CallService:
             PlanAction.ESCALATE_TO_HUMAN: "Human review required",
         }
         lines = [instructions[primary.action]]
+        recipient_kind = {
+            PlanAction.HAND_TO_CUSTOMER: "CUSTOMER",
+            PlanAction.RESCHEDULE: "CUSTOMER",
+            PlanAction.LEAVE_WITH_NEIGHBOR: "NEIGHBOR",
+            PlanAction.LEAVE_WITH_SECURITY: "SECURITY",
+        }.get(primary.action)
+        restrictions = []
+        if order.payment_mode == PaymentMode.COD or order.declared_value_inr >= HIGH_VALUE_THRESHOLD_INR:
+            restrictions.append("Customer-only handoff. Do not leave with a neighbour or security.")
+        if recipient_kind == "CUSTOMER":
+            lines.append("Hand the parcel directly to the customer")
         if primary.call_on_arrival:
             lines.append("Call customer on arrival")
         if order.requires_otp:
-            lines.append("Courier must verify OTP directly with the customer before handoff, including to an authorized named neighbour. If customer cannot be reached or verification fails, do not hand over; arrange the next available delivery. Never collect OTP through the AI assistant.")
+            third_party = any(step is not None and step.action in {PlanAction.LEAVE_WITH_NEIGHBOR, PlanAction.LEAVE_WITH_SECURITY} for step in (primary, proposal.fallback))
+            handoff = " before any authorized third-party handoff" if third_party else " before handing the parcel to the customer"
+            lines.append(f"Courier must verify OTP directly with the customer{handoff}. If customer cannot be reached or verification fails, do not hand over; arrange the next available delivery. Never collect OTP through the AI assistant.")
         if order.payment_mode == PaymentMode.COD:
             lines.append("Collect cash on delivery")
         if proposal.fallback is not None:
@@ -743,6 +754,8 @@ class CallService:
             call_on_arrival=primary.call_on_arrival,
             named_recipient=primary.named_recipient,
             recipient_address=primary.recipient_address,
+            recipient_kind=recipient_kind,
+            handoff_restrictions=restrictions,
             instructions=lines,
             generated_at=now,
         )

@@ -15,6 +15,25 @@ _MONTHS.update({"फरवरी": 2, "सितम्बर": 9, "नवम्�
 _MONTH_RE = "|".join(sorted(map(re.escape, _MONTHS), key=len, reverse=True))
 _DATE = re.compile(rf"(?<!\d)([0-3]?\d)\s+({_MONTH_RE})(?!\w)", re.IGNORECASE)
 _TIME = re.compile(r"(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])")
+_HINDI_CLOCK = re.compile(
+    r"(रात|सुबह|दोपहर|शाम)\s+(\d{1,2})(?::([0-5]\d))?"
+    r"(?:\s+से\s+(?:(रात|सुबह|दोपहर|शाम)\s+)?(\d{1,2})(?::([0-5]\d))?)?\s+बजे"
+)
+
+
+def _spoken_hindi_clock(match: re.Match) -> str:
+    def clock(hour, minute):
+        value = int(hour)
+        if not 1 <= value <= 12:
+            return None
+        if minute and int(minute):
+            return f"{_NUM_HI[value]} बजकर {_NUM_HI[int(minute)]} मिनट"
+        return f"{_NUM_HI[value]} बजे"
+    start = clock(match[2], match[3])
+    end = clock(match[5], match[6]) if match[5] else None
+    if start is None or (match[5] and end is None):
+        return match[0]
+    return f"{match[1]} {start}" + (f" से {match[4] + ' ' if match[4] else ''}{end}" if end else "")
 
 
 def _english_number(value: int) -> str:
@@ -69,7 +88,7 @@ def spoken_clock(hour: int, minute: int, language: str) -> str:
 
 def customer_moment(moment: datetime, language: str) -> str:
     """A single clock time with no timezone name."""
-    if language == "hi-IN":
+    if language in {"hi-IN", "hi-en"}:
         return f"{moment.day} {_HI[moment.month - 1]}, {_hindi_period(moment.hour)} {_clock_number(moment)} बजे"
     suffix = "AM" if moment.hour < 12 else "PM"
     return f"{moment:%d %B}, {_clock_number(moment)} {suffix}"
@@ -77,14 +96,14 @@ def customer_moment(moment: datetime, language: str) -> str:
 
 def customer_date(day: int, month: int, language: str) -> str:
     """A calendar date without a year, matching how windows name their days."""
-    if language == "hi-IN":
+    if language in {"hi-IN", "hi-en"}:
         return f"{day} {_HI[month - 1]}"
     return f"{day:02d} {_EN[month - 1]}"
 
 
 def customer_window(start: datetime, end: datetime, language: str) -> str:
     """A delivery window the way a person would say it, without IST."""
-    if language == "hi-IN":
+    if language in {"hi-IN", "hi-en"}:
         if start.date() == end.date():
             when = f"{start.day} {_HI[start.month - 1]}"
         else:
@@ -110,6 +129,9 @@ def spoken_text(text: str, language: str = "hi-en") -> str:
     This runs at the synthesis boundary. Transcripts and structured plan/window
     values retain the exact original text and timestamps.
     """
+    if language == "hi-en" and re.search(r"[\u0900-\u097f]", text):
+        language = "hi-IN"
+
     def date(match: re.Match) -> str:
         day = int(match[1])
         if not 1 <= day <= 31:
@@ -120,6 +142,8 @@ def spoken_text(text: str, language: str = "hi-en") -> str:
         return f"{_english_number(day)} {_EN[month - 1]}"
 
     rendered = _DATE.sub(date, text)
+    if language == "hi-IN":
+        rendered = _HINDI_CLOCK.sub(_spoken_hindi_clock, rendered)
     # A range dash belongs to the clock label, not an order number or name.
     rendered = re.sub(r"(?<=\d{2}:\d{2})\s*[-–—]\s*(?=\d{1,2}:\d{2})", " से " if language == "hi-IN" else " to ", rendered)
     rendered = _TIME.sub(lambda m: _time(int(m[1]), int(m[2]), language), rendered)

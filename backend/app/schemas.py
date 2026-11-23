@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Literal
 
@@ -30,6 +30,14 @@ class TurnRelevance(str, Enum):
     CALL_CONTROL = "CALL_CONTROL"
 
 
+class InformationTopic(str, Enum):
+    AVAILABILITY = "AVAILABILITY"
+    SCHEDULED_DELIVERY = "SCHEDULED_DELIVERY"
+    ORDER_PLACED = "ORDER_PLACED"
+    PAYMENT = "PAYMENT"
+    HANDOFF_POLICY = "HANDOFF_POLICY"
+
+
 SLOT_ACTIONS = {
     PlanAction.HAND_TO_CUSTOMER,
     PlanAction.LEAVE_WITH_SECURITY,
@@ -55,6 +63,16 @@ class RequestDetails(BaseModel):
     window_start: datetime | None = None
     window_end: datetime | None = None
     time_source: CustomerEvidence | None = None
+    time_reference: Literal["UNSPECIFIED", "START_ONLY", "EXPLICIT_WINDOW"] = "UNSPECIFIED"
+    end_time_source: CustomerEvidence | None = None
+    requested_start_clock: time | None = None
+    requested_end_clock: time | None = None
+    date_reference: Literal["UNSPECIFIED", "ABSOLUTE", "TODAY", "TOMORROW", "SCHEDULED", "DISCUSSED"] = "UNSPECIFIED"
+    requested_date: date | None = None
+    date_source: CustomerEvidence | None = None
+    unavailable_dates: list[date] = Field(default_factory=list, max_length=31)
+    scheduled_window_available: bool | None = None
+    availability_source: CustomerEvidence | None = None
     relative_day_source: CustomerEvidence | None = Field(default=None, description="Quote only today, tomorrow, aaj, kal, आज or कल when the requested primary date is relative to call_date. The backend resolves this day.")
     recipient_source: CustomerEvidence | None = None
     recipient_address_source: CustomerEvidence | None = None
@@ -108,6 +126,8 @@ class PlannerDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PlannerAction
+    information_topics: list[InformationTopic] = Field(default_factory=list, max_length=5)
+    availability_scope: Literal["ALL", "ALTERNATIVES", "DATE"] = "ALL"
     relevance: TurnRelevance = TurnRelevance.DELIVERY
     delivery_quotes: list[str] = Field(
         default_factory=list,
@@ -116,7 +136,7 @@ class PlannerDecision(BaseModel):
     )
     awaiting_continuation: bool = False
     request_details: RequestDetails | None = None
-    missing_fields: list[Literal["time", "end_time", "recipient", "recipient_address", "continuation", "availability", "other"]] = Field(default_factory=list, max_length=6)
+    missing_fields: list[Literal["date", "time", "end_time", "recipient", "recipient_address", "continuation", "availability", "other"]] = Field(default_factory=list, max_length=6)
     message: str = Field(max_length=500)
     proposal: PlanProposal | None
     escalation_reason: str | None = Field(max_length=300)
@@ -192,6 +212,8 @@ class AgentTurnRequest(BaseModel):
 
 
 class PlannerMeta(BaseModel):
+    information_topics: list[InformationTopic] = Field(default_factory=list)
+    availability_scope: Literal["ALL", "ALTERNATIVES", "DATE"] = "ALL"
     relevance: TurnRelevance = TurnRelevance.DELIVERY
     delivery_quotes: list[str] = Field(default_factory=list)
     presented_proposal_id: str | None = None
@@ -228,6 +250,8 @@ class VoiceTimings(BaseModel):
     total_ms: int = 0
     first_audio_ms: int = 0
     first_response_audio_ms: int | None = None
+    text_ready_ms: int | None = None
+    tts_first_chunk_ms: int | None = None
 
 
 class VoiceTurnResponse(BaseModel):
@@ -259,6 +283,8 @@ class CourierCard(BaseModel):
     call_on_arrival: bool
     named_recipient: str | None = None
     recipient_address: str | None = None
+    recipient_kind: Literal["CUSTOMER", "NEIGHBOR", "SECURITY"] | None = None
+    handoff_restrictions: list[str] = Field(default_factory=list)
     instructions: list[str]
     generated_at: datetime
 

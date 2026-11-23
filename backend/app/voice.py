@@ -278,6 +278,7 @@ class VoiceTurnService:
                 planner_task.cancel()
             await asyncio.gather(planner_task, return_exceptions=True)
         planner_ms = round((perf_counter() - planner_started) * 1_000)
+        text_ready_at = perf_counter()
 
         response = VoiceTurnResponse(
             session_id=session_id,
@@ -288,7 +289,10 @@ class VoiceTurnService:
             agent_message=planner_response.agent_message,
             turn=planner_response.turn,
             planner=planner_response.planner,
-            timings=VoiceTimings(stt_ms=stt_ms, planner_ms=planner_ms),
+            timings=VoiceTimings(
+                stt_ms=stt_ms, planner_ms=planner_ms,
+                text_ready_ms=round((text_ready_at - turn_reference) * 1000),
+            ),
         )
         if response.planner.awaiting_continuation:
             # The same planner call judges sentence completeness. Give the
@@ -306,6 +310,13 @@ class VoiceTurnService:
         audio_bytes = 0
         audio_streamed = False
         tts_started = perf_counter()
+        self.db.add(AuditEvent(
+            session_id=session_id, event_type="ASSISTANT_SPEECH",
+            payload_json=json.dumps({
+                "tts_text": redact_customer_text(spoken_text(planner_response.agent_message, planner_response.planner.response_language)),
+                "response_language": planner_response.planner.response_language,
+            }, ensure_ascii=False), created_at=utc_now(),
+        ))
 
         def mark_first_audio() -> None:
             nonlocal first_audio_at, first_response_audio_at
@@ -361,6 +372,7 @@ class VoiceTurnService:
                 (first_audio_at - turn_reference) * 1_000
             )
         if first_response_audio_at is not None:
+            response.timings.tts_first_chunk_ms = round((first_response_audio_at - tts_started) * 1000)
             response.timings.first_response_audio_ms = round(
                 (first_response_audio_at - turn_reference) * 1_000
             )
@@ -382,6 +394,8 @@ class VoiceTurnService:
                         "stt_ms": stt_ms,
                         "stt_mode": stt_mode,
                         "planner_ms": planner_ms,
+                        "text_ready_ms": response.timings.text_ready_ms,
+                        "tts_first_chunk_ms": response.timings.tts_first_chunk_ms,
                         "tts_ms": tts_ms,
                         "total_ms": total_ms,
                         "first_audio_ms": response.timings.first_audio_ms,

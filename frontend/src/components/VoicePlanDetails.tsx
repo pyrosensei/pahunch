@@ -24,12 +24,13 @@ export function VoicePlanDetails({ proposal, card }: { proposal?: JsonObject | n
   return <div className="voice-plan-details readable-plan">
     <dl><dt>{card ? 'Committed action' : 'Proposed action'}</dt><dd>{label(text(primary.action))}</dd>
       <dt>Delivery window · IST</dt><dd>{dateTime(text(primary.window_start))}<br />{dateTime(text(primary.window_end))}</dd>
-      <dt>Recipient</dt><dd>{recipient || (primary.action === 'HAND_TO_CUSTOMER' ? 'Customer' : 'Not specified')}</dd>
+      <dt>Recipient</dt><dd>{recipient || (primary.recipient_kind === 'CUSTOMER' || primary.action === 'HAND_TO_CUSTOMER' ? 'Customer' : primary.recipient_kind === 'SECURITY' ? 'Building security' : 'Not specified')}</dd>
       {address && <><dt>Recipient address</dt><dd>{address}</dd></>}
       {typeof primary.call_on_arrival === 'boolean' && <><dt>Call on arrival</dt><dd>{primary.call_on_arrival ? 'Yes' : 'No'}</dd></>}
       {typeof primary.delay_minutes === 'number' && <><dt>Retry delay</dt><dd>{primary.delay_minutes} minutes</dd></>}
       {fallback && !card && <><dt>If the primary plan cannot happen</dt><dd>{label(text(fallback.action))}{text(fallback.named_recipient) ? ` · ${text(fallback.named_recipient)}` : ''}{text(fallback.recipient_address) ? ` · ${text(fallback.recipient_address)}` : ''}{typeof fallback.delay_minutes === 'number' ? ` · After ${fallback.delay_minutes} minutes` : ''}{typeof fallback.max_retries === 'number' ? ` · ${fallback.max_retries} retries` : ''}</dd></>}
     </dl>
+    {Array.isArray(card?.handoff_restrictions) && card.handoff_restrictions.length > 0 && <><h3>Handoff restrictions</h3><ul>{card.handoff_restrictions.filter((item): item is string => typeof item === 'string').map((item, i) => <li key={i}>{item}</li>)}</ul></>}
     {(recipientSource || addressSource) && <details className="plan-source"><summary>Customer source</summary><dl>
       {recipientSource && <><dt>Recipient</dt><dd>{recipientSource}</dd></>}
       {addressSource && <><dt>Address</dt><dd>{addressSource}</dd></>}

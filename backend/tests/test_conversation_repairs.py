@@ -52,7 +52,7 @@ def test_courier_otp_guidance_explains_direct_handoff_without_reflexive_refusal(
     call = start_call(planner.calls)
     result = run(planner, call.id, "डिलीवरी वाले को ओटीपी देना है, आपको नहीं")
     assert result.planner.fallback_reason == "COURIER_OTP_GUIDANCE"
-    assert "कूरियर को देना है" in result.agent_message
+    assert "courier को देना है" in result.agent_message
     assert "कभी नहीं" not in result.agent_message
     assert not result.turn.customer_confirmed
 
@@ -96,22 +96,26 @@ def test_neighbour_with_otp_requires_courier_verification_and_confirmation(db, s
     assert not result.turn.customer_confirmed
 
 
-def test_order_and_delivery_date_question_uses_actual_creation_record(db):
-    planner = PlannerService(db, NoModel())
+def test_order_and_delivery_date_question_uses_actual_creation_record(db, scripted_llm):
+    item = decision(PlannerAction.RESPOND, "{order_placed}")
+    item["information_topics"] = ["ORDER_PLACED", "SCHEDULED_DELIVERY"]
+    planner = PlannerService(db, scripted_llm([item]))
     call = start_call(planner.calls)
     db.add(DialerEvent(order_id=1042, event_type="ORDER_CREATED", reason="Demo order", payload_json="{}", created_at=datetime(2026, 11, 2, 12, 0, tzinfo=UTC)))
     db.commit()
     result = run(planner, call.id, "मैंने अभी order किया, order और delivery date अलग होगी ना?")
-    assert "02 November, 5:30 PM" in result.agent_message
-    assert "05 November, 6 PM-8 PM" in result.agent_message
+    assert "2 नवंबर, शाम 5:30 बजे" in result.agent_message
+    assert "5 नवंबर, शाम 6 से रात 8 बजे" in result.agent_message
     assert "IST" not in result.agent_message
-    assert "alag hain" in result.agent_message
+    assert "अलग हैं" in result.agent_message
     assert result.planner.response_language == "hi-en"
-    assert result.planner.fallback_reason == "ORDER_DATE_QUESTION"
+    assert result.planner.information_topics[0].value == "ORDER_PLACED"
 
 
-def test_combined_date_and_time_question_returns_both_without_generic_apology(db):
-    planner = PlannerService(db, NoModel())
+def test_combined_date_and_time_question_returns_both_without_generic_apology(db, scripted_llm):
+    item = decision(PlannerAction.RESPOND, "{order_window}")
+    item["information_topics"] = ["SCHEDULED_DELIVERY"]
+    planner = PlannerService(db, scripted_llm([item]))
     call = start_call(planner.calls)
     result = run(planner, call.id, "मुझे मेरा date बताइए time")
     assert "5 नवंबर" in result.agent_message and "शाम 6" in result.agent_message and "रात 8" in result.agent_message

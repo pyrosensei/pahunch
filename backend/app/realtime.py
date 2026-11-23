@@ -22,6 +22,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.calls import ADMISSION_LOCK, CallService, acknowledge_operator_revision, utc_now
 from app.errors import DomainError
 from app.gnani import GnaniError, SpeechClient
+from app.language import redact_customer_text
 from app.llm import StructuredLLM
 from app.models import AuditEvent, Speaker, Turn
 from app.planner import MIN_CONFIDENCE, MIN_TRANSCRIPT_CONFIDENCE, outbound_opening
@@ -557,6 +558,7 @@ async def handle_voice_socket(
     pending_start = False
     playback_tracking = False
     reported_underrun_generation = None
+    reported_playback_generation = None
     audio_feedback = False
     listening_since = perf_counter()
     last_frame_at: float | None = None
@@ -849,6 +851,8 @@ async def handle_voice_socket(
         audit(
             "OPENING_LINE_SPOKEN",
             {
+                "tts_text": redact_customer_text(spoken_text(message, meta.response_language)),
+                "response_language": meta.response_language,
                 "bytes": byte_count,
                 "first_audio_ms": first_audio_ms,
                 "tts_ms": round((perf_counter() - started) * 1000),
@@ -1141,6 +1145,19 @@ async def handle_voice_socket(
                 else:
                     playback_generation = None
                     await listen()
+            elif kind == "playback_started":
+                reported = control.get("generation_id")
+                if (type(reported) is int and reported == playback_generation
+                        and reported != reported_playback_generation):
+                    reported_playback_generation = reported
+                    timings = {}
+                    for key in ("client_text_to_playback_ms", "client_audio_buffer_ms"):
+                        value = control.get(key)
+                        if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 3_600_000:
+                            timings[key] = round(value)
+                    audit("BROWSER_PLAYBACK_STARTED", {
+                        "generation_id": reported, "source": "browser_render_report", **timings,
+                    })
             elif kind == "playback_underrun":
                 reported = control.get("generation_id")
                 if (type(reported) is int and reported == playback_generation

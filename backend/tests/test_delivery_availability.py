@@ -67,16 +67,12 @@ def test_requested_three_pm_requires_confirmation_then_commits(db, scripted_llm)
 
 
 @pytest.mark.parametrize("question", ["Which time is available?", "What delivery slots are available?", "कौन सा टाइम उपलब्ध है?", "टाइम चेंज नहीं कर सकते विच टाइम इज़ अवेलेबल", "क्या बारह नवंबर को आप यह चीज कर सकते हैं?", "Can you deliver on 12 November?"])
-def test_availability_questions_do_not_call_model_or_repeat_rejected_plan(db, question):
+def test_availability_questions_use_structured_topic_and_recorded_facts(db, question, scripted_llm):
     setup_availability(db)
-    class NoModel:
-        model_name = "unused"
-        async def complete_json(self, **kwargs):
-            raise AssertionError("Availability comes from backend data")
     call = start_call(CallService(db))
-    response = run(PlannerService(db, NoModel()), call.id, question)
-    assert response.planner.fallback_reason == "DELIVERY_AVAILABILITY"
-    if response.planner.response_language == "hi-IN":
+    response = run(PlannerService(db, scripted_llm([{"action": "RESPOND", "information_topics": ["AVAILABILITY"], "message": "{available_windows}", "proposal": None, "escalation_reason": None, "confidence": 0.95}])), call.id, question)
+    assert response.planner.information_topics[0].value == "AVAILABILITY"
+    if response.planner.response_language in {"hi-IN", "hi-en"}:
         assert "सुबह 10" in response.agent_message and "शाम 6" in response.agent_message
         assert "नवंबर" in response.agent_message
     else:
@@ -100,35 +96,33 @@ def test_date_question_with_a_clock_still_reaches_the_planner(db, scripted_llm):
 @pytest.mark.parametrize("question,present,absent", [
     ("Can you deliver on 6 November?", "06 November is available", "05 November"),
     ("Can you deliver on 12 November?", "12 November is not available", None),
-    ("क्या बारह नवंबर को आप यह चीज कर सकते हैं?", "12 नवंबर उपलब्ध नहीं है", None),
-    ("क्या छह नवंबर को हो सकता है?", "6 नवंबर उपलब्ध है", "5 नवंबर"),
+    ("क्या बारह नवंबर को आप यह चीज कर सकते हैं?", "12 नवंबर available नहीं है", None),
+    ("क्या छह नवंबर को हो सकता है?", "6 नवंबर, सुबह 10 से शाम 6 बजे में delivery हो सकती है", "5 नवंबर"),
 ])
-def test_feasibility_answer_addresses_the_date_asked_about(db, question, present, absent):
+def test_feasibility_answer_addresses_the_date_asked_about(db, question, present, absent, scripted_llm):
     setup_availability(db)
-    class NoModel:
-        model_name = "unused"
-        async def complete_json(self, **kwargs):
-            raise AssertionError("Availability comes from backend data")
     call = start_call(CallService(db))
-    response = run(PlannerService(db, NoModel()), call.id, question)
-    assert response.planner.fallback_reason == "DELIVERY_AVAILABILITY"
+    day = 6 if "6 November" in question or "छह" in question else 12
+    item = {"action": "RESPOND", "information_topics": ["AVAILABILITY"], "availability_scope": "DATE", "message": "{available_windows}", "proposal": None, "escalation_reason": None, "confidence": 0.95,
+                "request_details": {"date_reference":"ABSOLUTE", "requested_date":f"2026-11-{day:02d}", "date_source":{"quote":question}}}
+    response = run(PlannerService(db, scripted_llm([item])), call.id, question)
+    assert response.planner.information_topics[0].value == "AVAILABILITY"
     assert present in response.agent_message
     if absent is not None:
         assert absent not in response.agent_message
     assert not response.turn.customer_confirmed
 
 
-def test_a_slot_spanning_days_covers_the_date_in_its_middle(db):
+def test_a_slot_spanning_days_covers_the_date_in_its_middle(db, scripted_llm):
     order = db.get(Order, 1042)
     db.exec(delete(DeliverySlot).where(DeliverySlot.order_id == order.id))
     db.add(DeliverySlot(order_id=order.id, start_at=at("05T10:00:00"), end_at=at("08T18:00:00")))
     db.commit()
-    class NoModel:
-        model_name = "unused"
-        async def complete_json(self, **kwargs):
-            raise AssertionError("Availability comes from backend data")
     call = start_call(CallService(db))
-    response = run(PlannerService(db, NoModel()), call.id, "Can you deliver on 7 November?")
+    question = "Can you deliver on 7 November?"
+    item = {"action": "RESPOND", "information_topics": ["AVAILABILITY"], "availability_scope": "DATE", "message": "{available_windows}", "proposal": None, "escalation_reason": None, "confidence": 0.95,
+                "request_details": {"date_reference":"ABSOLUTE", "requested_date":"2026-11-07", "date_source":{"quote":question}}}
+    response = run(PlannerService(db, scripted_llm([item])), call.id, question)
     assert "07 November is available" in response.agent_message
 
 

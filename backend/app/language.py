@@ -2,8 +2,11 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+from app.consent import is_explicit_confirmation
+
 _HINDI = re.compile(r"[\u0900-\u097f]")
 _HINGLISH_WORDS = {
+    "main",
     "haan",
     "han",
     "ha",
@@ -28,6 +31,16 @@ _HINGLISH_WORDS = {
     "shaam",
     "subah",
     "baje",
+    "dopahar",
+    "dopaher",
+    "raat",
+    "pandrah",
+    "solah",
+    "teen",
+    "paanch",
+    "tarikh",
+    "tareekh",
+    "samay",
     "dena",
     "de",
     "kardo",
@@ -134,18 +147,22 @@ def conversation_language(text: str, previous: str = "hi-IN") -> str:
     if re.fullmatch(r"\s*(?:please\s+)?(?:hindi mein (?:bolo|boliye|baat karo)|हिंदी में (?:बोलिए|बोलो|बात करें))[.!?।\s]*", text, re.IGNORECASE):
         return "hi-IN"
     normalized = " ".join(text.casefold().split()).strip(".!?। ")
+    if not normalized:
+        return previous
     acknowledgements = {
         "yes", "yeah", "okay", "ok", "haan", "han", "ha", "ji", "theek hai",
         "हाँ", "हां", "हा", "जी", "ठीक", "ठीक है", "नमस्ते", "namaste",
     }
-    if normalized in acknowledgements:
+    if normalized in acknowledgements or (
+        len(normalized.split()) <= 8 and is_explicit_confirmation(text)
+    ):
         return previous
     words = re.findall(r"[a-z]+", text.casefold())
     hindi_words = re.findall(r"[\u0900-\u097f]+", text)
     if hindi_words and not words and len(hindi_words) <= 2:
         return previous
-    # A Hinglish call stays Hinglish when the customer answers in Devanagari.
-    # Full Hindi is only for an explicit request, handled above.
+    # Hindi speech preserves the conversational Hinglish default. An explicit
+    # Hindi request above selects Hindi until the customer switches language.
     if hindi_words and previous == "hi-en":
         return "hi-en"
     if hindi_words:
@@ -167,6 +184,8 @@ def conversation_language(text: str, previous: str = "hi-IN") -> str:
 def language_matches(text: str, language: str) -> bool:
     if language == "hi-IN":
         return bool(_HINDI.search(text))
+    if language == "hi-en" and _HINDI.search(text):
+        return True
     if _HINDI.search(text):
         return False
     detected = response_language(text)
@@ -225,20 +244,20 @@ def redact_payload(value):
 
 MESSAGES = {
     "hi-en": {
-        "unclear": "Aap scheduled time par parcel lenge, ya delivery ka doosra time chahiye?",
-        "unavailable": "Mujhe abhi jawab taiyar karne mein technical dikkat aa rahi hai. Kripya thodi der baad dobara koshish kijiye.",
-        "rate_limit": "Jawab taiyar karne wali service ki usage limit abhi poori ho gayi hai. Kripya thodi der baad dobara koshish kijiye.",
-        "confirmation_required": "Confirm karne ke liye haan ya theek hai boliye. Phir main isi plan ko aage badha sakti hoon.",
-        "confirmation_accepted": "Theek hai, main is plan ko final karne ke liye aage badha rahi hoon.",
-        "confirmation_question": "Kya main is plan ko aage badhaun?",
-        "escalation": "Main is request ko human team ko bhej rahi hoon. Woh aapse details confirm karenge.",
-        "otp_refusal": "Main OTP kabhi share nahi karti. OTP aapke phone par aata hai; delivery ke time courier ko dijiye.",
-        "identity": "Main SwiftCart ki automated delivery assistant hoon, insaan nahi. Aap tracking link se apna order verify kar sakte hain.",
-        "greeting": "Namaste, main SwiftCart ki automated delivery assistant hoon. Boliye, delivery ke liye kya chahiye?",
-        "heard": "Haan, aapki aawaz aa rahi hai. Boliye, delivery ke liye kya chahiye?",
-        "repeat_plan": "Aapne yeh plan mana kiya hai. Koi doosra time ya handoff bataiye.",
-        "turn_limit": "Hum is call mein plan tay nahi kar paye. Yahin call khatam karte hain; abhi koi plan final nahi hua hai.",
-        "ack": "Ji, aapki baat sun li.",
+        "unclear": "आप scheduled time पर parcel ले पाएँगे, या दूसरा delivery time चाहिए?",
+        "unavailable": "अभी जवाब तैयार करने में technical दिक्कत आ रही है। थोड़ी देर में दोबारा कोशिश कीजिए।",
+        "rate_limit": "अभी जवाब देने वाली service की usage limit पूरी हो गई है। थोड़ी देर में दोबारा कोशिश कीजिए।",
+        "confirmation_required": "क्या आप यही plan confirm करना चाहेंगे?",
+        "confirmation_accepted": "ठीक है, यही plan save करने के लिए आगे बढ़ा रही हूँ।",
+        "confirmation_question": "यही plan confirm कर दूँ?",
+        "escalation": "आपकी request support team को भेज रही हूँ। वे आपसे details confirm करेंगे।",
+        "otp_refusal": "मैं OTP नहीं माँगती या share करती। Delivery के समय इसे केवल courier को दीजिए।",
+        "identity": "मैं SwiftCart की automated delivery assistant हूँ। Tracking link से अपना order verify कर सकते हैं।",
+        "greeting": "नमस्ते, मैं SwiftCart की delivery assistant हूँ। Delivery के बारे में बताइए।",
+        "heard": "हाँ, आपकी आवाज़ आ रही है।",
+        "repeat_plan": "यह plan आपने मना किया था। कौन सा दूसरा time या parcel लेने वाला व्यक्ति रखें?",
+        "turn_limit": "अभी delivery plan तय नहीं हुआ है। यह call यहीं समाप्त करते हैं।",
+        "ack": "जी।",
     },
     "en-IN": {
         "unclear": "Will you receive the parcel at the scheduled time, or would you prefer another delivery time?",
@@ -280,16 +299,19 @@ def phrase(key: str, language: str = "hi-en") -> str:
 
 
 def translate_fixed(message: str, language: str) -> str:
-    for key, original in MESSAGES["hi-en"].items():
-        if message == original:
-            return phrase(key, language)
+    if message in MESSAGES[language].values():
+        return message
+    for phrases in MESSAGES.values():
+        for key, original in phrases.items():
+            if message == original:
+                return phrase(key, language)
     return message
 
 
 WRAPPER_PREFIXES = {
-    "en-IN": ("", "Understood.", "Thanks for clarifying.", "For the revised instruction:"),
-    "hi-IN": ("", "समझ गई।", "स्पष्ट करने के लिए धन्यवाद।", "बदले हुए निर्देश के लिए:"),
-    "hi-en": ("", "Samajh gayi.", "Aapki baat samajh gayi.", "Badle hue instruction ke liye:"),
+    "en-IN": ("", "Then"),
+    "hi-IN": ("", "तो"),
+    "hi-en": ("", "तो"),
 }
 PLAN_PLACEHOLDERS = "{plan_summary} {confirmation_question}"
 FACT_TEMPLATES = {
@@ -309,6 +331,11 @@ FACT_TEMPLATES = {
         "{handoff_policy}",
     ),
 }
+FACT_TEMPLATES["hi-en"] = (
+    "आपकी delivery का scheduled time {order_window} है।",
+    "इस order का payment mode {payment_mode} है।",
+    "{handoff_policy}",
+)
 
 
 _NUMERIC_EXPRESSION = re.compile(r"\d{1,2}:\d{2}(?::\d{2})?|\d+")

@@ -16,9 +16,10 @@ class Worklet {
     postMessage: (value: JsonObject) => this.messages.push(value) };
   connect = vi.fn(); disconnect = vi.fn();
   drain(generation: number, connection = 1) { this.port.onmessage?.({ data: { type: 'drained', generation_id: generation, connection_id: connection } }); }
+  start(generation: number, connection = 1) { this.port.onmessage?.({ data: { type: 'started', generation_id: generation, connection_id: connection } }); }
 }
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
-function fixture(options: { transport?: string; state?: string; microphone?: () => Promise<MediaStream> } = {}) {
+function fixture(options: { transport?: string; state?: string; microphone?: () => Promise<MediaStream>; now?: () => number } = {}) {
   const session: VoiceSession = { id: 'call-1', order_id: 42, transport: options.transport || 'browser', state: options.state || 'DISCOVERY', customer_confirmed: false };
   const requests: { url: string; method: string; body?: string }[] = [];
   const sockets: Socket[] = [];
@@ -38,6 +39,7 @@ function fixture(options: { transport?: string; state?: string; microphone?: () 
     return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json' } });
   });
   const controller = new VoiceController({ fetch: fetcher, origin: 'https://demo.test',
+    now: options.now || (() => performance.now()),
     audio, microphone, worklet: (_context, name) => (name === 'pcm-player' ? player : mic) as unknown as AudioWorkletNode,
     socket: () => { const socket = new Socket(); sockets.push(socket); return socket as unknown as WebSocket; },
   });
@@ -105,7 +107,7 @@ describe('voice controller connection and safety', () => {
     ]);
     ws.event({ type: 'turn', generation_id: 2, transcript: 'My OTP is [redacted]', turn: { customer_confirmed: false } });
     expect(f.controller.getSnapshot().processing).toBe(false);
-    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['How should we deliver your order?', 'My OTP is [redacted]']);
+    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['My OTP is [redacted]']);
     expect(f.controller.sendText('Please hand it to me')).toBe(true);
     f.controller.disconnect();
   });
@@ -269,9 +271,53 @@ describe('voice controller connection and safety', () => {
 });
 
 describe('playback generations and cleanup', () => {
+  it('shows reply text at render start while updating conversation state immediately', async () => {
+    let now = 0;
+    const f = fixture({ now: () => now }); await f.connect();
+    const ws = f.sockets[0];
+    ws.event({ type: 'turn', generation_id: 1, transcript: 'Yes', agent_message: 'Saving your plan.',
+      state: 'PENDING_CONFIRMATION', turn: { customer_confirmed: true } });
+    expect(f.controller.getSnapshot().session?.customer_confirmed).toBe(true);
+    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['Yes']);
+    now = 500;
+    ws.event({ type: 'agent_audio_chunk', generation_id: 1, chunk_base64: 'AAA=' });
+    expect(f.controller.getSnapshot().speaking).toBe(false);
+    expect(f.controller.getSnapshot().lines).toHaveLength(1);
+    now = 630; f.player.start(1);
+    expect(f.controller.getSnapshot().speaking).toBe(true);
+    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['Yes', 'Saving your plan.']);
+    expect(f.controller.getSnapshot().timings).toMatchObject({ client_text_to_playback_ms: 630, client_audio_buffer_ms: 130 });
+    f.player.start(1);
+    expect(ws.sent.filter(event => event.type === 'playback_started')).toHaveLength(1);
+    expect(f.controller.getSnapshot().lines).toHaveLength(2);
+    f.controller.disconnect();
+  });
+  it('reveals the reply with an error when synthesis produces no audio', async () => {
+    const f = fixture(); await f.connect();
+    f.sockets[0].event({ type: 'turn', generation_id: 1, agent_message: 'Your preferred time is available.' });
+    expect(f.controller.getSnapshot().lines).toHaveLength(0);
+    f.sockets[0].event({ type: 'agent_audio_end', generation_id: 1, audio_error: 'TTS_UNAVAILABLE' });
+    expect(f.controller.getSnapshot().lines[0].text).toBe('Your preferred time is available.');
+    expect(f.controller.getSnapshot().error).toContain('Audio could not be completed');
+    expect(f.controller.getSnapshot().speaking).toBe(false);
+    f.controller.disconnect();
+  });
+  it('discards an interrupted pending reply and ignores obsolete playback reports', async () => {
+    const f = fixture(); await f.connect(); const ws = f.sockets[0];
+    ws.event({ type: 'turn', generation_id: 1, agent_message: 'Old reply' });
+    ws.event({ type: 'stop_speaking', generation_id: 1 }); f.player.start(1);
+    ws.event({ type: 'turn', generation_id: 2, agent_message: 'Current reply' });
+    f.player.start(2, 0);
+    expect(f.controller.getSnapshot().lines).toHaveLength(0);
+    f.player.start(2);
+    expect(f.controller.getSnapshot().lines.map(line => line.text)).toEqual(['Current reply']);
+    f.controller.disconnect();
+  });
   it('shows the agent-initiated opening without inventing customer consent', async () => {
     const f=fixture(); await f.connect();
     f.sockets[0].event({type:'opening',generation_id:1,agent_message:'Your SwiftCart delivery is scheduled for this evening. Will you be available?'});
+    expect(f.controller.getSnapshot().lines).toHaveLength(0);
+    f.player.port.onmessage?.({ data: { type: 'started', generation_id: 1, connection_id: 1 } });
     expect(f.controller.getSnapshot().lines.some(line=>line.speaker==='agent' && line.text.includes('Will you be available?'))).toBe(true);
     expect(f.controller.getSnapshot().session?.customer_confirmed).toBe(false);
     f.controller.disconnect();

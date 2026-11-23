@@ -135,7 +135,7 @@ def test_voice_turn_runs_stt_planner_policy_and_tts(scripted_llm, scripted_speec
         assert body["transcript_confidence"] == 0.93
         assert body["state"] == "PENDING_CONFIRMATION"
         assert body["turn"]["verdict"]["valid"] is True
-        assert "direct handoff" in body["agent_message"]
+        assert "सीधे आपको parcel दे सकता है" in body["agent_message"]
         assert "Delivery ho gayi" not in body["agent_message"]
         assert body["planner"]["action"] == "PROPOSE_PLAN"
         assert base64.b64decode(body["audio_base64"]) == b"AUDIO"

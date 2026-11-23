@@ -5,6 +5,7 @@ class PcmPlayer extends AudioWorkletProcessor {
     this._chunks = [];
     this._queuedSamples = 0;
     this._started = false;
+    this._reportedStart = false;
     this._underruns = 0;
     this._fadeIn = 0;
     this._offset = 0;
@@ -21,6 +22,7 @@ class PcmPlayer extends AudioWorkletProcessor {
         this._chunks = [];
         this._queuedSamples = 0;
         this._started = false;
+        this._reportedStart = false;
         this._underruns = 0;
         this._fadeIn = 0;
         this._offset = 0;
@@ -35,6 +37,7 @@ class PcmPlayer extends AudioWorkletProcessor {
         this._chunks = [];
         this._queuedSamples = 0;
         this._started = false;
+        this._reportedStart = false;
         this._underruns = 0;
         this._fadeIn = 0;
         this._offset = 0;
@@ -47,6 +50,7 @@ class PcmPlayer extends AudioWorkletProcessor {
         this._chunks = [];
         this._queuedSamples = 0;
         this._started = false;
+        this._reportedStart = false;
         this._underruns = 0;
         this._fadeIn = 0;
         this._offset = 0;
@@ -89,6 +93,11 @@ class PcmPlayer extends AudioWorkletProcessor {
     for (let i = 0; i < written && this._fadeIn > 0; i++) {
       output[i] *= 1 - this._fadeIn / ramp;
       this._fadeIn--;
+    }
+    if (!this._reportedStart && output.subarray(0, written).some(value => Math.abs(value) > 0.0001)) {
+      this._reportedStart = true;
+      this.port.postMessage({ type: "started", generation_id: this._generation,
+        connection_id: this._connection });
     }
     if (this._started && this._queuedSamples === 0 && !this._ended) {
       const fade = Math.min(written, ramp);

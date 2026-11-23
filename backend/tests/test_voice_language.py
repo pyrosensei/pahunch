@@ -54,7 +54,7 @@ class LanguageSpeech:
     "text,language",
     [
         ("Please hand the parcel to me", "en-IN"),
-        ("मुझे ही पार्सल देना", "hi-IN"),
+        ("मुझे ही पार्सल देना", "hi-en"),
         ("Mujhe hi parcel dena", "hi-en"),
     ],
 )
@@ -108,11 +108,7 @@ def test_gnani_payload_and_cache_are_language_specific(method):
             await client.aclose()
 
     asyncio.run(run())
-    assert captured == (
-        ["en-IN", "hi-IN", "hi-en", "en-IN"]
-        if method == "synthesize_pcm_blocking"
-        else ["en-IN", "hi-IN", "hi-en"]
-    )
+    assert captured == ["en-IN", "hi-IN", "hi-en"]
 
 
 def test_acknowledgement_never_plays_in_wrong_language(db):

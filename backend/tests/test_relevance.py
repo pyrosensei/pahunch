@@ -7,7 +7,7 @@ from sqlmodel import select
 from test_planner import db as planner_database
 from test_planner import run, start_call, valid_proposal
 
-from app.calls import MAX_TURNS, utc_now
+from app.calls import utc_now
 from app.dialogue import EvidenceError, evidence_text, load_details, save_details
 from app.errors import DomainError
 from app.models import (
@@ -448,12 +448,12 @@ def test_contextual_delivery_cancellation_still_uses_shipment_policy(db, scripte
     assert result.state == "CANCELLED" and order.status == OrderStatus.CANCELLED
 
 
-def test_repeated_background_respects_overall_turn_budget(db, scripted_llm):
-    planner = PlannerService(db, scripted_llm([decision()] * (MAX_TURNS + 1)))
+def test_repeated_background_keeps_the_session_open(db, scripted_llm):
+    planner = PlannerService(db, scripted_llm([decision()] * (12)))
     call = start_call(planner.calls)
-    for _ in range(MAX_TURNS + 1):
+    for _ in range(12):
         result = run(planner, call.id, "How many rotis?")
-    assert result.state == "TURN_BUDGET_EXHAUSTED"
+    assert result.state == "DISCOVERY"
     assert call.clarification_count == 0
 
 

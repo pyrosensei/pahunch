@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.calls import MAX_CLARIFICATIONS, MAX_TURNS, CallService
+from app.calls import MAX_CLARIFICATIONS, CallService
 from app.errors import DomainError
 from app.models import CallState, Order
 from app.schemas import CustomerTurnRequest, PlanAction, PlanProposal, PlanStep
@@ -144,15 +144,15 @@ def test_address_change_escalates_without_modifying_address(db):
     assert db.get(Order, 1042).delivery_address_summary == original
 
 
-def test_turn_budget_is_enforced(db):
+def test_conversation_continues_beyond_old_turn_budget(db):
     service = CallService(db)
     call = start_call(service)
     result = None
-    for index in range(MAX_TURNS + 1):
+    for index in range(12):
         result = service.submit_turn(call.id, CustomerTurnRequest(text=f"turn {index}"))
     assert result is not None
-    assert result.state == CallState.TURN_BUDGET_EXHAUSTED.value
-    assert result.turn_count == MAX_TURNS + 1
+    assert result.state == CallState.DISCOVERY.value
+    assert result.turn_count == 12
 
 
 def test_repeated_invalid_plans_remain_recoverable_after_clarification_limit(db):

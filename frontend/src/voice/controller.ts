@@ -32,6 +32,7 @@ export interface VoiceEnvironment {
   worklet: (context: AudioContext, name: string) => AudioWorkletNode;
   microphone: () => Promise<MediaStream>;
   origin: string;
+  now: () => number;
 }
 const conversational = new Set(['DISCOVERY', 'NEGOTIATION', 'PENDING_CONFIRMATION']);
 const resumable = new Set(['CALLING', 'CONNECTED', ...conversational]);
@@ -81,6 +82,8 @@ export class VoiceController {
   private lineId = 0;
   private detailRevision = 0;
   private autoCommit = false;
+  private pendingAgent: { generation: number; text: string; readyAt: number } | null = null;
+  private firstChunkAt: number | null = null;
 
   constructor(environment?: Partial<VoiceEnvironment>) {
     this.env = {
@@ -88,6 +91,7 @@ export class VoiceController {
       audio: () => new AudioContext(), worklet: (context, name) => new AudioWorkletNode(context, name),
       microphone: () => navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }),
       origin: typeof location === 'undefined' ? 'http://localhost' : location.origin,
+      now: () => performance.now(),
       ...environment,
     };
   }
@@ -195,20 +199,20 @@ export class VoiceController {
       case 'stop_speaking': if (event.generation_id === this.generation) { this.stopPlayback(); this.update({ processing: false, hint: 'Go ahead, I’m listening.' }); } break;
       case 'opening': {
         if (!this.acceptGeneration(event.generation_id)) break;
-        if (event.agent_message) this.line('agent', event.agent_message);
+        if (event.agent_message) this.pendingAgent = { generation: event.generation_id, text: event.agent_message, readyAt: this.env.now() };
         this.update({ processing: false, plannerModel: event.planner?.model || null, plannerError: event.planner?.error_code || null,
-          hint: 'The agent is explaining your delivery. Listen, then answer its question.' });
+          hint: 'Preparing the delivery audio…' });
         break;
       }
       case 'turn': {
         if (!this.acceptGeneration(event.generation_id)) break;
         // Only the backend-redacted transcript is displayed, including for typed input.
         if (event.transcript) this.line('customer', event.transcript);
-        if (event.agent_message) this.line('agent', event.agent_message);
+        if (event.agent_message) this.pendingAgent = { generation: event.generation_id, text: event.agent_message, readyAt: this.env.now() };
         const current = this.snapshot.session;
         this.update({ session: current ? { ...current, state: event.state || current.state, customer_confirmed: !!event.turn?.customer_confirmed, verdict: event.turn?.verdict || current.verdict } : null,
           processing: false, plannerModel: event.planner?.model || null, plannerError: event.planner?.error_code || null,
-          timings: event.timings || this.snapshot.timings,
+          hint: 'Preparing your reply audio…', timings: event.timings || this.snapshot.timings,
           wording: event.planner ? `${event.planner.response_language || ''} · ${event.planner.wording_source || 'model'}${event.planner.fallback_reason ? ` · ${event.planner.fallback_reason}` : ''}` : null });
         if (event.state && !conversational.has(event.state)) this.releaseMic();
         void this.refreshPlan(ws);
@@ -217,17 +221,18 @@ export class VoiceController {
       }
       case 'agent_audio_chunk':
         if (!this.acceptGeneration(event.generation_id)) break;
-        this.update({ speaking: true, hint: 'Pahunch is speaking' });
+        if (this.firstChunkAt === null) this.firstChunkAt = this.env.now();
         if (event.chunk_base64) this.playChunk(event.chunk_base64, event.generation_id!);
         break;
       case 'agent_audio':
         if (!this.acceptGeneration(event.generation_id)) break;
-        if (event.audio_base64) { this.update({ speaking: true }); await this.playBlob(event.audio_base64, event.generation_id!, ws); }
+        if (event.audio_base64) { if (this.firstChunkAt === null) this.firstChunkAt = this.env.now(); await this.playBlob(event.audio_base64, event.generation_id!, ws); }
         break;
       case 'agent_audio_end':
         if (!this.acceptGeneration(event.generation_id)) break;
         this.ended = true;
-        this.update({ timings: event.timings || this.snapshot.timings });
+        this.update({ timings: { ...this.snapshot.timings, ...event.timings } });
+        if (event.audio_error || !this.output) this.revealAgent(event.generation_id!);
         if (event.audio_error) this.update({ error: 'Audio could not be completed. Your reply is available as text.' });
         if (this.output === 'blob') { if (this.blobDone) this.finishPlayback(event.generation_id!, ws); }
         else if (this.player) {
@@ -296,6 +301,9 @@ export class VoiceController {
         if (epoch !== this.actionEpoch) { await context.close(); return; }
         const player = this.env.worklet(context, 'pcm-player'); this.player = player;
         player.port.onmessage = event => {
+          if (event.data.type === 'started' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
+            this.revealAgent(event.data.generation_id, true);
+          }
           if (event.data.type === 'underrun' && event.data.connection_id === this.connectionId && event.data.generation_id === this.generation) {
             this.send({ type: 'playback_underrun', generation_id: this.generation });
           }
@@ -342,6 +350,7 @@ export class VoiceController {
   private stopPlayback() {
     const generation = this.generation;
     this.generation = null; this.ended = false; this.output = null; this.blobDone = false;
+    this.pendingAgent = null; this.firstChunkAt = null;
     if (this.playing) { this.playing.onended = null; try { this.playing.stop(); } catch { /* already stopped */ } this.playing = null; }
     this.player?.port.postMessage({ type: 'flush', generation_id: generation, connection_id: this.connectionId });
     this.update({ speaking: false });
@@ -354,7 +363,9 @@ export class VoiceController {
   }
   private finishPlayback(generation: number, ws: WebSocket | null) {
     if (!ws || this.ws !== ws || this.generation !== generation || !this.ended) return;
-    this.generation = null; this.update({ speaking: false, hint: 'Your turn' });
+    this.revealAgent(generation);
+    this.generation = null;
+    this.update({ speaking: false, hint: this.snapshot.session?.state === 'COMMITTED' ? 'Delivery plan saved for your courier.' : 'Your turn' });
     if (ws.readyState !== 1) return;
     this.send({ type: 'playback_done', generation_id: generation });
     if (this.snapshot.microphone && this.snapshot.autoListen && conversational.has(this.snapshot.session?.state || '')) this.startListening();
@@ -382,7 +393,27 @@ export class VoiceController {
         this.playing = null; this.blobDone = true; this.finishPlayback(generation, ws);
       };
       source.start();
+      this.revealAgent(generation, true);
     } catch { if (this.ws === ws && this.generation === generation) { this.blobDone = true; this.fail(new Error('Audio playback failed. Please read the reply below.')); this.finishPlayback(generation, ws); } }
+  }
+
+  private revealAgent(generation: number, playbackStarted = false) {
+    if (generation !== this.generation) return;
+    const pending = this.pendingAgent;
+    if (pending?.generation === generation) {
+      this.pendingAgent = null;
+      this.line('agent', pending.text);
+      if (playbackStarted) {
+        const now = this.env.now();
+        const timings = {
+          client_text_to_playback_ms: Math.max(0, Math.round(now - pending.readyAt)),
+          client_audio_buffer_ms: this.firstChunkAt === null ? 0 : Math.max(0, Math.round(now - this.firstChunkAt)),
+        };
+        this.update({ timings: { ...this.snapshot.timings, ...timings } });
+        this.send({ type: 'playback_started', generation_id: generation, ...timings });
+      }
+    }
+    if (playbackStarted) this.update({ speaking: true, hint: 'Pahunch is speaking' });
   }
 
   async commit() {

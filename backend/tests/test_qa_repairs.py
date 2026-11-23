@@ -190,7 +190,9 @@ def test_relative_day_is_bound_to_server_call_date(db, scripted_llm, source, off
 
 
 def test_compound_date_question_also_answers_payment(db, scripted_llm):
-    planner = PlannerService(db, scripted_llm([]))
+    item = decision(PlannerAction.RESPOND, "{order_window} {payment_mode}")
+    item["information_topics"] = ["SCHEDULED_DELIVERY", "PAYMENT"]
+    planner = PlannerService(db, scripted_llm([item]))
     call = start_call(planner.calls)
     result = run(planner, call.id, "What date and time is my delivery, and is it already paid?")
     assert "November" in result.agent_message

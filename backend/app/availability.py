@@ -1,40 +1,13 @@
 """Server-owned delivery availability; no model-written dates or origin claims."""
 
-import re
 from datetime import datetime, time, timedelta
 
 from sqlmodel import Session, select
 
-from app.language import mentioned_date_parts
 from app.models import DeliverySlot, DialerEvent, Order, OrderStatus
 from app.policy import IST, _utc
 from app.schemas import PlanStep
 from app.speech_text import customer_date, customer_window
-
-
-def availability_question(text: str) -> bool:
-    # Factual requests only. A time-change instruction still goes to the planner.
-    return bool(re.search(
-        r"(?:which|what).{0,40}(?:available|availability|options)|which.{0,10}slots?|available.{0,20}(?:time|slot)|"
-        r"कौन.{0,20}(?:टाइम|समय|स्लॉट)|(?:टाइम|समय|स्लॉट).{0,20}(?:उपलब्ध|अवेलेबल)|"
-        r"(?:kaun|konsa|kaunsa).{0,20}(?:time|slot)", text, re.IGNORECASE))
-
-
-_CLOCK_MENTION = re.compile(r"\b(?:am|pm|baje|o'clock)\b|बजे|\d{1,2}:\d{2}", re.IGNORECASE)
-
-
-def date_feasibility_question(text: str) -> bool:
-    """"Can you do it on the 12th?" asks about availability, not for a booking.
-
-    A stated clock makes it an instruction, which still goes to the planner.
-    """
-    if mentioned_date_parts(text) is None or _CLOCK_MENTION.search(text):
-        return False
-    return bool(re.search(
-        r"\b(?:can|could|would|is|are)\b.{0,60}\b(?:possible|available|do|make|deliver|schedule)\b|"
-        r"\b(?:possible|available|feasible)\b|"
-        r"क्या.{0,60}(?:सकते|सकती|सकता|हो सकता|हो सकती|संभव)|संभव|हो सकता है\?",
-        text, re.IGNORECASE))
 
 
 def _covers_date(window: tuple[datetime, datetime], asked: tuple[int, int]) -> bool:
@@ -61,7 +34,13 @@ def _bookable_windows(
         if start < end:
             windows.append((start, end))
     windows.sort()
-    return windows
+    merged = []
+    for start, end in windows:
+        if merged and start.date() == merged[-1][0].date() and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def availability_reply(
@@ -72,6 +51,8 @@ def availability_reply(
     rejected=False,
     requested: PlanStep | None = None,
     asked: tuple[int, int] | None = None,
+    excluded_dates=(),
+    exclude_scheduled_window: bool = False,
 ) -> str:
     after_hours = False
     requested_date = None
@@ -89,29 +70,47 @@ def availability_reply(
     if not alternatives and after_hours:
         # Nothing later is recorded, but the earlier options are still real.
         alternatives = _bookable_windows(slots, False, None)
+    alternatives = [window for window in alternatives if window[0].date() not in excluded_dates]
+    if exclude_scheduled_window:
+        scheduled_start, scheduled_end = _utc(order.window_start), _utc(order.window_end)
+        split = []
+        for start, end in alternatives:
+            if _utc(start) < scheduled_start < _utc(end):
+                split.append((start, scheduled_start.astimezone(IST)))
+            if _utc(start) < scheduled_end < _utc(end):
+                split.append((scheduled_end.astimezone(IST), end))
+            if _utc(end) <= scheduled_start or _utc(start) >= scheduled_end:
+                split.append((start, end))
+        alternatives = split
     matching = [w for w in alternatives if _covers_date(w, asked)] if asked is not None else []
     windows = "; ".join(
-        customer_window(start, end, language) for start, end in (matching or alternatives)[:3]
+        customer_window(start, end, language) for start, end in (matching or alternatives)
     )
     if not windows:
         return {"en-IN": "No alternative delivery availability is recorded. This needs the delivery team's review; no change has been saved.",
                 "hi-IN": "डिलीवरी का कोई वैकल्पिक समय दर्ज नहीं है। डिलीवरी टीम की समीक्षा चाहिए; अभी कोई बदलाव नहीं हुआ है।",
-                "hi-en": "Alternative delivery time recorded nahi hai. Delivery team ki review chahiye; koi change save nahi hua."}[language]
+                "hi-en": "कोई दूसरा delivery time दर्ज नहीं है। Delivery team की मदद चाहिए, अभी कोई change save नहीं हुआ है।"}[language]
     if asked is not None:
         label = customer_date(asked[0], asked[1], language)
         if matching:
             return {"en-IN": f"{label} is available: {windows}. Which time within it works for you?",
                     "hi-IN": f"{label} उपलब्ध है: {windows}। इसमें कौन सा समय आपके लिए ठीक रहेगा?",
-                    "hi-en": f"{label} available hai: {windows}. Ismein kaunsa time theek rahega?"}[language]
+                    "hi-en": f"{windows} में delivery हो सकती है। कौन सा time आपके लिए ठीक रहेगा?"}[language]
         return {"en-IN": f"{label} is not available. Recorded delivery periods are {windows}. Which of these dates and times works for you?",
                 "hi-IN": f"{label} उपलब्ध नहीं है। दर्ज डिलीवरी अवधि हैं: {windows}। इनमें कौन सी तारीख और समय आपके लिए ठीक रहेगा?",
-                "hi-en": f"{label} available nahi hai. Recorded delivery periods hain: {windows}. Inmein kaunsi date aur time theek rahega?"}[language]
+                "hi-en": f"{label} available नहीं है। Delivery के options {windows} हैं। इनमें कौन सी date और time ठीक रहेगा?"}[language]
     prefix = {"en-IN": "That requested window is outside this order's delivery availability. ",
               "hi-IN": "माँगा गया समय इस ऑर्डर की उपलब्ध डिलीवरी अवधि में नहीं है। ",
-              "hi-en": "Maanga gaya time is order ki delivery availability mein nahi hai. "}[language] if rejected else ""
-    return prefix + {"en-IN": f"Available delivery periods are {windows}. Delivery cannot be scheduled before the first available date. Which date and time within these periods work for you?",
-                     "hi-IN": f"उपलब्ध डिलीवरी अवधि हैं: {windows}। पहली उपलब्ध तारीख से पहले डिलीवरी नहीं हो सकती। इनमें कौन सी तारीख और समय आपके लिए ठीक रहेगा?",
-                     "hi-en": f"Available delivery periods hain: {windows}. Pehli available date se pehle delivery nahi ho sakti. Inmein kaunsi date aur time theek rahega?"}[language]
+              "hi-en": "आपने जो time बताया, उसमें इस order की delivery available नहीं है। "}[language] if rejected else ""
+    filtered = bool(excluded_dates) or exclude_scheduled_window
+    limit = {
+        "en-IN": "These are the recorded alternatives matching your availability." if filtered else "No other dates are recorded.",
+        "hi-IN": "आपकी उपलब्धता के अनुसार ये दर्ज विकल्प हैं।" if filtered else "इनके अलावा कोई तारीख दर्ज नहीं है।",
+        "hi-en": "आपकी availability के अनुसार ये दर्ज विकल्प हैं।" if filtered else "इनके अलावा कोई date दर्ज नहीं है।",
+    }[language]
+    return prefix + {"en-IN": f"Recorded delivery availability is {windows}. {limit} Which date and time works for you?",
+                     "hi-IN": f"दर्ज डिलीवरी समय {windows} हैं। {limit} कौन सी तारीख और समय आपके लिए ठीक रहेगा?",
+                     "hi-en": f"दर्ज delivery availability {windows} है। {limit} कौन सी date और time आपके लिए ठीक रहेगा?"}[language]
 
 
 def expand_demo_availability(db: Session) -> None:

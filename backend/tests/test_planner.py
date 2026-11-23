@@ -121,7 +121,7 @@ def test_valid_proposal_uses_backend_message_and_waits_for_confirmation(db, scri
     assert result.state == CallState.PENDING_CONFIRMATION.value
     assert result.turn.verdict is not None and result.turn.verdict.valid
     assert result.turn.customer_confirmed is False
-    assert "direct handoff" in result.agent_message
+    assert "सीधे आपको parcel दे सकता है" in result.agent_message
     assert "done" not in result.agent_message.lower()
     assert result.planner.action == PlannerAction.PROPOSE_PLAN
     assert result.planner.degraded is False
@@ -165,7 +165,7 @@ def test_invalid_plan_moves_to_negotiation_with_policy_explanation(db, scripted_
         violation.code == ViolationCode.OTP_REQUIRED_NO_THIRD_PARTY
         for violation in result.turn.verdict.violations
     )
-    assert "OTP" in result.agent_message
+    assert "ओटीपी" in result.agent_message
     assert result.turn.customer_confirmed is False
     assert "chhod diya" not in result.agent_message
 
@@ -210,10 +210,10 @@ def test_confirmation_with_new_instruction_is_not_accepted(db, scripted_llm):
 
     assert result.turn.customer_confirmed is False
     assert result.state == CallState.PENDING_CONFIRMATION.value
-    assert result.planner.error_code == "EXPLICIT_CONFIRMATION_REQUIRED"
+    assert result.planner.fallback_reason == "CONFIRMATION_REVIEW_REQUIRED"
     assert "current_proposal" in llm.requests[1]["user_prompt"]
     assert '"current_state": "PENDING_CONFIRMATION"' in llm.requests[1]["user_prompt"]
-    assert "Confirm karne" in result.agent_message
+    assert "plan confirm" in result.agent_message
 
 
 def test_low_confidence_proposal_is_not_executed(db, scripted_llm):
@@ -325,7 +325,7 @@ def test_escalation_is_acked_with_a_fixed_message(db, scripted_llm):
 
     assert result.state == CallState.ESCALATED.value
     assert result.planner.action == PlannerAction.ESCALATE_TO_HUMAN
-    assert "human team" in result.agent_message
+    assert "support team" in result.agent_message
     assert "Address update" not in result.agent_message
 
 
@@ -588,7 +588,7 @@ def test_otp_question_gets_a_deterministic_refusal(db, scripted_llm):
 
     assert result.planner.model == "rules:safety-reply"
     assert result.planner.action == PlannerAction.RESPOND
-    assert "share nahi" in result.agent_message
+    assert "share करती" in result.agent_message
     assert result.turn.customer_confirmed is False
     assert llm.requests == []
     events = list(db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all())
@@ -653,7 +653,7 @@ def test_changed_window_is_normalized_to_reschedule(db, scripted_llm):
     record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
     stored = json.loads(record.proposal_json)
     assert stored["primary"]["action"] == "RESCHEDULE"
-    assert "Delivery ka naya time" in result.agent_message
+    assert "delivery रख सकते हैं" in result.agent_message
     events = list(db.exec(select(AuditEvent).where(AuditEvent.session_id == call.id)).all())
     assert any(event.event_type == "PLAN_NORMALIZED" for event in events)
 
@@ -676,7 +676,7 @@ def test_original_window_stays_hand_to_customer(db, scripted_llm):
     record = db.get(PlanProposalRecord, planner.calls.get_call(call.id).current_proposal_id)
     stored = json.loads(record.proposal_json)
     assert stored["primary"]["action"] == "HAND_TO_CUSTOMER"
-    assert "direct handoff" in result.agent_message
+    assert "सीधे आपको parcel दे सकता है" in result.agent_message
 
 
 def test_policy_message_leads_with_hard_constraint():
@@ -701,7 +701,7 @@ def test_policy_message_leads_with_hard_constraint():
 
     message = plan_result_message(verdict, proposal)
 
-    assert "cash-on-delivery" in message
+    assert "भुगतान डिलीवरी पर" in message
     assert "available" not in message
 
 

@@ -1,7 +1,7 @@
 """Source-backed request details and recoverable clarification context."""
 
 import json
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 from sqlmodel import Session, select
 
@@ -23,6 +23,9 @@ class EvidenceError(ValueError):
     def __init__(self, field: str, reason: str, reference_kind: str, current_match: bool):
         prefix = {
             "time_source": "TIME_SOURCE",
+            "date_source": "TIME_SOURCE",
+            "end_time_source": "TIME_SOURCE",
+            "availability_source": "AVAILABILITY_SOURCE",
             "recipient_source": "RECIPIENT_SOURCE",
             "recipient_address_source": "RECIPIENT_ADDRESS_SOURCE",
         }[field]
@@ -53,7 +56,16 @@ def evidence_text(
     # when the model guessed a stale turn id. Bind it to the current turn.
     if current_match:
         evidence.turn_id = None
-    elif evidence.turn_id is not None:
+    elif evidence.turn_id is None:
+        # Providers sometimes repeat an earlier verbatim customer quote while
+        # omitting its turn id. Resolve only eligible, same-session evidence.
+        recent = db.exec(select(Turn).where(
+            Turn.session_id == session_id, Turn.speaker == Speaker.CUSTOMER,
+        ).order_by(Turn.id.desc()).limit(10)).all()
+        previous = next((turn for turn in recent if evidence.quote in delivery_evidence_text(turn)), None)
+        if previous is not None:
+            evidence.turn_id = previous.id
+    if not current_match and evidence.turn_id is not None:
         turn = db.get(Turn, evidence.turn_id)
         if turn is None:
             reference_kind = "missing"
@@ -78,6 +90,26 @@ def load_details(db: Session, session_id: str) -> RequestDetails:
     return RequestDetails.model_validate_json(event.payload_json) if event else RequestDetails()
 
 
+def load_negotiation(db: Session, session_id: str) -> dict:
+    event = db.exec(select(AuditEvent).where(
+        AuditEvent.session_id == session_id, AuditEvent.event_type == "NEGOTIATION_CONTEXT",
+    ).order_by(AuditEvent.id.desc())).first()
+    return json.loads(event.payload_json) if event else {"focus": "AVAILABILITY", "information_topics": []}
+
+
+def save_negotiation(db, session_id, focus, information_topics, discussed_date=None):
+    context = load_negotiation(db, session_id)
+    context.update(focus=focus, information_topics=information_topics)
+    if discussed_date is not None:
+        context["discussed_date"] = discussed_date.isoformat()
+    db.add(AuditEvent(
+        session_id=session_id, event_type="NEGOTIATION_CONTEXT",
+        payload_json=json.dumps(context),
+        created_at=utc_now(),
+    ))
+    db.commit()
+
+
 def effective_preferences(details: RequestDetails) -> tuple[object, ...]:
     # Compare resolved preferences, not evidence references or time-quote wording.
     return (
@@ -87,15 +119,54 @@ def effective_preferences(details: RequestDetails) -> tuple[object, ...]:
         details.call_on_arrival,
         details.recipient_source.quote if details.recipient_source is not None else None,
         details.recipient_address_source.quote if details.recipient_address_source is not None else None,
+        details.requested_date,
+        tuple(details.unavailable_dates),
+        details.scheduled_window_available,
     )
 
 
-def merge_details(db, session_id, text, old, new):
+def merge_details(db, session_id, text, old, new, *, rejected=None):
     if new is None:
         return old.model_copy(deep=True)
     result = old.model_copy(deep=True)
+    if set(new.unavailable_dates) - set(old.unavailable_dates) and new.date_source is None:
+        # "This time" can reject the booked window; it does not identify a
+        # different calendar date merely because that date was just offered.
+        new.unavailable_dates = [day for day in new.unavailable_dates if day in old.unavailable_dates]
+        db.add(AuditEvent(session_id=session_id, event_type="AVAILABILITY_EVIDENCE_IGNORED",
+                          payload_json=json.dumps({"reason": "CALENDAR_SOURCE_REQUIRED_FOR_DATE_REFUSAL"}), created_at=utc_now()))
     call = db.get(CallSession, session_id)
     order = db.get(Order, call.order_id)
+    # Validate independent evidence before mutating the draft. A bad date must
+    # not discard a correctly quoted recipient or clock in the same turn.
+    new = new.model_copy(deep=True)
+    for field in ("time_source", "end_time_source", "date_source", "availability_source", "recipient_source", "recipient_address_source"):
+        evidence = getattr(new, field)
+        if evidence is None:
+            continue
+        try:
+            evidence_text(db, session_id, text, evidence, field=field)
+        except EvidenceError as error:
+            if rejected is None:
+                raise
+            rejected.append(error)
+            setattr(new, field, None)
+            if field == "date_source":
+                new.requested_date = None
+                new.date_reference = "UNSPECIFIED"
+                new.unavailable_dates = []
+                if new.window_start is not None:
+                    new.requested_start_clock = _utc(new.window_start).astimezone(IST).time().replace(tzinfo=None)
+                new.window_start = new.window_end = None
+            elif field == "time_source":
+                new.window_start = new.window_end = None
+                new.requested_start_clock = new.requested_end_clock = None
+            elif field == "end_time_source":
+                new.window_end = None
+                new.requested_end_clock = None
+            elif field == "availability_source":
+                new.unavailable_dates = []
+                new.scheduled_window_available = None
     recipient_changed = (
         new.recipient_source is not None
         and old.recipient_source is not None
@@ -103,22 +174,51 @@ def merge_details(db, session_id, text, old, new):
     )
     if recipient_changed:
         result.recipient_address_source = None
-    for field in ("time_source", "recipient_source", "recipient_address_source"):
+    for field in ("time_source", "end_time_source", "date_source", "availability_source", "recipient_source", "recipient_address_source"):
         evidence = getattr(new, field)
         if evidence is not None:
+            known = getattr(old, field)
+            if known is not None and known.quote == evidence.quote and evidence.quote not in text:
+                evidence = known
             if field == "recipient_address_source" and recipient_changed and evidence.quote not in text:
                 continue
-            evidence_text(db, session_id, text, evidence, field=field)
             if field == "recipient_address_source" and not usable_recipient_location(evidence.quote):
                 result.recipient_address_source = None
                 continue
             setattr(result, field, evidence)
+    if new.unavailable_dates or new.scheduled_window_available is not None:
+        changed = bool(set(new.unavailable_dates) - set(old.unavailable_dates)) or (
+            new.scheduled_window_available is not None and new.scheduled_window_available != old.scheduled_window_available
+        )
+        if changed and new.availability_source is None:
+            # A missing refusal quote cannot erase independently verified time
+            # or handoff facts. Keep the previous availability and audit it.
+            new.unavailable_dates = [day for day in new.unavailable_dates if day in old.unavailable_dates]
+            new.scheduled_window_available = old.scheduled_window_available
+            db.add(AuditEvent(
+                session_id=session_id, event_type="AVAILABILITY_EVIDENCE_IGNORED",
+                payload_json=json.dumps({"reason": "AVAILABILITY_SOURCE_REQUIRED"}), created_at=utc_now(),
+            ))
+        result.unavailable_dates = sorted(set(old.unavailable_dates + new.unavailable_dates))
+        if new.scheduled_window_available is not None:
+            result.scheduled_window_available = new.scheduled_window_available
+    if new.requested_date is not None and new.requested_date not in new.unavailable_dates:
+        if new.date_source is None and new.time_source is None and new.date_reference not in {"SCHEDULED", "DISCUSSED"}:
+            raise EvidenceError("date_source", "REQUIRED", "missing", False)
+        result.requested_date = new.requested_date
+        result.date_reference = new.date_reference
+        if new.requested_date not in new.unavailable_dates:
+            result.unavailable_dates = [day for day in result.unavailable_dates if day != new.requested_date]
     if new.window_start is not None:
         if new.time_source is None and _utc(new.window_start) != _utc(order.window_start):
             raise ValueError("TIME_SOURCE_REQUIRED")
         if result.window_start != new.window_start:
             result.window_end = None
         result.window_start = new.window_start
+        result.time_reference = new.time_reference
+        if new.time_source is not None:
+            result.requested_start_clock = _utc(new.window_start).astimezone(IST).time().replace(tzinfo=None)
+            result.requested_end_clock = None
     if new.window_end is not None:
         if new.time_source is None and (
             _utc(new.window_end) != _utc(order.window_end)
@@ -126,6 +226,12 @@ def merge_details(db, session_id, text, old, new):
         ):
             raise ValueError("TIME_SOURCE_REQUIRED")
         result.window_end = new.window_end
+        if new.end_time_source is not None:
+            result.requested_end_clock = _utc(new.window_end).astimezone(IST).time().replace(tzinfo=None)
+    if new.time_source is not None:
+        for field in ("requested_start_clock", "requested_end_clock"):
+            if getattr(new, field) is not None:
+                setattr(result, field, getattr(new, field))
     action = new.handoff_action or new.action
     if action == "HAND_TO_CUSTOMER":
         result.recipient_source = None
@@ -139,18 +245,69 @@ def merge_details(db, session_id, text, old, new):
     return result
 
 
-def normalize_relative_day(db, session_id, text, decision, call_date):
+def normalize_relative_day(db, session_id, text, decision, call_date, *, known=None):
     details = decision.request_details
-    if details is None or details.relative_day_source is None:
+    if details is None:
         return
-    quote = evidence_text(db, session_id, text, details.relative_day_source, field="time_source")
-    offsets = {"today": 0, "aaj": 0, "आज": 0, "tomorrow": 1, "kal": 1, "कल": 1}
-    offset = offsets.get(quote.casefold().strip())
-    if offset is None:
-        raise ValueError("TIME_RELATIVE_DAY_AMBIGUOUS")
-    requested_date = call_date + timedelta(days=offset)
     primary = decision.proposal.primary if decision.proposal else None
-    start = details.window_start or (primary.window_start if primary else None)
+    known = known or load_details(db, session_id)
+    if details.requested_date in details.unavailable_dates and details.window_start is None and primary is None:
+        return
+    source = details.date_source or details.time_source
+    absolute = details.date_reference == "ABSOLUTE" and details.requested_date is not None
+    if details.date_reference in {"SCHEDULED", "DISCUSSED"}:
+        call = db.get(CallSession, session_id)
+        order = db.get(Order, call.order_id)
+        if details.date_reference == "SCHEDULED":
+            requested_date = _utc(order.window_start).astimezone(IST).date()
+        else:
+            discussed = load_negotiation(db, session_id).get("discussed_date")
+            if discussed is None:
+                raise EvidenceError("date_source", "REQUIRED", "missing", False)
+            requested_date = date.fromisoformat(discussed)
+        # Calendar dates for these references come from validated server state.
+        # Provider annotations quoting an agent date are unnecessary.
+        details.date_source = None
+        details.relative_day_source = None
+        details.requested_date = requested_date
+    elif absolute:
+        if source is None:
+            raise EvidenceError("date_source", "REQUIRED", "missing", False)
+        evidence_text(db, session_id, text, source, field="date_source")
+        requested_date = details.requested_date
+        if details.relative_day_source is not None:
+            db.add(AuditEvent(session_id=session_id, event_type="DATE_ANNOTATION_IGNORED",
+                              payload_json=json.dumps({"reason": "VERIFIED_ABSOLUTE_DATE"}), created_at=utc_now()))
+            details.relative_day_source = None
+    elif details.date_reference in {"TODAY", "TOMORROW"} or details.relative_day_source is not None:
+        relative_source = details.relative_day_source or details.date_source
+        if relative_source is None:
+            raise EvidenceError("date_source", "REQUIRED", "missing", False)
+        quote = evidence_text(db, session_id, text, relative_source, field="date_source")
+        offsets = {"today": 0, "aaj": 0, "आज": 0, "tomorrow": 1, "kal": 1, "कल": 1}
+        offset = offsets.get(quote.casefold().strip())
+        if offset is None:
+            raise ValueError("TIME_RELATIVE_DAY_AMBIGUOUS")
+        requested_date = call_date + timedelta(days=offset)
+        details.requested_date = requested_date
+        details.date_source = relative_source
+        details.date_reference = "TODAY" if offset == 0 else "TOMORROW"
+    elif details.requested_start_clock is not None and known.requested_date is not None:
+        requested_date = known.requested_date
+    else:
+        return
+    start = details.window_start or (primary.window_start if primary else None) or known.window_start
+    clock = details.requested_start_clock
+    if clock is None and details.window_start is None and details.time_source is None:
+        clock = known.requested_start_clock
+    clock_source = details.time_source or known.time_source
+    if clock is not None and clock_source is not None:
+        evidence_text(db, session_id, text, clock_source, field="time_source")
+        details.time_source = clock_source
+        details.time_reference = "START_ONLY" if details.requested_end_clock is None else "EXPLICIT_WINDOW"
+        start = datetime.combine(requested_date, clock, IST)
+        if details.requested_end_clock is not None:
+            details.window_end = datetime.combine(requested_date, details.requested_end_clock, IST)
     if start is None:
         return
     local = _utc(start).astimezone(IST)
@@ -294,7 +451,7 @@ def normalize_clarification(decision, details, order, slots):
 
 def save_details(db, session_id, turn_id, details):
     stored = details.model_copy(deep=True)
-    for field in ("time_source", "recipient_source", "recipient_address_source"):
+    for field in ("time_source", "end_time_source", "date_source", "availability_source", "recipient_source", "recipient_address_source"):
         evidence = getattr(stored, field)
         if evidence is not None and evidence.turn_id is None:
             evidence.turn_id = turn_id
@@ -327,27 +484,34 @@ def save_details(db, session_id, turn_id, details):
 
 
 def clarification_fallback(fields, language):
+    if language == "hi-en":
+        language = "hi-IN"
     kind = next(iter(fields), "other")
     messages = {
+        "date": (
+            "Which delivery date should I check? I have kept your requested time.",
+            "डिलीवरी की कौन सी तारीख चाहिए? आपका बताया समय याद है।",
+            "डिलीवरी की कौन सी तारीख चाहिए? आपका बताया समय याद है।",
+        ),
         "recipient": (
             "Who should receive the parcel? Please give their name.",
             "पार्सल किसे देना है? उनका नाम बताइए।",
-            "Parcel kise dena hai? Unka naam bataiye.",
+            "Parcel किसे देना है? उनका नाम बताइए।",
         ),
         "recipient_address": (
             "Where should the courier find your neighbour? Please give their house or flat number, or clear directions.",
             "कूरियर आपके पड़ोसी को कहाँ मिलेगा? उनका मकान या फ्लैट नंबर, या स्पष्ट रास्ता बताइए।",
-            "Courier aapke padosi ko kahan milega? Unka house ya flat number, ya saaf directions bataiye.",
+            "Courier आपके पड़ोसी को कहाँ मिलेगा? उनका house या flat number, या साफ़ directions बताइए।",
         ),
         "time": (
             "Which delivery time works for you?",
             "डिलीवरी का कौन सा समय आपके लिए ठीक रहेगा?",
-            "Delivery ka kaunsa time aapke liye theek rahega?",
+            "Delivery का कौन सा time आपके लिए ठीक रहेगा?",
         ),
         "other": (
             "Would you like to receive the parcel at the scheduled time, or arrange another time or recipient?",
             "क्या आप तय समय पर पार्सल लेंगे, या समय या पार्सल लेने वाला व्यक्ति बदलना है?",
-            "Kya aap tay samay par parcel lenge, ya time ya parcel lene wala badalna hai?",
+            "क्या आप scheduled time पर parcel लेंगे, या time या parcel लेने वाला व्यक्ति बदलना है?",
         ),
     }
     return messages.get(kind, messages["other"])[{"en-IN": 0, "hi-IN": 1, "hi-en": 2}[language]]

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import random
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from time import perf_counter
@@ -18,6 +19,9 @@ from app.http_pool import HttpClientPool
 # every other. Requests are therefore serialised behind a single slot and
 # retried with backoff instead of failing the turn.
 GNANI_RETRY_DELAYS = (0.4, 0.8, 1.6, 3.2, 5.0, 8.0, 12.0)
+PCM_CACHE_ENTRIES = 16
+PCM_CACHE_BYTES = 8 * 1024 * 1024
+PCM_CACHE_ENTRY_BYTES = 1024 * 1024
 
 
 class GnaniError(Exception):
@@ -115,7 +119,18 @@ class GnaniSpeechClient:
         self._transport = transport
         self._pool = HttpClientPool(timeout=timeout_seconds, transport=transport)
         self._tts_cache: dict[tuple[str, str, str], SpeechAudio] = {}
-        self._pcm_cache: dict[tuple[str, int, str], bytes] = {}
+        self._pcm_cache: OrderedDict[tuple[str, int, str], bytes] = OrderedDict()
+        self._pcm_cache_bytes = 0
+
+    def _remember_pcm(self, key: tuple[str, int, str], data: bytes) -> None:
+        if not data or len(data) > PCM_CACHE_ENTRY_BYTES:
+            return
+        previous = self._pcm_cache.pop(key, b"")
+        self._pcm_cache_bytes += len(data) - len(previous)
+        self._pcm_cache[key] = data
+        while len(self._pcm_cache) > PCM_CACHE_ENTRIES or self._pcm_cache_bytes > PCM_CACHE_BYTES:
+            _, removed = self._pcm_cache.popitem(last=False)
+            self._pcm_cache_bytes -= len(removed)
 
     def _next_key(self) -> str:
         key = self._api_keys[self._key_index % len(self._api_keys)]
@@ -254,21 +269,27 @@ class GnaniSpeechClient:
         language: str | None = None,
         container: str = "raw",
     ) -> AsyncIterator[bytes]:
-        """Yield raw PCM16 chunks as Timbre synthesises them.
-
-        The SSE endpoint starts delivering audio ~400 ms after the request,
-        well before the whole sentence exists, so the client can play the
-        agent while it is still being spoken.
-        """
+        """Stream synthesis immediately and reuse only successfully completed audio."""
+        language = language or self._tts_language
+        key = (text, sample_rate, language)
+        cached = self._pcm_cache.get(key) if container == "raw" else None
+        if cached is not None:
+            self._pcm_cache.move_to_end(key)
+            frame_bytes = max(2, sample_rate * 2 // 5)
+            for offset in range(0, len(cached), frame_bytes):
+                yield cached[offset:offset + frame_bytes]
+            return
         payload = {
             "text": text,
             "voice": self._tts_voice,
             "model": self._tts_model,
-            "language": language or self._tts_language,
+            "language": language,
             "audio_config": {"container": container, "sample_rate": sample_rate},
         }
         for attempt in range(len(GNANI_RETRY_DELAYS) + 1):
             rate_limited = False
+            completed = bytearray()
+            cacheable = container == "raw"
             try:
                 async with self._gate:
                     headers = {
@@ -295,10 +316,26 @@ class GnaniSpeechClient:
                                     event = json.loads(line[5:].strip())
                                 except ValueError:
                                     continue
+                                if not isinstance(event, dict):
+                                    continue
+                                if event.get("error") or event.get("type") == "error":
+                                    raise GnaniResponseError("Gnani TTS stream reported an error")
                                 audio = event.get("audio")
                                 if isinstance(audio, str) and audio:
-                                    yield base64.b64decode(audio)
+                                    try:
+                                        chunk = base64.b64decode(audio, validate=True)
+                                    except ValueError as error:
+                                        raise GnaniResponseError("Gnani TTS stream returned invalid audio") from error
+                                    if cacheable:
+                                        if len(completed) + len(chunk) <= PCM_CACHE_ENTRY_BYTES:
+                                            completed.extend(chunk)
+                                        else:
+                                            completed.clear()
+                                            cacheable = False
+                                    yield chunk
                 if not rate_limited:
+                    if cacheable:
+                        self._remember_pcm(key, bytes(completed))
                     return
             except httpx.TimeoutException as error:
                 raise GnaniTimeoutError("Gnani TTS timed out") from error
@@ -316,6 +353,11 @@ class GnaniSpeechClient:
         sentence in one response, so the caller still hears the agent when
         streaming fails.
         """
+        language = language or self._tts_language
+        key = (text, sample_rate, language)
+        if container == "raw" and key in self._pcm_cache:
+            self._pcm_cache.move_to_end(key)
+            return self._pcm_cache[key]
         payload = {
             "text": text,
             "voice": self._tts_voice,
@@ -341,6 +383,8 @@ class GnaniSpeechClient:
             raise GnaniResponseError(f"Gnani TTS returned HTTP {response.status_code}")
         if not response.content:
             raise GnaniResponseError("Gnani TTS returned empty audio")
+        if container == "raw":
+            self._remember_pcm(key, response.content)
         return response.content
 
     async def aclose(self) -> None:
@@ -352,12 +396,13 @@ class GnaniSpeechClient:
         key = (text, sample_rate, language)
         cached = self._pcm_cache.get(key)
         if cached is not None:
+            self._pcm_cache.move_to_end(key)
             return cached
         chunks = [chunk async for chunk in self.stream_pcm(text, sample_rate=sample_rate, language=language)]
         data = b"".join(chunks)
         if not data:
             raise GnaniResponseError("Gnani TTS returned no audio")
-        self._pcm_cache[key] = data
+        self._remember_pcm(key, data)
         return data
 
 

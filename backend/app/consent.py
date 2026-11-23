@@ -25,11 +25,14 @@ _AFFIRMATIVE_WORDS = {
     "bilkul",
     "zaroor",
     "chalo",
+    "chalega",
+    "works",
 }
 _CONFIRMATION_WORDS = _AFFIRMATIVE_WORDS | {
     "i", "this", "that", "the", "it", "with", "proceed",
     "date", "window", "time", "arrangement", "delivery", "instructions", "proposed", "revised",
     "main", "mein", "mai", "isi", "ki", "karta", "karti", "hoon", "hun",
+    "mujhe", "mere", "liye", "for", "me", "badha",
     "dijiye",
     "aage",
     "aap",
@@ -126,6 +129,12 @@ _DEVANAGARI_WORD_MAP = {
     "प्लीज़": "please",
     "प्लीज": "please",
     "जी": "ji",
+    "चलेगा": "chalega",
+    "मुझे": "mujhe",
+    "मेरे": "mere",
+    "लिए": "liye",
+    "बढ़ा": "badha",
+    "बढा": "badha",
 }
 
 def is_explicit_confirmation(text: str) -> bool:
@@ -148,8 +157,25 @@ def is_explicit_confirmation(text: str) -> bool:
             # a clean confirmation; dropping it could invert the meaning.
             return False
         words.append(word)
-    return any(word in _AFFIRMATIVE_WORDS for word in words) and all(
-        word in _CONFIRMATION_WORDS for word in words
+    # Validate the entire utterance before recognizing acceptance or a proceed
+    # command. Unknown qualifiers, negation and corrections cannot be dropped.
+    if not all(word in _CONFIRMATION_WORDS for word in words):
+        return False
+    # Speech transcripts may omit question marks. A question about the
+    # proposal, or a request to verify its details, does not authorize it.
+    request = words[1:] if words[0] == "please" else words
+    if request[:2] == ["do", "i"] or (
+        len(request) >= 2 and request[0] == "is" and request[1] in {"this", "that", "the", "it"}
+    ):
+        return False
+    if request[:1] == ["confirm"] and set(request[1:]) & {"date", "time", "window"}:
+        return False
+    proceed_command = "proceed" in words or "go ahead" in normalized or (
+        "aage" in words and (
+            any(word in {"badhaiye", "badhao", "badho"} for word in words)
+            or (any(word in {"badh", "badha"} for word in words) and "dijiye" in words)
+        )
     )
+    return proceed_command or any(word in _AFFIRMATIVE_WORDS for word in words)
 
 

@@ -328,8 +328,8 @@ def test_old_yes_is_only_a_revision_notice_then_playback_ack_and_new_yes_confirm
         notice = asyncio.run(planner.handle_turn(review.sid, AgentTurnRequest(text="Yes please go ahead")))
         assert not notice.turn.customer_confirmed
         assert notice.planner.operator_revision_id == proposal_id
-        assert "operator revised" in notice.agent_message.lower()
-        assert "no arrival call" in notice.agent_message.lower()
+        assert "team ने आपकी delivery का plan बदला है" in notice.agent_message
+        assert "पहुँचने पर call करने का instruction शामिल नहीं है" in notice.agent_message
         assert pending_operator_revision(db, review.sid, proposal_id)
         assert not acknowledge_operator_revision(db, review.sid, review.pid)
         assert acknowledge_operator_revision(db, review.sid, proposal_id)

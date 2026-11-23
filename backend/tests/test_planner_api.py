@@ -86,7 +86,7 @@ def test_agent_turn_flow_over_http(scripted_llm):
         proposed_body = proposed.json()
         assert proposed_body["state"] == "PENDING_CONFIRMATION"
         assert proposed_body["turn"]["verdict"]["valid"] is True
-        assert "direct handoff" in proposed_body["agent_message"]
+        assert "सीधे आपको parcel दे सकता है" in proposed_body["agent_message"]
         assert "Delivery ho gayi" not in proposed_body["agent_message"]
         assert proposed_body["planner"]["action"] == "PROPOSE_PLAN"
         assert proposed_body["planner"]["degraded"] is False

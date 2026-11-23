@@ -39,9 +39,9 @@ test('queue underrun cannot signal playback completion before generation end', (
   assert.equal(played[0], 0.5);
   assert.equal(played[1], 0.25);
   tick();
-  assert.equal(player.port.sent.length, 1);
-  assert.equal(player.port.sent[0].type, 'drained');
-  assert.equal(player.port.sent[0].generation_id, 1);
+  assert.equal(player.port.sent.filter(e => e.type === 'drained').length, 1);
+  assert.equal(player.port.sent.at(-1).type, 'drained');
+  assert.equal(player.port.sent.at(-1).generation_id, 1);
 });
 
 test('flushed generations cannot play late chunks or end a newer generation', () => {
@@ -56,8 +56,8 @@ test('flushed generations cannot play late chunks or end a newer generation', ()
   send({ type: 'end', generation_id: 2 });
   assert.equal(tick()[0], 0.25);
   tick();
-  assert.equal(player.port.sent.length, 1);
-  assert.equal(player.port.sent[0].generation_id, 2);
+  assert.equal(player.port.sent.filter(e => e.type === 'drained').length, 1);
+  assert.equal(player.port.sent.at(-1).generation_id, 2);
 });
 
 test('empty generation completes once, only after its explicit end', () => {
@@ -326,7 +326,7 @@ test('playback buffers jitter, reports starvation once and drains a short final 
   for (let i = 0; i < 24; i++) tick();
   assert.equal(player.port.sent.filter(e => e.type === 'underrun').length, 1);
   for (let i = 0; i < 20; i++) tick();
-  assert.equal(player.port.sent.length, 1);
+  assert.equal(player.port.sent.filter(e => e.type === 'underrun').length, 1);
   send({ type: 'pcm', generation_id: 1, samples: new Float32Array(100).fill(0.5) });
   assert.equal(tick()[0], 0);
   send({ type: 'end', generation_id: 1 });
@@ -334,4 +334,21 @@ test('playback buffers jitter, reports starvation once and drains a short final 
   assert.equal(tail[0], 0);
   assert(tail[79] > 0.45);
   assert.equal(player.port.sent.at(-1).type, 'drained');
+});
+
+test('render start is reported once after buffering and leading silence', () => {
+  const { player, send, tick } = worklet();
+  send({ type: 'begin', generation_id: 1 });
+  send({ type: 'pcm', generation_id: 1, samples: new Float32Array(1920) });
+  for (let i = 0; i < 15; i++) tick();
+  assert.equal(player.port.sent.filter(e => e.type === 'started').length, 0);
+  send({ type: 'pcm', generation_id: 1, samples: new Float32Array(3840).fill(0.5) });
+  for (let i = 0; i < 30; i++) tick();
+  assert.equal(player.port.sent.filter(e => e.type === 'started').length, 1);
+  send({ type: 'flush', generation_id: 1 });
+  send({ type: 'begin', generation_id: 2 });
+  send({ type: 'pcm', generation_id: 2, samples: new Float32Array(1920).fill(0.25) });
+  tick();
+  assert.equal(player.port.sent.filter(e => e.type === 'started').length, 2);
+  assert.equal(player.port.sent.filter(e => e.type === 'started').at(-1).generation_id, 2);
 });

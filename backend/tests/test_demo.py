@@ -50,7 +50,7 @@ def demo(tmp_path, scripted_llm):
         [
             {
                 "action": "PROPOSE_PLAN",
-                "message": "Understood. {plan_summary} {confirmation_question}",
+                "message": "Then {plan_summary} {confirmation_question}",
                 "confidence": 0.95,
                 "escalation_reason": None,
                 "proposal": {
