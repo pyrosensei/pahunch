@@ -24,3 +24,4 @@ frontend/test-run-*.txt
 
 # Keep local review and instruction documents out of Git.
 *.[mM][dD]
+!/README.md
